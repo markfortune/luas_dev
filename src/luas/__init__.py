@@ -1,25 +1,12 @@
-from .GeneralKernel import GeneralKernel as GeneralKernel
-from .LuasKernel import LuasKernel as LuasKernel
-from .GP import GP as GP
-from .kernels import (
-    squared_exp,
-    exp,
-    matern32,
-    matern52,
-    rational_quadratic,
-    exp_sine_squared,
-    cosine,
+from luas.kernels import (
+    WhiteNoiseKernel as WhiteNoiseKernel,
+    SingleKronTermKernel as SingleKronTermKernel,
+    GeneralKernel as GeneralKernel,
+    LuasKernel as LuasKernel,
+    LuasLasrachKernel as LuasLasrachKernel,
 )
 
-__all__ = [
-    "GeneralKernel",
-    "LuasKernel",
-    "GP",
-    "squared_exp",
-    "exp"
-    "matern32",
-    "matern52",
-    "rational_quadratic",
-    "exp_sine_squared",
-    "cosine",
-]
+from luas import (
+    kernels as kernels,
+    GP as GP,
+)

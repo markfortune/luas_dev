@@ -9,6 +9,7 @@ We have detailed documentation for luas included in this section. For getting st
 :maxdepth: 2
 GP
 LuasKernel
+LuasLasrachKernelND
 GeneralKernel
 ```
 

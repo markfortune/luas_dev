@@ -1,10 +1,7 @@
 import jax.numpy as jnp
-import jax
-from jax import custom_jvp, jit
-import numpy as np
+from jax import custom_jvp
 from typing import Callable, Tuple, Union, Any, Optional
 from .luas_types import JAXArray, Scalar, PyTree
-from functools import partial
 
 __all__ = [
     "make_vec",
@@ -83,102 +80,7 @@ def kron_prod(
     
     return A @ R @ B.T
 
-@partial(jit, static_argnums=1)
-def cyclic_transpose(R, d):
-    ndim = R.ndim
-    axes = tuple((i + d) % ndim for i in range(ndim))
-    return jnp.transpose(R, axes)
 
-
-def vmap_for_tensors(f):
-    def wrapped(R, **kwargs):
-        *leading, N_l, N_t = R.shape
-        
-        R_flat = R.reshape(-1, N_l, N_t)
-        
-        f_new = lambda R, **kwargs: f(R, **kwargs)
-        R_prime_flat = jax.vmap(f_new)(R_flat)
-        
-        return R_prime_flat.reshape(*leading, *R_prime_flat.shape[1:])
-    
-    return wrapped
-
-    
-def tensor_mult(kron_mat_list, X1, X2, R, **kwargs):
-
-    gp_dim = len(kron_mat_list)
-    R_prime = cyclic_transpose(R, 2)
-    
-    for d in range(gp_dim):
-        method = getattr(kron_mat_list[d], "matmul")
-        
-        R_prime = method(X1[d], X2[d], R_prime, **kwargs)
-        R_prime = cyclic_transpose(R_prime, 1)
-        
-    R_prime = cyclic_transpose(R_prime, -2)
-
-    return R_prime
-
-
-def tensor_arb_op(kron_mat_list, method_name, R, **kwargs):
-
-    gp_dim = len(kron_mat_list)
-    R_prime = cyclic_transpose(R, 2)
-    
-    for d in range(gp_dim):
-        method = getattr(kron_mat_list[d], "matmul")
-        
-        R_prime = method(X1[d], X2[d], R_prime, **kwargs)
-        R_prime = cyclic_transpose(R_prime, 1)
-        
-    R_prime = cyclic_transpose(R_prime, -2)
-
-    return R_prime
-    
-
-def kron_prod_dim_d(
-    A: JAXArray,
-    R: JAXArray,
-    d: int,
-) -> JAXArray:
-    r"""Computes the matrix vector product of the kronecker product of N matrices
-    which are all Identity matrices except for ``A`` at dim ``d``, times a tensor ``R``.
-    Performs these using the cyclic matrix transpose as described in Saatchi (2011).
-    
-    .. math::
-
-        [\mathbf{I} \otimes \dots \mathbf{A} \dots \mathbf{I}] \vec{R} = \mathbf{A} ((\mathbf{R})^T) \dots )^T
-    
-    Args:
-        A (JAXArray): Matrix on the left side of the kronecker product.
-        R (JAXArray): Tensor to right multiply, stored as an ndarray.
-        
-    Returns:
-        JAXArray: The result of the multiplication as a JAXArray array of shape ``(N_l, N_t)``.
-    """
-
-    R_trans = cyclic_transpose(R, d)
-    A_R = A @ R_trans
-    return cyclic_transpose(A_R, -d)
-    
-def calc_total_size(x):
-    # If it's a single array, just return its size
-    if isinstance(x, jnp.ndarray):
-        return x.shape[-1]
-        
-    # Otherwise assume it's an iterable of arrays
-    return jnp.prod(jnp.array([xi.shape[-1] for xi in x]))
-
-
-def calc_data_shape(X):
-    # If it's a single array, just return its size
-    if isinstance(X, jnp.ndarray) or isinstance(X, np.ndarray):
-        return (X.shape[-1],)
-        
-    # Otherwise assume it's an iterable of arrays
-    return sum([(x_i.shape[-1],) for x_i in X])
-
-    
 @custom_jvp
 def K_inv_vec(
     R: JAXArray,
@@ -210,11 +112,6 @@ def K_inv_vec(
         by the vector represented by ``R`` as a JAXArray of shape ``(N_l, N_t)``.
     
     """
-    # b = stored_values["S_l"].cho_solve(R)
-    # b = stored_values["S_t"].cho_solve(R, transpose = 1)
-
-    # b = kron_prod(stored_values["Q_Kl_tilde"].T, stored_values["Q_Kt_tilde"].T, R)
-    # b = jnp.multiply(stored_values["D_inv"], b)
     
     b = kron_prod(stored_values["W_l"].T, stored_values["W_t"].T, R)
     b = jnp.multiply(stored_values["D_inv"], b)

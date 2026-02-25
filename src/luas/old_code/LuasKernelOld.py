@@ -184,6 +184,9 @@ class LuasKernel(Kernel):
             if hasattr(fn, "decomp"):
                 if fn.decomp == "diag":
                     fn.decomp = diag_eigendecomp
+                else:
+                    pass
+                    # print(f"Using {fn.decomp} for kernel fn {fn}. ")
             else:
                 fn.decomp = jnp.linalg.eigh
                 
