@@ -536,7 +536,7 @@ class _LuasLasrachKernelNDBase(CovType):
 
         return Sigma_full + K_full
 
-    def eigendecomp_no_stored_values(self, *X: Tuple, stored_values: Optional[PyTree] = {}):
+    def eigendecomp_no_stored_values(self, *X: Tuple, stored_values: Optional[PyTree] = None):
         """Decompose kernel without attempting reuse of previous stored values.
 
         Steps
@@ -551,6 +551,8 @@ class _LuasLasrachKernelNDBase(CovType):
         4. Delegate transformed block decomposition to subclass-provided
            ``kf_tilde`` object.
         """
+        stored_values = {} if stored_values is None else stored_values
+
         if stored_values:
             R_shape = stored_values["R_shape"]
             total_size = jnp.prod(jnp.array(R_shape))
@@ -632,7 +634,7 @@ class _LuasLasrachKernelNDBase(CovType):
 
         return self, stored_values
 
-    def eigendecomp_use_stored_values(self, *X: Tuple, stored_values: Optional[PyTree] = {}):
+    def eigendecomp_use_stored_values(self, *X: Tuple, stored_values: Optional[PyTree] = None):
         return self.eigendecomp_no_stored_values(*X, stored_values=stored_values)
 
     def matrix_sqrt(self, R: JAXArray, transpose=0) -> JAXArray:

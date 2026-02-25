@@ -117,8 +117,10 @@ class LuasKernel(CovType):
     def eigendecomp_no_stored_values(
         self,
         *X: Tuple,
-        stored_values: Optional[PyTree] = {},
+        stored_values: Optional[PyTree] = None,
     ) -> PyTree:
+
+        stored_values = {} if stored_values is None else stored_values
 
         if stored_values:
             R_shape = stored_values["R_shape"]

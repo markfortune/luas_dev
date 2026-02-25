@@ -192,6 +192,114 @@ class GP(object):
         
         return logL
 
+    def apply_inverse(
+        self,
+        p: PyTree,
+        R: JAXArray,
+        **kwargs,
+    ) -> Scalar:
+        """Computes the log likelihood without returning any stored values from the
+        decomposition of the covariance matrix.
+        
+        Args:
+            p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
+                in addition to any mean function parameters which may be needed to calculate the mean function.
+            Y (JAXArray): Observed data to fit, must be of shape ``(N_l, N_t)``.
+        
+        Returns:
+            Scalar: The value of the log likelihood.
+            
+        """
+        
+        self.kf = self.build_kf(p, *self.x)
+        
+        self.kf, stored_values = self.kf.decompose(*self.x, stored_values = {"R_shape":self.data_shape})
+        K_inv_R = self.kf.inverse(R, **kwargs)
+        
+        return K_inv_R
+
+    
+    def matmul(
+        self,
+        p: PyTree,
+        R: JAXArray,
+        **kwargs,
+    ) -> Scalar:
+        """Computes the log likelihood without returning any stored values from the
+        decomposition of the covariance matrix.
+        
+        Args:
+            p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
+                in addition to any mean function parameters which may be needed to calculate the mean function.
+            Y (JAXArray): Observed data to fit, must be of shape ``(N_l, N_t)``.
+        
+        Returns:
+            Scalar: The value of the log likelihood.
+            
+        """
+        
+        self.kf = self.build_kf(p, *self.x)
+
+        if len(self.x) == 1:
+            K_R = self.kf.matmul(self.x[0], self.x[0], R, **kwargs)
+        else:
+            K_R = self.kf.matmul(self.x, self.x, R, **kwargs)
+        
+        return K_R
+        
+
+    def apply_matrix_sqrt(
+        self,
+        p: PyTree,
+        R: JAXArray,
+        transpose = 0,
+    ) -> Scalar:
+        """Computes the log likelihood without returning any stored values from the
+        decomposition of the covariance matrix.
+        
+        Args:
+            p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
+                in addition to any mean function parameters which may be needed to calculate the mean function.
+            Y (JAXArray): Observed data to fit, must be of shape ``(N_l, N_t)``.
+        
+        Returns:
+            Scalar: The value of the log likelihood.
+            
+        """
+        
+        self.kf = self.build_kf(p, *self.x)
+        
+        self.kf, stored_values = self.kf.decompose(*self.x, stored_values = {"R_shape":self.data_shape})
+        L_R = self.kf.matrix_sqrt(R, transpose = transpose)
+        
+        return L_R
+
+    def apply_matrix_inv_sqrt(
+        self,
+        p: PyTree,
+        R: JAXArray,
+        transpose = 0,
+    ) -> Scalar:
+        """Computes the log likelihood without returning any stored values from the
+        decomposition of the covariance matrix.
+        
+        Args:
+            p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
+                in addition to any mean function parameters which may be needed to calculate the mean function.
+            Y (JAXArray): Observed data to fit, must be of shape ``(N_l, N_t)``.
+        
+        Returns:
+            Scalar: The value of the log likelihood.
+            
+        """
+        
+        self.kf = self.build_kf(p, *self.x)
+        
+        self.kf, stored_values = self.kf.decompose(*self.x, stored_values = {"R_shape":self.data_shape})
+        L_inv_R = self.kf.matrix_inv_sqrt(R, transpose = transpose)
+        
+        return L_inv_R
+
 
     def studentT_logL(
         self,
@@ -272,11 +380,7 @@ class GP(object):
             
         """
         
-        R = Y - self.mf(p,  *self.x)
-        
-        self.kf = self.build_kf(p, *self.x)
-        logL, stored_values = self.kf.logL(p,  *self.x, R, {"R_shape":R.shape})
-        
+        logL = self.logL(p, Y)
         logPrior = self.logPrior(p)
         logP = logPrior + logL
         
@@ -680,86 +784,6 @@ class GP(object):
                 plt.show()
 
         return Y_clean
-    
-    
-    def plot(
-        self,
-        p: PyTree,
-        Y: JAXArray,
-        x_l_plot = None, 
-        x_t_plot = None,
-        **kwargs,
-    ) -> plt.Figure:
-        """Visualises the fit to the data. Displays the observed data as well as the mean function,
-        the GP predictive mean (not including the mean function) and the residuals of the data
-        after subtraction of the GP predictive mean (including the mean function).
-        
-        For a good fit to the data, the data minus the GP predictive mean should consist of
-        white noise with no remaining correlations. The GP predictive mean (not including the mean function)
-        should also just be fitting correlated noise and should not look like its fitting the mean function.
-        
-        Args:
-            p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
-                in addition to any mean function parameters which may be needed to calculate the mean function.
-            Y (JAXArray): Observed data to fit, must be of shape ``(N_l, N_t)``.
-            x_l_plot (JAXArray, optional): The values on the y-axis used by ``plt.pcolormesh`` for the plot.
-                If not included will default to ``x_l`` if ``x_l`` is of shape ``(N_l,)`` or to ``x_l[0, :]``
-                if ``x_l`` is of shape ``(d_l, N_l)``.
-            x_t_plot (JAXArray, optional): The values on the x-axis used by ``plt.pcolormesh`` for the plot.
-                If not included will default to ``x_t`` if ``x_t`` is of shape ``(N_t,)`` or to ``x_t[0, :]``
-                if ``x_t`` is of shape ``(d_t, N_t)``.
-        
-        Returns:
-            plt.Figure: The figure object containing the plot produced.
-            
-        """
-        
-        # If no x and y axes for the plots specified, defaults to x_l, x_t
-        # If x_l or x_t contain multiple rows then pick the first row
-        if x_l_plot is None:
-            if self.x_l.ndim == 1:
-                x_l_plot = self.x_l
-            else:
-                x_l_plot = self.x_l[0, :]
-                
-        if x_t_plot is None:
-            if self.x_t.ndim == 1:
-                x_t_plot = self.x_t
-            else:
-                x_t_plot = self.x_t[0, :]
-    
-        # Perform GP regression at the observed data locations
-        gp_mean, gp_cov, M = self.predict(p, Y, **kwargs)
-        
-        fig = plt.figure(figsize = (20, 5))
-        ax = fig.subplots(1, 4, sharey = True)
-        
-        # First plot is just the observed data
-        ax[0].set_title("Data")
-        ax[0].pcolormesh(x_t_plot, x_l_plot, Y, shading = "nearest")
-        
-        # Second plot is just the deterministic mean function
-        ax[1].set_title("Mean function")
-        ax[1].pcolormesh(x_t_plot, x_l_plot, M, shading = "nearest")
-        
-        # Third plot is the GP mean fit to the data without the mean function included
-        ax[2].set_title("GP mean (excl. mean function)")
-        ax[2].pcolormesh(x_t_plot, x_l_plot, gp_mean - M, shading = "nearest")
-        
-        # Final plot is the residuals of the observed data after subtraction of the GP
-        # predictive mean (including the deterministic mean function)
-        ax[3].set_title("Residual noise")
-        ax[3].pcolormesh(x_t_plot, x_l_plot, Y - gp_mean, shading = "nearest")
-
-        # Label axes
-        ax[0].set_ylabel(r'$x_l$')
-        for i in range(4):
-            ax[i].set_xlabel(r'$x_t$')
-
-        # pcolormesh defaults to having the y-axis decrease with height which is weird so invert it
-        plt.gca().invert_yaxis()
-        
-        return fig
     
     
     def autocorrelate(
@@ -1465,6 +1489,105 @@ class GP(object):
 
         return fig
 
+    
+    def plot(
+        self,
+        p: PyTree,
+        Y: JAXArray,
+        x_plot = None,
+        return_fig = False,
+        **kwargs,
+    ) -> plt.Figure:
+        """Visualises the fit to the data. Displays the observed data as well as the mean function,
+        the GP predictive mean (not including the mean function) and the residuals of the data
+        after subtraction of the GP predictive mean (including the mean function).
+        
+        For a good fit to the data, the data minus the GP predictive mean should consist of
+        white noise with no remaining correlations. The GP predictive mean (not including the mean function)
+        should also just be fitting correlated noise and should not look like its fitting the mean function.
+        
+        Args:
+            p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
+                in addition to any mean function parameters which may be needed to calculate the mean function.
+            Y (JAXArray): Observed data to fit, must be of shape ``(N_l, N_t)``.
+            x_l_plot (JAXArray, optional): The values on the y-axis used by ``plt.pcolormesh`` for the plot.
+                If not included will default to ``x_l`` if ``x_l`` is of shape ``(N_l,)`` or to ``x_l[0, :]``
+                if ``x_l`` is of shape ``(d_l, N_l)``.
+            x_t_plot (JAXArray, optional): The values on the x-axis used by ``plt.pcolormesh`` for the plot.
+                If not included will default to ``x_t`` if ``x_t`` is of shape ``(N_t,)`` or to ``x_t[0, :]``
+                if ``x_t`` is of shape ``(d_t, N_t)``.
+        
+        Returns:
+            plt.Figure: The figure object containing the plot produced.
+            
+        """
+        
+        # If no x and y axes for the plots specified, defaults to x_l, x_t
+        # If x_l or x_t contain multiple rows then pick the first row
+        if x_plot is None:
+            x_plot = ()
+            for x in self.x:
+                if x.ndim == 1:
+                    x_plot += (x.copy(),)
+                else:
+                    x_plot += (x[0, :],)
+    
+        # Perform GP regression at the observed data locations
+        M = self.mf(p, *self.x)
+        
+        res = Y - M
+        K_inv_R = self.apply_inverse(p, res)
+        gp_mean = M + self.matmul(p, K_inv_R, wn = False)
+        
+        fig = plt.figure(figsize = (20, 5))
+
+        if self.dim == 1:
+            ax = fig.subplots(1, 4, sharey = False)
+        else:
+            ax = fig.subplots(1, 4, sharey = True)
+        
+        # First plot is just the observed data
+        ax[0].set_title("Data")
+        # Second plot is just the deterministic mean function
+        ax[1].set_title("Mean function")
+        # Third plot is the GP mean fit to the data without the mean function included
+        ax[2].set_title("GP mean (excl. mean function)")
+        # Final plot is the residuals of the observed data after subtraction of the GP
+        # predictive mean (including the deterministic mean function)
+        ax[3].set_title("Residual noise")
+
+        if self.dim == 1:
+            ax[0].plot(x_plot[0], Y)
+            ax[1].plot(x_plot[0], M)
+            ax[2].plot(x_plot[0], gp_mean - M)
+            ax[3].plot(x_plot[0], Y - gp_mean)
+
+            for i in range(4):
+                ax[i].set_xlabel(r'$x$')
+                
+        elif self.dim == 2:
+            ax[0].pcolormesh(x_plot[1], x_plot[0], Y, shading = "nearest")
+            ax[1].pcolormesh(x_plot[1], x_plot[0], M, shading = "nearest")
+            ax[2].pcolormesh(x_plot[1], x_plot[0], gp_mean - M, shading = "nearest")
+            ax[3].pcolormesh(x_plot[1], x_plot[0], Y - gp_mean, shading = "nearest")
+            
+            # Label axes
+            ax[0].set_ylabel(r'$x_l$')
+            for i in range(4):
+                ax[i].set_xlabel(r'$x_t$')
+    
+            # pcolormesh defaults to having the y-axis decrease with height which is weird so invert it
+            plt.gca().invert_yaxis()
+
+        else:
+            raise Exception(f"Plotting of {self.dim}D data not yet implemented")
+
+        plt.tight_layout()
+
+        if return_fig:
+            return fig
+    
+    
     
     def plot_cov(
         self,
