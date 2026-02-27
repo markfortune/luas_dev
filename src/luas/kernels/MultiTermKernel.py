@@ -2,22 +2,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 import jax.numpy as jnp
 import jax
-from jax import grad, value_and_grad, hessian, vmap, custom_jvp, jit
-from jax.flatten_util import ravel_pytree
-from copy import deepcopy
-from tqdm import tqdm
 from typing import Callable, Tuple, Union, Any, Optional
-from functools import partial
 import tinygp
-from tinygp.solvers.quasisep.core import LowerTriQSM, StrictLowerTriQSM, DiagQSM
-import jax.scipy.linalg as JLA
 
-from luas.kernels.covtype import Outer
+from luas import WhiteNoiseKernel, SingleKronTermKernel
+from luas.kernels.covtype import Outer, Exp, GeneralQuasisep, CovType, Identity, ScaledIdentity, Diagonal
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar
-from luas.kronecker_fns import kron_prod, logdetK_calc, r_K_inv_r, K_inv_vec, logdetK_calc_hessianable
-from luas.jax_convenience_fns import array_to_pytree_2D, get_corr_mat
-
-cpu_device = jax.devices("cpu")[0]
+from luas.kronecker_fns import kron_prod, logdetK_calc, r_K_inv_r, K_inv_vec, logdetK_calc_hessianable, tensor_mult
+from luas.kernels.tinygp_ext import Multiband
 
 __all__ = [
     "KinvR_block",
@@ -29,63 +21,279 @@ __all__ = [
 jax.config.update("jax_enable_x64", True)
 
 
-def orthonormal_nullspace_gen(A):
+
+class GeneralQuasisep2D(CovType):
+    def __init__(self, tinygp_kf, diag = 0., wn_diag = 0., params = None, cel_dim=1):
+        self.tinygp_kf = tinygp_kf
+        self.diag = diag
+        self.wn_diag = wn_diag
+        self.cel_dim = cel_dim
+        self.params = params
+
+    def tinygp_coords(self, X):
+        cel_vec = X[self.cel_dim]
+        non_cel_vec = X[1-self.cel_dim]
+        
+        x_t_long = jnp.kron(cel_vec, jnp.ones(non_cel_vec.shape[-1]))
+        x_l_long = jnp.kron(jnp.ones(cel_vec.shape[-1], dtype = int), jnp.arange(non_cel_vec.shape[-1]))
+        
+        return (x_t_long, x_l_long)
+
+    def calc_diag(self, X, wn = True):
+        
+        return self.diag + wn*self.wn_diag
+
+    def evaluate(self, x1, x2, wn = True, **kwargs):
+
+        X1 = self.tinygp_coords(x1)
+        X2 = self.tinygp_coords(x2)
+        
+        return self.tinygp_kf(X1, X2) + jnp.diag(self.calc_diag(x1, wn = wn))
     
-    N_l = A.shape[0]
-    N_alpha = A.shape[1]
+    def decompose(self, x, wn = True, **kwargs):
 
-    V = jnp.zeros_like(A)
-    U = jnp.zeros_like(A)
-    Lam = jnp.zeros((N_alpha, N_alpha))
+        X = self.tinygp_coords(x)
 
-    for i in range(N_alpha):
-        v_i = A[:, i]
-        for j in range(i):
-            Lam = Lam.at[j, i].set(jnp.dot(v_i, V[:, j]))
-            v_i -= Lam[j, i] * V[:, j]
+        diag = self.calc_diag(x, wn = wn)
+
+        noise_model = tinygp.noise.Diagonal(diag=diag)
+        matrix = self.tinygp_kf.to_symm_qsm(X)
+        matrix += noise_model.to_qsm()
+        self.factor = matrix.cholesky()
+        
+        logdetK = 2*jnp.sum(jnp.log(self.factor.diag.d))
+        
+        return self, {"logdetK":logdetK}
+        
+    def matrix_inv_sqrt(self, R, transpose=0):
+        
+        if self.cel_dim == 0:
+            R_prime = R.T
+        else:
+            R_prime = R.copy()
+
+        R_shape = R_prime.shape
+        r = R_prime.ravel("F")
+        
+        if transpose:
+            r = self.factor.transpose().solve(r)
+        else:
+            r = self.factor.solve(r)
+
+        R_prime = r.reshape(R_shape, order="F")
+
+        if self.cel_dim == 0:
+            R_prime = R_prime.T
             
-        Lam = Lam.at[i, i].set(jnp.linalg.norm(v_i))
-        v_i /= Lam[i, i]
-        V = V.at[:, i].set(v_i)
+        return R_prime
+
+    def matrix_sqrt(self, R, transpose=0, **kwargs):
+
+        if self.cel_dim == 0:
+            R_prime = R.T
+        else:
+            R_prime = R.copy()
+        
+        R_shape = R_prime.shape
+        r = R_prime.ravel("F")
+
+        if transpose:
+            L_r = self.factor.transpose() @ r
+        else:
+            L_r = self.factor @ r
+
+        L_R = L_r.reshape(R_shape, order="F")
+
+        if self.cel_dim == 0:
+            L_R = L_R.T
+            
+        return L_R
+
+    def scale(self, c):
+        return GeneralQuasisep2D(self.tinygp_kf * c, diag = self.diag * c, wn_diag = self.wn_diag * c)
+
+    def matmul(self, x1, x2, R, wn = True, **kwargs):
+
+        X1 = self.tinygp_coords(x1)
+        X2 = self.tinygp_coords(x2)
+        
+        if self.cel_dim == 0:
+            R_prime = R.T
+        else:
+            R_prime = R.copy()
+        
+        R_shape = R_prime.shape
+        r = R_prime.ravel("F")
+
+        r_prime = self.tinygp_kf.matmul(X1, X2, r)
+
+        diag = self.calc_diag(x1, wn = wn)
+        noise_model = tinygp.noise.Diagonal(diag=diag)
+        r_prime += noise_model @ r
+
+        R_prime = r_prime.reshape(R_shape, order="F")
+
+        if self.cel_dim == 0:
+            R_prime = R_prime.T
+            
+        return R_prime
+        
+    def __add__(self, K):
+
+        if isinstance(K, GeneralQuasisep2D):
+            K_sum = GeneralQuasisep2D(K.tinygp_kf + self.tinygp_kf,
+                                    diag = self.diag + K.diag, wn_diag = self.wn_diag + K.wn_diag)
+        else:
+            raise Exception(f"{type(K)} not recognised or addition not supported yet")
+            
+        return K_sum
+
+class Block2x2Kernel(CovType):
+    def __init__(self, kf_A, kf_B = None, kf_D_CAB = None, kf_D = None, dim_split = 0, split_loc = 1):
+        self.kf_A = kf_A
+        self.kf_B_matmul = kf_B
+        self.kf_D_CAB = kf_D_CAB
+        self.kf_D = kf_D
+
+        self.dim_split = dim_split
+        self.split_loc = split_loc
+
+        if self.kf_D is None and self.kf_B_matmul is None:
+            self.kf_D = self.kf_D_CAB
+
+    def x_split(self, x):
+        x_A = x[self.dim_split][..., :self.split_loc]
+        x_D = x[self.dim_split][..., self.split_loc:]
+
+        if self.dim_split == 0:
+            X_A = (x_A, x[1])
+            X_D = (x_D, x[1])
+        else:
+            X_A = (x[0], x_A)
+            X_D = (x[0], x_D)
+            
+        return X_A, X_D
+
+    def evaluate(self, x1, x2, wn = True, **kwargs):
+        
+        if self.kf_B_matmul is None:
+            zeros_fn = lambda x1, x2, R, **kwargs: jnp.zeros(x1.shape[-1], x2.shape[-1])
+            self.kf_B_matmul = zeros_fn
+
+        A_mat = self.kf_A.evaluate(x1, x2)
+        B_mat = self.kf_B_matmul(x1, x2, jnp.eye(x2.shape[-1]))
+
+        if self.kf_D is None:
+            C_A_inv_B = B_mat.T @ jnp.linalg.inv(A_mat) @ B_mat
+            D_mat = self.kf_D_CAB.evaluate(x1, x2) - C_A_inv_B
+        else:
+            D_mat = self.kf_D.evaluate(x1, x2)
+
+        if self.dim_split == 0:
+            top_rows = jnp.concatenate([A_mat, B_mat], axis = 1)
+            bottom_rows = jnp.concatenate([B_mat.T, D_mat], axis = 1)
+        else:
+            raise Exception("Not implemented")
+        
+        return jnp.concatenate([top_rows, bottom_rows], axis = 0)
     
-    # Householder vector
-    for i in range(N_alpha):
-        w_i = V[:, i]
-        for j in range(i):
-            w_i -= 2 * jnp.dot(U[:, j], w_i) * U[:, j]
+    def decompose(self, X, **kwargs):
 
-        e_i = jnp.zeros(N_l)
-        e_i = e_i.at[i].set(1)
-        u_i = w_i - e_i
-        u_i /= jnp.linalg.norm(u_i)
+        X_A, X_D = self.x_split(X)
 
-        U = U.at[:, i].set(u_i)
+        self.kf_A, stored_values_A = self.kf_A.decompose(X_A, **kwargs)
+
+        if self.kf_D_CAB is not None:
+            self.kf_D_CAB, stored_values_D = self.kf_D_CAB.decompose(X_D, stored_values = stored_values_A)
+        else:
+            raise Exception("Not Implemented")
+
+        if self.kf_B_matmul is not None:
+            self.B_mult = lambda R, **kwargs: self.kf_B_matmul(X_A, X_D, R, **kwargs)
+            self.C_mult = lambda R, **kwargs: self.kf_B_matmul(X_D, X_A, R, **kwargs)
+        
+        return self, {"logdetK":stored_values_A["logdetK"] + stored_values_D["logdetK"]}
+        
+    def matrix_inv_sqrt(self, R, transpose=0):
+
+        if self.dim_split == 0:
+            R_A = R[:self.split_loc, :]
+            R_D = R[self.split_loc:, :]
+        elif self.dim_split == 1:
+            R_A = R[:, :self.split_loc]
+            R_D = R[:, self.split_loc:]
+        
+        R_prime_A = self.kf_A.matrix_inv_sqrt(R_A, transpose = transpose)
+        R_prime_D = self.kf_D_CAB.matrix_inv_sqrt(R_D, transpose = transpose)
+
+        if self.kf_B_matmul is not None:
+            if transpose == 0:
+                R_C = self.kf_A.matrix_inv_sqrt(R_prime_A, transpose = 1)
+                R_C = self.C_mult(R_C, wn = False)
+                R_prime_D += -self.kf_D_CAB.matrix_inv_sqrt(R_C, transpose = 0)
+            else:
+                R_B = self.B_mult(R_prime_D, wn = False)
+                R_prime_A += -self.kf_A.inverse(R_B)
+
+        R_prime = jnp.concatenate([R_prime_A, R_prime_D], axis = self.dim_split)
+            
+        return R_prime
+        
+    def matrix_sqrt(self, R, transpose=0, **kwargs):
+
+        if self.dim_split == 0:
+            R_A = R[:self.split_loc, :]
+            R_D = R[self.split_loc:, :]
+        elif self.dim_split == 1:
+            R_A = R[:, :self.split_loc]
+            R_D = R[:, self.split_loc:]
+        
+        R_prime_A = self.kf_A.matrix_sqrt(R_A, transpose = transpose)
+        R_prime_D = self.kf_D_CAB.matrix_sqrt(R_D, transpose = transpose)
+
+        if self.kf_B_matmul is not None:
+            if transpose == 0:
+                R_C = self.kf_A.matrix_inv_sqrt(R_A, transpose = 1)
+                R_prime_D += self.C_mult(R_C, wn = False)
+            else:
+                R_B = self.B_mult(R_D, wn = False)
+                R_prime_A += self.kf_A.matrix_inv_sqrt(R_B, transpose = 0)
+        
+        R_prime = jnp.concatenate([R_prime_A, R_prime_D], axis = self.dim_split)
+        
+        return R_prime
+
+    def scale(self, c):
+        raise Exception("Not implemented")
+
+    def matmul(self, x1, x2, R, wn = True, **kwargs):
+
+        if self.kf_D is None and self.kf_B_matmul is not None:
+            raise Exception("Need to specify kernel function in block D for this method")
+
+        if self.dim_split == 0:
+            R_A = R[:self.split_loc, :]
+            R_D = R[self.split_loc:, :]
+        elif self.dim_split == 1:
+            R_A = R[:, :self.split_loc]
+            R_D = R[:, self.split_loc:]
+
+        X1_A, X1_D = self.x_split(X1)
+        X2_A, X2_D = self.x_split(X2)
+
+        if self.kf_B_matmul is None:
+            K_R_A = self.kf_A.matmul(X1_A, X2_A, R_A)
+            K_R_D = self.kf_D.matmul(X1_D, X2_D, R_D)
+        else:
+            K_R_A = self.kf_A.matmul(X1_A, X2_A, R_A) + self.kf_B_matmul(X1_A, X2_B, R_D)
+            K_R_D = self.kf_B_matmul(X1_B, X2_A, R_A) + self.kf_D.matmul(X1_D, X2_D, R_D)
+
+        K_R = jnp.concatenate([K_R_A, K_R_D], axis = self.dim_split)
+        
+        return K_R
+
     
-    return Lam, U
-
-
-
-@tinygp.helpers.dataclass
-class Multiband(tinygp.kernels.quasisep.Wrapper):
-    amplitudes: jnp.ndarray
-
-    def coord_to_sortable(self, X):
-        return X[0]
-
-    def observation_model(self, X):
-        return self.amplitudes[X[1]] * self.kernel.observation_model(X[0])
-
-
-def faster_cel(kernel, X, y, diag=None):
-    noise_model = tinygp.noise.Diagonal(diag=diag)
-    matrix = kernel.to_symm_qsm(X)
-    matrix += noise_model.to_qsm()
-    factor = matrix.cholesky()
-    
-    return - 0.5 * (factor.solve(y)**2).sum() - jnp.sum(jnp.log(factor.diag.d)) - 0.5 * factor.shape[0] * jnp.log(2 * jnp.pi)
-faster_cel_GP = jax.jit(faster_cel, device = cpu_device)
-
-class MultiTermKernel(Kernel):
+class MultiTermKernel(CovType):
     r"""Kernel class which solves for the log likelihood for any covariance matrix which
     is the sum of two kronecker products of the covariance matrix in each of two dimensions
     i.e. the full covariance matrix K is given by:
@@ -136,17 +344,18 @@ class MultiTermKernel(Kernel):
         Sigma,
         *K_list,
         cel_dim = 1,
+        never_reduce_dim = False,
         use_stored_values: Optional[bool] = True,
     ):
         
         self.Sigma = Sigma[0], Sigma[1]
         self.K_list = K_list
         self.cel_dim = cel_dim
+        self.never_reduce_dim = never_reduce_dim
         self.N_alpha = len(K_list)
 
-
         self.logL_hessianable = self.logL
-        self.decomp_fn = self.decomp_no_stored_values
+        self.decompose = self.decomp_no_stored_values
            
         # Have different decomposition functions depending on whether previous stored values
         # are to be used to avoid recalculating eigendecompositions
@@ -155,305 +364,374 @@ class MultiTermKernel(Kernel):
         # else:
         #     self.decomp_fn = self.eigendecomp_no_stored_values
 
+    def _rotate_to_cel_dim_wrapper(self, fn, cel_dim):
+
+        def wrapped_fn(R, **kwargs):
+            if cel_dim == 0:
+                R_prime = R.T
+            else:
+                R_prime = R.copy()
+
+            R_prime = fn(R_prime, **kwargs)
+
+            if self.cel_dim == 0:
+                R_prime = R_prime.T
+                
+            return R_prime
+
+        return wrapped_fn
+
+
 
     def decomp_no_stored_values(
         self,
-        hp: PyTree,
-        non_cel_vec: JAXArray,
-        cel_vec: JAXArray,
+        *X: Tuple[JAXArray],
         stored_values: Optional[PyTree] = {},
     ) -> PyTree:
-        r"""Required calculations for the decomposition of the overall matrix ``K`` where the previously
-        stored decomposition of ``K`` cannot be used for the calculation of a new decomposition.
-        This avoids checking if any of the matrices have changed but may result in performing the
-        same eigendecomposition calculations multiple times.
-        
-        We can decompose the inverse of ``K`` into the matrices:
 
-        .. math::
-        
-            K^{-1} = [W_l \otimes W_t] D^{-1} [W_l^T \otimes W_t^T]
-        
-        Where this function will calculate ``W_l``, ``W_t`` and ``D_inv`` and stored them in the
-        ``stored_values`` PyTree for future log likelihood calculations.
-        
-        Note:
-            Values still need to be stored for any log likelihood calculations so this method does
-            not save memory over ``eigendecomp_use_stored_values``. It may however reduce runtimes
-            by avoiding checking if matrices have changed so it could be beneficial if all hyperparameters
-            are being varied simultaneously for each calculation.
-            
-        
-        Args:
-            hp (Pytree): Hyperparameters needed to build the covariance matrices
-                ``Kl``, ``Kt``, ``Sl``, ``St``. Will be unaffected if additional mean function
-                parameters are also included.
-            x_l (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
-                for the observed locations. May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l``
-                different wavelength/vertical regression variables.
-            x_t (JAXArray): Array containing time/horizontal dimension regression variable(s) for the
-                observed locations. May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different
-                time/horizontal regression variables.
-            stored_values (PyTree): This may contain stored values from the decomposition of ``K`` but
-                this method will not make use of it. This dictionary will simply be overwritten with
-                new stored values from the decomposition of ``K``.
-        
-        Returns:
-            PyTree: Stored values from the decomposition of the covariance matrices. For
-            :class:`LuasKernel` this consists of values computed using the eigendecomposition
-            of each matrix and also the log determinant of ``K``.
-        
-        """
-        stored_values["A"] = jnp.stack([K_i[1-self.cel_dim].alpha for K_i in self.K_list], axis = 1)
-        
-        self.Sigma[1-self.cel_dim].cholesky_decomp(hp, non_cel_vec, non_cel_vec)
+        non_cel_vec = X[1-self.cel_dim]
+        cel_vec = X[self.cel_dim]
 
-        # Generate transformed objects, doesn' actually do transformation yet
-        A_tilde = self.Sigma[1-self.cel_dim].cho_solve(stored_values["A"], transpose = 0)
+        # Generate transformations
+        self.Sigma_transf, stored_values_Sigma_transf = self.Sigma[1-self.cel_dim].decompose(non_cel_vec)
 
-        # Evaluates transformation and does eigendecomp
-        stored_values["J_dot"], stored_values["u_H_stack"] = orthonormal_nullspace_gen(A_tilde)
+        # Define transformations which diagonalise Sigma matrix
+        apply_sigma_matrix_sqrt = self._rotate_to_cel_dim_wrapper(self.Sigma_transf.matrix_sqrt, self.cel_dim)
+        apply_sigma_inv_matrix_sqrt = self._rotate_to_cel_dim_wrapper(self.Sigma_transf.matrix_inv_sqrt, self.cel_dim)
 
         # Computes the log determinant of K
-        stored_values["logdetK"] = cel_vec.shape[-1]*self.Sigma[1-self.cel_dim].logdet
+        stored_values["logdetK"] = cel_vec.shape[-1]*stored_values_Sigma_transf["logdetK"]
         
-        return stored_values
-
-
-    
-
-# @jax.jit
-# def radvel_evenfastergen(params, kernel_list, x_l, x_t, X, R):
-
-#     N_alpha = params["A"].shape[1]
-#     N_t = x_t.shape[-1]
-#     N_l = x_l.shape[-1]
-    
-#     inv_sigma = 1/params["sigma"]
-
-#     A = inv_sigma[:, jnp.newaxis] * params["A"]
-    
-#     Lam, U = orthonormal_nullspace_gen(A)
-
-#     R_prime = inv_sigma[:, jnp.newaxis] * R
-
-#     for i in range(N_alpha):
-#         u_R_prime = U[:, i].T @ R_prime
-#         R_prime -= jnp.outer(2*U[:, i], u_R_prime)
-
-#         if i == 0:
-#             kernel = Multiband(
-#                 kernel=kernel_list[i],
-#                 amplitudes=Lam[:, i],
-#             )
-#         else:
-#             kernel += Multiband(
-#                 kernel=kernel_list[i],
-#                 amplitudes=Lam[:, i],
-#             )
-
-#     cel_logL = faster_cel_GP(kernel, X, R_prime[:N_alpha, :].ravel("F"), diag=jnp.ones(N_alpha*N_t))
-
-#     return cel_logL - 0.5 * (R_prime[N_alpha:, :]**2).sum() - N_t * jnp.log(params["sigma"]).sum() - 0.5 * (N_l - N_alpha)*N_t * jnp.log(2*jnp.pi)
-
-
-    
-    
-    def logL(self, hp, x_l, x_t, R, stored_values):
-
-        non_cel_vec = (x_l, x_t)[1-self.cel_dim]
-        cel_vec = (x_l, x_t)[self.cel_dim]
-
-        stored_values = self.decomp_fn(hp, non_cel_vec, cel_vec, stored_values)
+        stored_values["non_cel_rank"] = 0
+        for K_i in self.K_list:
+            stored_values["non_cel_rank"] += K_i[1-self.cel_dim].rank(non_cel_vec)
         
-        if self.cel_dim == 0:
-            R_prime = R.T
+        stored_values["A"] = jnp.zeros((non_cel_vec.shape[-1], stored_values["non_cel_rank"]))
+        stored_values["cel_kernel_order"] = []
+        
+        col_i = 0
+        for (i, K_i) in enumerate(self.K_list):
+            if isinstance(K_i[1-self.cel_dim], Outer):
+                K_i_non_cel, _ = K_i[1-self.cel_dim].decompose(non_cel_vec)
+                stored_values["A"] = stored_values["A"].at[:, col_i].set(K_i_non_cel.alpha)
+                stored_values["cel_kernel_order"].append(K_i[self.cel_dim])
+                col_i += 1
+            else:
+                K_i_non_cel, _ = K_i[1-self.cel_dim].decompose(non_cel_vec)
+                
+                for j in range(non_cel_vec.shape[-1]):
+                    stored_values["A"] = stored_values["A"].at[:, col_i].set(K_i_non_cel.factor[:, j])
+                    stored_values["cel_kernel_order"].append(K_i[self.cel_dim])
+                    col_i += 1
+        
+        # Transform vectors 
+        stored_values["J"] = apply_sigma_inv_matrix_sqrt(stored_values["A"], transpose = 0)
+
+        # Handle Sigma mat in the cel_dim, likely just diagonal
+        if type(self.Sigma[self.cel_dim]) in [GeneralQuasisep, Exp]:
+            stored_values["J"] = jnp.stack([stored_values["J"], jnp.eye(non_cel_vec.shape[-1])], axis = 1)
+
+            for j in range(non_cel_vec.shape[-1]):
+                stored_values["cel_kernel_order"].append(self.Sigma[self.cel_dim])
+                
+            cel_diag = jnp.zeros(cel_vec.shape[-1])
         else:
-            R_prime = R.copy()
+            cel_diag = (self.Sigma[self.cel_dim].diag + self.Sigma[self.cel_dim].wn_diag)*jnp.ones(cel_vec.shape[-1])
 
-        R_prime = self.Sigma[1-self.cel_dim].cho_solve(R_prime, transpose = 0)
+        # If the total rank is less than the length of that dimension, we can reduce the dimension by exploiting sparsity
+        reduce_dim = stored_values["non_cel_rank"] < non_cel_vec.shape[-1] and not self.never_reduce_dim
 
-        for i in range(self.N_alpha):
-            u_R_prime = stored_values["u_H_stack"][:, i].T @ R_prime
-            R_prime -= jnp.outer(2*stored_values["u_H_stack"][:, i], u_R_prime)
-    
+        if reduce_dim:
+            stored_values["J"], householder_transform = orthonormal_nullspace_gen(stored_values["J"])
+   
+            def transform_fn(R, transpose = 0):
+                
+                if self.cel_dim == 0:
+                    R_prime = R.T
+                else:
+                    R_prime = R.copy()
+
+                if transpose:
+                    R_prime = self.Sigma_transf.matrix_sqrt(R_prime, transpose = 1)
+                    R_prime = householder_transform(R_prime, transpose = 0)
+                else:
+                    R_prime = householder_transform(R_prime, transpose = 1)
+                    R_prime = self.Sigma_transf.matrix_sqrt(R_prime, transpose = 0)
+
+                if self.cel_dim == 0:
+                    R_prime = R_prime.T
+                    
+                return R_prime
+
+            def inv_transform_fn(R, transpose = 0):
+                
+                if self.cel_dim == 0:
+                    R_prime = R.T
+                else:
+                    R_prime = R.copy()
+
+                if transpose:
+                    R_prime = householder_transform(R_prime, transpose = 1)
+                    R_prime = self.Sigma_transf.matrix_inv_sqrt(R_prime, transpose = 1)
+                else:
+                    R_prime = self.Sigma_transf.matrix_inv_sqrt(R_prime, transpose = 0)
+                    R_prime = householder_transform(R_prime, transpose = 0)
+
+                if self.cel_dim == 0:
+                    R_prime = R_prime.T
+                    
+                return R_prime
+                
+            self.transform_fn = transform_fn
+            self.inv_transform_fn = inv_transform_fn
+            
+            # x_t_long = jnp.kron(cel_vec, jnp.ones(stored_values["non_cel_rank"]))
+            # x_l_long = jnp.kron(jnp.ones(cel_vec.shape[-1], dtype = int), jnp.arange(stored_values["non_cel_rank"]))
+
+            total_cel_diag = jnp.kron(cel_diag, jnp.ones(stored_values["non_cel_rank"]))
+
+        else:
+
+            self.transform_fn = apply_sigma_matrix_sqrt
+            self.inv_transform_fn = apply_sigma_inv_matrix_sqrt
+            
+            # x_t_long = jnp.kron(cel_vec, jnp.ones(non_cel_vec.shape[-1]))
+            # x_l_long = jnp.kron(jnp.ones(cel_vec.shape[-1], dtype = int), jnp.arange(non_cel_vec.shape[-1]))
+
+            total_cel_diag = jnp.kron(cel_diag, jnp.ones(non_cel_vec.shape[-1]))
+                
+
+        # Build quasiseparable kernel with tinygp
+        for i in range(stored_values["non_cel_rank"]):
+            # if stored_values["cel_kernel_order"][i].diag or stored_values["cel_kernel_order"][i].wn_diag:
+            #     raise Exception("Adding diagonal terms to this celerite term not yet supported with this optimisation")
+            
             if i == 0:
-                kernel = Multiband(
-                    kernel=self.K_list[i][self.cel_dim].kf,
-                    amplitudes=stored_values["J_dot"][:, i],
+                kernel_tinygp = Multiband(
+                    kernel=stored_values["cel_kernel_order"][i].tinygp_kf,
+                    amplitudes=stored_values["J"][:, i],
                 )
             else:
-                kernel += Multiband(
-                    kernel=self.K_list[i][self.cel_dim].kf,
-                    amplitudes=stored_values["J_dot"][:, i],
+                kernel_tinygp += Multiband(
+                    kernel=stored_values["cel_kernel_order"][i].tinygp_kf,
+                    amplitudes=stored_values["J"][:, i],
                 )
-
-        D_cel = (self.Sigma[self.cel_dim].diag + self.Sigma[self.cel_dim].wn_diag)*jnp.ones(cel_vec.shape[-1])
-        D_cel_inv_sqrt = 1/jnp.sqrt(D_cel)
-        diag_part = R_prime[self.N_alpha:, :] * D_cel_inv_sqrt
-
-        x_t_long = jnp.kron(cel_vec, jnp.ones(self.N_alpha))
-        x_l_long = jnp.kron(jnp.ones(cel_vec.shape[-1], dtype = int), jnp.arange(self.N_alpha))
-        X = (x_t_long, x_l_long)
         
-        cel_logL = faster_cel_GP(kernel, X, R_prime[:self.N_alpha, :].ravel("F"), diag=jnp.kron(D_cel, jnp.ones(self.N_alpha)))
+        kf_quasi2D = GeneralQuasisep2D(kernel_tinygp, diag = total_cel_diag, cel_dim=self.cel_dim)
 
-        logL = cel_logL - 0.5 * (diag_part**2).sum() - 0.5 * stored_values["logdetK"] - 0.5 * (non_cel_vec.shape[-1] - self.N_alpha)*cel_vec.shape[-1] * jnp.log(2*jnp.pi)
-        logL += -0.5 * (non_cel_vec.shape[-1] - self.N_alpha) * jnp.log(D_cel).sum()
-    
-        return logL, stored_values
+        if reduce_dim:
+            if isinstance(self.Sigma[self.cel_dim], (Identity, ScaledIdentity, Diagonal)):
+                null_space_rank = non_cel_vec.shape[-1] - stored_values["non_cel_rank"]
+                if self.cel_dim == 0:
+                    rest_cel_diag = jnp.outer(cel_diag, jnp.ones(null_space_rank))
+                else:
+                    rest_cel_diag = jnp.outer(jnp.ones(null_space_rank), cel_diag)
+                    
+                kf_D = WhiteNoiseKernel(diag = rest_cel_diag)
+            else:
+                if self.cel_dim == 0:
+                    kf_D = SingleKronTermKernel((self.Sigma[self.cel_dim], Identity()))
+                else:
+                    kf_D = SingleKronTermKernel((Identity(), self.Sigma[self.cel_dim]))
+
+            print("kf_A", kf_quasi2D, "kf_D_CAB", kf_D, "dim_split", 1-self.cel_dim, "split_loc", stored_values["non_cel_rank"], "cel_dim",self.cel_dim)
+            self.kf_tilde = Block2x2Kernel(kf_quasi2D, kf_D_CAB = kf_D, dim_split = 1-self.cel_dim, split_loc = stored_values["non_cel_rank"])
+        else:
+            self.kf_tilde = kf_quasi2D
+        
+        self.kf_tilde, stored_values["kf_tilde_stored"] = self.kf_tilde.decompose(X)
+
+        return self, stored_values
         
 
-
-    # This is terribly coded but a start
-    def fast_LA(self, D_tensor, b_mat, stored_values):
-        
-        N_b = D_tensor.shape[0]
-        N_l = D_tensor.shape[1]
-        N_t = b_mat.shape[1]
-
-        # Calc celerite block inverse times each time vector
-        b_vecs = jnp.kron(b_mat, jnp.ones((N_l, 1, 1)))
-        L_inv_b = calc_Linv_mat_vmap(*stored_values["cel_decomp"], b_vecs)
-
-        # Multiply each pair of time vectors and sum over time dimension
-        # Computes diagonal entries of diagonal matrices D_ij
-        D_ij = L_inv_b[None, :, :, :] * L_inv_b[:, None, :, :]
-        D_ij = D_ij.sum(3)
-        
-        # JAX/NumPy treats tensor matrix multiplication as if it is a stack of matrices stored in last two dimensions
-        # Which works here as D_tensor is of shape (N_b, N_l, N_l)
-        W_l_D = stored_values["W_l"].T @ D_tensor
-        
-        # Dj_W_l_D shape will initially be (N_b, N_b, N_l, N_l)
-        Dj_W_l_D = D_ij[:, :, :, jnp.newaxis] * W_l_D[:, :, :]
-
-        # We then sum over axis 1, summing over j
-        Dj_W_l_D = Dj_W_l_D.sum(1)
-
-        # Must be careful to transpose W_l_D just along the two wavelength axes
-        # Broadcasting will result in N_b stacks of matrices multiplying together
-        TKT = jnp.transpose(W_l_D, (0, 2, 1)) @ Dj_W_l_D
-
-        # We then do our second sum over axis 0, summing over i
-        TKT = TKT.sum(0)
-
-        # Finally we invert T.T K^-1 T to get our covariance matrix
-        Sigma_d = jnp.linalg.inv(TKT)
-        logdetSigma_d = -jnp.linalg.slogdet(TKT)[1]
-    
-        return Sigma_d, logdetSigma_d
-
-
-    
-    def generate_noise(
+    def matrix_sqrt(
         self,
-        hp: PyTree,
-        x_l: JAXArray,
-        x_t: JAXArray,
-        size: Optional[int] = 1,
-        wn: Optional[bool] = True,
-        z = None,
-    ) -> JAXArray:
-        r"""Generate noise with the covariance matrix returned by this kernel using the input
-        hyperparameters ``hp``.
-        
-        Solves for the matrix square root of K and then multiplies this by a random normal vector.
-        Doing it this way has numerical stability advantages over generating noise separately for
-        each of the two kronecker products of K as they might not both be well-conditioned matrices.
-        
-        Args:
-            hp (Pytree): Hyperparameters needed to build the covariance matrices
-                ``Kl``, ``Kt``, ``Sl``, ``St``. Will be unaffected if additional mean function
-                parameters are also included.
-            x_l (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
-                for the observed locations. May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l``
-                different wavelength/vertical regression variables.
-            x_t (JAXArray): Array containing time/horizontal dimension regression variable(s) for the
-                observed locations. May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different
-                time/horizontal regression variables.
-            size (int, optional): The number of different draws of noise to generate. Defaults to 1.
-            wn (bool, optional): Whether to include white noise when generating noise. Must have
-                a `wn` keyword argument in all kernel functions ``Kl``, ``Kt``, ``Sl``, ``St``.
-                
-        Returns:
-            JAXArray: If ``size = 1`` will generate noise of shape ``(N_l, N_t)``, otherwise if ``size > 1`` then
-            generated noise will be of shape ``(N_l, N_t, size)``.
-        
-        """
-        
-        raise Exception("Not yet implemented!")
-
-
-    
-    def solve(
-        self,
-        hp: PyTree,
-        x_l: JAXArray,
-        x_t: JAXArray,
         R: JAXArray,
-        stored_values,
+        transpose = 0,
     ) -> JAXArray:
-        r"""Calculates the product of the inverse of the covariance matrix with a vector, represented by
-        a JAXArray of shape ``(N_l, N_t)``. Useful for testing for numerical stability.
-        
-        Args:
-            hp (Pytree): Hyperparameters needed to build the covariance matrices
-                ``Kl``, ``Kt``, ``Sl``, ``St``. Will be unaffected if additional mean function
-                parameters are also included.
-            x_l (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
-                for the observed locations. May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l``
-                different wavelength/vertical regression variables.
-            x_t (JAXArray): Array containing time/horizontal dimension regression variable(s) for the
-                observed locations. May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different
-                time/horizontal regression variables.
-            R (JAXArray): JAXArray of shape ``(N_l, N_t)`` representing the vector to multiply on the right by
-                the inverse of the covariance matrix ``K``.
-                
-        Returns:
-            JAXArray: The result of multiplying the inverse of the covariance matrix ``K`` by the vector ``R``.
-        
-        """
-        
-        raise Exception("Not implemented!")
-    
-    
-    def K_mult_vec(
-        self,
-        hp: PyTree,
-        x_l: JAXArray,
-        x_t: JAXArray,
-        R: JAXArray,
-        stored_values,
-        **kwargs,
-    ) -> JAXArray:
-        r"""Calculates the product of the covariance matrix with a vector, represented by a JAXArray of shape ``(N_l, N_t)`.
-        Useful for testing for numerical stability.
-        
-        Args:
-            hp (Pytree): Hyperparameters needed to build the covariance matrices
-                ``Kl``, ``Kt``, ``Sl``, ``St``. Will be unaffected if additional mean function
-                parameters are also included.
-            x_l (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
-                for the observed locations. May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l``
-                different wavelength/vertical regression variables.
-            x_t (JAXArray): Array containing time/horizontal dimension regression variable(s) for the
-                observed locations. May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different
-                time/horizontal regression variables.
-            R (JAXArray): JAXArray of shape ``(N_l, N_t)`` representing the vector to multiply on the right by
-                the covariance matrix ``K``.
-                
-        Returns:
-            JAXArray: The result of multiplying the covariance matrix ``K`` by the vector ``R``.
-        
-        """
-        
-        R_prime = self.Sigma[0].left_mult(R, hp, x_l, x_l, **kwargs)
-        Kr = self.Sigma[1].left_mult(R_prime.T, hp, x_t, x_t, **kwargs).T
 
-        for i in range(len(self.K_list)):
-            R_prime = self.K_list[i][0].left_mult(R, hp, x_l, x_l, **kwargs)
-            Kr += self.K_list[i][1].left_mult(R_prime.T, hp, x_t, x_t, **kwargs).T
+        if transpose:
+            R_prime = self.transform_fn(R, transpose = 1)
+            R_prime = self.kf_tilde.matrix_sqrt(R_prime, transpose = 1)
+        else:
+            R_prime = self.kf_tilde.matrix_sqrt(R, transpose = 0)
+            R_prime = self.transform_fn(R_prime, transpose = 0)
         
-        return Kr
+        return R_prime
+
+
+    def matrix_inv_sqrt(
+        self,
+        R: JAXArray,
+        transpose = 0,
+    ) -> JAXArray:
+
+        if transpose:
+            R_prime = self.kf_tilde.matrix_inv_sqrt(R, transpose = 1)
+            R_prime = self.inv_transform_fn(R_prime, transpose = 1)
+        else:
+            R_prime = self.inv_transform_fn(R, transpose = 0)
+            R_prime = self.kf_tilde.matrix_inv_sqrt(R_prime, transpose = 0)
+        
+        return R_prime
+        
+
+    def logL(
+        self,
+        R: JAXArray,
+        stored_values: PyTree,
+    ) -> Tuple[Scalar, PyTree]:
+        
+        R_prime = self.inv_transform_fn(R, transpose = 0)
+        logL_tilde = self.kf_tilde.logL(R_prime, stored_values["kf_tilde_stored"])
+        
+        return logL_tilde - 0.5 * stored_values["logdetK"]
+
+
+    def matmul(self, X1, X2, R, **kwargs):
+
+        K_R = tensor_mult(self.Sigma, X1, X2, R, **kwargs)
+
+        for K in self.K_list:
+            K_R += tensor_mult(K, X1, X2, R, **kwargs)
+        
+        return K_R
+
+    
+    # def logL(self, R, stored_values):
+
+    #     # non_cel_vec = (x_l, x_t)[1-self.cel_dim]
+    #     # cel_vec = (x_l, x_t)[self.cel_dim]
+
+    #     # stored_values = self.decomp_fn(hp, non_cel_vec, cel_vec, stored_values)
+        
+    #     if self.cel_dim == 0:
+    #         R_prime = R.T
+    #     else:
+    #         R_prime = R.copy()
+
+    #     R_prime = self.Sigma[1-self.cel_dim].cho_solve(R_prime, transpose = 0)
+
+    #     for i in range(stored_values["non_cel_rank"]):
+
+    #         # print(i, stored_values["cel_kernel_order"])
+    #         # cel_kernel = self.total_K_list[stored_values["cel_kernel_order"][i]][self.cel_dim].kf
+    #         cel_kernel = stored_values["cel_kernel_order"][i].kf
+
+    #         if stored_values["cel_kernel_order"][i].diag or stored_values["cel_kernel_order"][i].wn_diag:
+    #             # If diagonal terms added to these celerite kernels then probably need to add some
+    #             # New terms for that too
+    #             raise Exception("Adding diagonal terms to this celerite term not yet supported with this optimisation")
+            
+    #         if i == 0:
+    #             kernel = Multiband(
+    #                 kernel=cel_kernel,
+    #                 amplitudes=stored_values["J"][:, i],
+    #             )
+    #         else:
+    #             kernel += Multiband(
+    #                 kernel=cel_kernel,
+    #                 amplitudes=stored_values["J"][:, i],
+    #             )
+
+    #     D_cel = (self.Sigma[self.cel_dim].diag + self.Sigma[self.cel_dim].wn_diag)*jnp.ones(cel_vec.shape[-1])
+
+    #     x_t_long = jnp.kron(cel_vec, jnp.ones(non_cel_vec.shape[-1]))
+    #     x_l_long = jnp.kron(jnp.ones(cel_vec.shape[-1], dtype = int), jnp.arange(non_cel_vec.shape[-1]))
+    #     X = (x_t_long, x_l_long)
+        
+    #     cel_logL = faster_cel_GP(kernel, X, R_prime.ravel("F"),
+    #                              diag=jnp.kron(D_cel, jnp.ones(non_cel_vec.shape[-1])))
+
+    #     logL = cel_logL - 0.5 * stored_values["logdetK"]
+    
+    #     return logL, stored_values
+        
+
+
+    # def matmul(
+    #     self,
+    #     X1: Tuple[JAXArray],
+    #     X2: Tuple[JAXArray],
+    #     R: JAXArray,
+    #     **kwargs,
+    # ) -> JAXArray:
+    #     r"""Calculates the product of the covariance matrix with a vector, represented by a JAXArray of shape ``(N_l, N_t)`.
+    #     Useful for testing for numerical stability.
+        
+    #     Args:
+    #         hp (Pytree): Hyperparameters needed to build the covariance matrices
+    #             ``Kl``, ``Kt``, ``Sl``, ``St``. Will be unaffected if additional mean function
+    #             parameters are also included.
+    #         x_l (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
+    #             for the observed locations. May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l``
+    #             different wavelength/vertical regression variables.
+    #         x_t (JAXArray): Array containing time/horizontal dimension regression variable(s) for the
+    #             observed locations. May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different
+    #             time/horizontal regression variables.
+    #         R (JAXArray): JAXArray of shape ``(N_l, N_t)`` representing the vector to multiply on the right by
+    #             the covariance matrix ``K``.
+                
+    #     Returns:
+    #         JAXArray: The result of multiplying the covariance matrix ``K`` by the vector ``R``.
+        
+    #     """
+        
+    #     R_prime = self.Sigma[0].matmul(X1, x2, **kwargs)
+    #     Kr = self.Sigma[1].left_mult(R_prime.T, hp, x_t, x_t, **kwargs).T
+
+    #     for i in range(len(self.K_list)):
+    #         R_prime = self.K_list[i][0].left_mult(R, hp, x_l, x_l, **kwargs)
+    #         Kr += self.K_list[i][1].left_mult(R_prime.T, hp, x_t, x_t, **kwargs).T
+        
+    #     return Kr
+
+
+def orthonormal_nullspace_gen(A):
+    
+    N_l = A.shape[0]
+    N_alpha = A.shape[1]
+
+    V = jnp.zeros_like(A)
+    U = jnp.zeros_like(A)
+    Lam = jnp.zeros((N_alpha, N_alpha))
+
+    for i in range(N_alpha):
+        v_i = A[:, i]
+        for j in range(i):
+            Lam = Lam.at[j, i].set(jnp.dot(v_i, V[:, j]))
+            v_i -= Lam[j, i] * V[:, j]
+            
+        Lam = Lam.at[i, i].set(jnp.linalg.norm(v_i))
+        v_i /= Lam[i, i]
+        V = V.at[:, i].set(v_i)
+    
+    # Householder vector
+    for i in range(N_alpha):
+        w_i = V[:, i]
+        for j in range(i):
+            w_i -= 2 * jnp.dot(U[:, j], w_i) * U[:, j]
+
+        e_i = jnp.zeros(N_l)
+        e_i = e_i.at[i].set(1)
+        u_i = w_i - e_i
+        u_i /= jnp.linalg.norm(u_i)
+
+        U = U.at[:, i].set(u_i)
+
+    def householder_transform(R, transpose = 0):
+        R_prime = R.copy()
+
+        if transpose:
+            for i in range(N_alpha):
+                u_R_prime = U[:, -i-1].T @ R_prime
+                R_prime -= jnp.outer(2*U[:, -i-1], u_R_prime)
+        else:
+            for i in range(N_alpha):
+                u_R_prime = U[:, i].T @ R_prime
+                R_prime -= jnp.outer(2*U[:, i], u_R_prime)
+
+        return R_prime
+    
+    return Lam, householder_transform
 

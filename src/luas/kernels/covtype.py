@@ -501,7 +501,7 @@ class GeneralQuasisep(CovType):
     #     elif isinstance(other, CovType):
         
     #     return self.scale(other)
-
+        
     
 class Exp(CovType):
     def __init__(self, l, sigma = 1., params = None):
@@ -599,13 +599,15 @@ class Exp(CovType):
 class Outer(CovType):
     def __init__(self, alpha, params = None):
         self.alpha_init = alpha
-        self.rank = 1
         self.diag = 0.
         self.wn_diag = 0.
         self.params = params
 
         assert is_scalar(self.alpha_init) or isinstance(self.alpha_init, jax.Array) or isinstance(self.alpha_init, np.ndarray)
-    
+
+    def rank(self, x):
+        return 1
+        
     def evaluate(self, x1, x2, **kwargs):
         return jnp.outer(self.alpha_init * jnp.ones(x1.shape[-1]), self.alpha_init * jnp.ones(x2.shape[-1]))
 

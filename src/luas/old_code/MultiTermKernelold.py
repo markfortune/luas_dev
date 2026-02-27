@@ -12,11 +12,12 @@ import tinygp
 from tinygp.solvers.quasisep.core import LowerTriQSM, StrictLowerTriQSM, DiagQSM
 import jax.scipy.linalg as JLA
 
-from luas.kernels.covtype import Outer, Exp, GeneralQuasisep
+from luas.kernels.covtype import Outer
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar
 from luas.kronecker_fns import kron_prod, logdetK_calc, r_K_inv_r, K_inv_vec, logdetK_calc_hessianable
 from luas.jax_convenience_fns import array_to_pytree_2D, get_corr_mat
 
+cpu_device = jax.devices("cpu")[0]
 
 __all__ = [
     "KinvR_block",
@@ -75,16 +76,16 @@ class Multiband(tinygp.kernels.quasisep.Wrapper):
         return self.amplitudes[X[1]] * self.kernel.observation_model(X[0])
 
 
-def faster_cel_GP(kernel, X, y, diag=None):
+def faster_cel(kernel, X, y, diag=None):
     noise_model = tinygp.noise.Diagonal(diag=diag)
     matrix = kernel.to_symm_qsm(X)
     matrix += noise_model.to_qsm()
     factor = matrix.cholesky()
     
     return - 0.5 * (factor.solve(y)**2).sum() - jnp.sum(jnp.log(factor.diag.d)) - 0.5 * factor.shape[0] * jnp.log(2 * jnp.pi)
+faster_cel_GP = jax.jit(faster_cel, device = cpu_device)
 
-
-class GordonKernel(Kernel):
+class MultiTermKernel(Kernel):
     r"""Kernel class which solves for the log likelihood for any covariance matrix which
     is the sum of two kronecker products of the covariance matrix in each of two dimensions
     i.e. the full covariance matrix K is given by:
@@ -140,9 +141,9 @@ class GordonKernel(Kernel):
         
         self.Sigma = Sigma[0], Sigma[1]
         self.K_list = K_list
-        self.total_K_list = K_list + Sigma
         self.cel_dim = cel_dim
         self.N_alpha = len(K_list)
+
 
         self.logL_hessianable = self.logL
         self.decomp_fn = self.decomp_no_stored_values
@@ -203,50 +204,57 @@ class GordonKernel(Kernel):
             of each matrix and also the log determinant of ``K``.
         
         """
-        non_cel_rank = 0
-        for K_i in self.K_list:
-            if type(K_i[1-self.cel_dim]) != Outer:
-                non_cel_rank += non_cel_vec.shape[-1]
-            else:
-                non_cel_rank += 1
+        stored_values["A"] = jnp.stack([K_i[1-self.cel_dim].alpha for K_i in self.K_list], axis = 1)
         
-        stored_values["A"] = jnp.zeros((non_cel_vec.shape[-1], non_cel_rank))
-        stored_values["cel_kernel_order"] = []
-        
-        col_i = 0
-        for (i, K_i) in enumerate(self.K_list):
-            if type(K_i[1-self.cel_dim]) != Outer:
-                K_i[1-self.cel_dim].cholesky_decomp(hp, non_cel_vec, non_cel_vec)
-                
-                for j in range(non_cel_vec.shape[-1]):
-                    stored_values["A"] = stored_values["A"].at[:, col_i].set(K_i[1-self.cel_dim].factor[:, j])
-                    stored_values["cel_kernel_order"].append(K_i[self.cel_dim])
-                    col_i += 1
-            else:
-                stored_values["A"] = stored_values["A"].at[:, col_i].set(K_i[1-self.cel_dim].alpha)
-                # stored_values["cel_kernel_order"] = stored_values["cel_kernel_order"].at[col_i].set(i)
-                stored_values["cel_kernel_order"].append(K_i[self.cel_dim])
-                col_i += 1
-                
         self.Sigma[1-self.cel_dim].cholesky_decomp(hp, non_cel_vec, non_cel_vec)
 
         # Generate transformed objects, doesn' actually do transformation yet
-        stored_values["J"] = self.Sigma[1-self.cel_dim].cho_solve(stored_values["A"], transpose = 0)
-        
-        if type(self.Sigma[self.cel_dim]) in [GeneralQuasisep, Exp]:
-            stored_values["J"] = jnp.stack([stored_values["J"], jnp.eye(non_cel_vec.shape[-1])], axis = 1)
-
-            for j in range(non_cel_vec.shape[-1]):
-                stored_values["cel_kernel_order"].append(self.Sigma[self.cel_dim])
+        A_tilde = self.Sigma[1-self.cel_dim].cho_solve(stored_values["A"], transpose = 0)
 
         # Evaluates transformation and does eigendecomp
-        # stored_values["J_dot"], stored_values["u_H_stack"] = orthonormal_nullspace_gen(A_tilde)
+        stored_values["J_dot"], stored_values["u_H_stack"] = orthonormal_nullspace_gen(A_tilde)
 
         # Computes the log determinant of K
         stored_values["logdetK"] = cel_vec.shape[-1]*self.Sigma[1-self.cel_dim].logdet
-        stored_values["non_cel_rank"] = non_cel_rank
         
         return stored_values
+
+
+    
+
+# @jax.jit
+# def radvel_evenfastergen(params, kernel_list, x_l, x_t, X, R):
+
+#     N_alpha = params["A"].shape[1]
+#     N_t = x_t.shape[-1]
+#     N_l = x_l.shape[-1]
+    
+#     inv_sigma = 1/params["sigma"]
+
+#     A = inv_sigma[:, jnp.newaxis] * params["A"]
+    
+#     Lam, U = orthonormal_nullspace_gen(A)
+
+#     R_prime = inv_sigma[:, jnp.newaxis] * R
+
+#     for i in range(N_alpha):
+#         u_R_prime = U[:, i].T @ R_prime
+#         R_prime -= jnp.outer(2*U[:, i], u_R_prime)
+
+#         if i == 0:
+#             kernel = Multiband(
+#                 kernel=kernel_list[i],
+#                 amplitudes=Lam[:, i],
+#             )
+#         else:
+#             kernel += Multiband(
+#                 kernel=kernel_list[i],
+#                 amplitudes=Lam[:, i],
+#             )
+
+#     cel_logL = faster_cel_GP(kernel, X, R_prime[:N_alpha, :].ravel("F"), diag=jnp.ones(N_alpha*N_t))
+
+#     return cel_logL - 0.5 * (R_prime[N_alpha:, :]**2).sum() - N_t * jnp.log(params["sigma"]).sum() - 0.5 * (N_l - N_alpha)*N_t * jnp.log(2*jnp.pi)
 
 
     
@@ -265,38 +273,33 @@ class GordonKernel(Kernel):
 
         R_prime = self.Sigma[1-self.cel_dim].cho_solve(R_prime, transpose = 0)
 
-        for i in range(stored_values["non_cel_rank"]):
-
-            # print(i, stored_values["cel_kernel_order"])
-            # cel_kernel = self.total_K_list[stored_values["cel_kernel_order"][i]][self.cel_dim].kf
-            cel_kernel = stored_values["cel_kernel_order"][i].kf
-
-            if stored_values["cel_kernel_order"][i].diag or stored_values["cel_kernel_order"][i].wn_diag:
-                # If diagonal terms added to these celerite kernels then probably need to add some
-                # New terms for that too
-                raise Exception("Adding diagonal terms to this celerite term not yet supported with this optimisation")
-            
+        for i in range(self.N_alpha):
+            u_R_prime = stored_values["u_H_stack"][:, i].T @ R_prime
+            R_prime -= jnp.outer(2*stored_values["u_H_stack"][:, i], u_R_prime)
+    
             if i == 0:
                 kernel = Multiband(
-                    kernel=cel_kernel,
-                    amplitudes=stored_values["J"][:, i],
+                    kernel=self.K_list[i][self.cel_dim].kf,
+                    amplitudes=stored_values["J_dot"][:, i],
                 )
             else:
                 kernel += Multiband(
-                    kernel=cel_kernel,
-                    amplitudes=stored_values["J"][:, i],
+                    kernel=self.K_list[i][self.cel_dim].kf,
+                    amplitudes=stored_values["J_dot"][:, i],
                 )
 
         D_cel = (self.Sigma[self.cel_dim].diag + self.Sigma[self.cel_dim].wn_diag)*jnp.ones(cel_vec.shape[-1])
+        D_cel_inv_sqrt = 1/jnp.sqrt(D_cel)
+        diag_part = R_prime[self.N_alpha:, :] * D_cel_inv_sqrt
 
-        x_t_long = jnp.kron(cel_vec, jnp.ones(non_cel_vec.shape[-1]))
-        x_l_long = jnp.kron(jnp.ones(cel_vec.shape[-1], dtype = int), jnp.arange(non_cel_vec.shape[-1]))
+        x_t_long = jnp.kron(cel_vec, jnp.ones(self.N_alpha))
+        x_l_long = jnp.kron(jnp.ones(cel_vec.shape[-1], dtype = int), jnp.arange(self.N_alpha))
         X = (x_t_long, x_l_long)
         
-        cel_logL = faster_cel_GP(kernel, X, R_prime.ravel("F"),
-                                 diag=jnp.kron(D_cel, jnp.ones(non_cel_vec.shape[-1])))
+        cel_logL = faster_cel_GP(kernel, X, R_prime[:self.N_alpha, :].ravel("F"), diag=jnp.kron(D_cel, jnp.ones(self.N_alpha)))
 
-        logL = cel_logL - 0.5 * stored_values["logdetK"]
+        logL = cel_logL - 0.5 * (diag_part**2).sum() - 0.5 * stored_values["logdetK"] - 0.5 * (non_cel_vec.shape[-1] - self.N_alpha)*cel_vec.shape[-1] * jnp.log(2*jnp.pi)
+        logL += -0.5 * (non_cel_vec.shape[-1] - self.N_alpha) * jnp.log(D_cel).sum()
     
         return logL, stored_values
         

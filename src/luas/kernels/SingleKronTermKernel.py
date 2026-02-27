@@ -136,7 +136,7 @@ class SingleKronTermKernel(CovType):
             R_prime = self.Sigma[d].matrix_sqrt(R_prime, transpose = transpose)
             R_prime = cyclic_transpose(R_prime, 1)
             
-        R_prime = cyclic_transpose(R, -2)
+        R_prime = cyclic_transpose(R_prime, -2)
         
         return R_prime
 

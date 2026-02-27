@@ -85,9 +85,8 @@ class WhiteNoiseKernel(CovType):
         **kwargs,
     ) -> JAXArray:
 
-        
         self.D = self.diag + wn * self.wn_diag
-        logdetK = jnp.log(self.diag).sum()
+        logdetK = jnp.log(self.D).sum()
         
         return self, {"logdetK":logdetK}
 
@@ -120,6 +119,20 @@ class WhiteNoiseKernel(CovType):
     ) -> JAXArray:
 
         return jnp.sum(jnp.square(R)/self.D)
+
+    def block_dot_solve(
+        self,
+        v1: JAXArray,
+        v2: JAXArray,
+        vec_dim: int,
+    ) -> JAXArray:
+
+        vec_prod = v1 * v2
+
+        diag_vals = jnp.tensordot(1/self.D, vec_prod, axes=([vec_dim], [0]))
+
+        return diag_vals
+        
     
     def logL(self, R, stored_values, **kwargs):
         
@@ -130,11 +143,12 @@ class WhiteNoiseKernel(CovType):
         X1: Tuple,
         X2: Tuple,
         R: JAXArray,
+        wn = True,
     ) -> JAXArray:
         
         self.D = self.diag + wn * self.wn_diag
         return R * self.D
-
+        
     
     def predict(
         self,

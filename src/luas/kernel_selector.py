@@ -18,7 +18,6 @@ from luas.kernels import (
     LuasLasrachKernel,
     MultiTermKernel,
     GeneralKernel,
-    GordonKernel,
 )
 
 cov_types_1D = [covtype.General, covtype.GeneralQuasisep, covtype.Diagonal, covtype.Exp,

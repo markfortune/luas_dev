@@ -111,8 +111,13 @@ def tensor_mult(kron_mat_list, X1, X2, R, **kwargs):
     
     for d in range(gp_dim):
         method = getattr(kron_mat_list[d], "matmul")
-        
-        R_prime = method(X1[d], X2[d], R_prime, **kwargs)
+
+        matmul_fn = lambda R, **kwargs: method(X1[d], X2[d], R, **kwargs)
+
+        if gp_dim > 2:
+            matmul_fn = vmap_for_tensors(matmul_fn)
+            
+        R_prime = matmul_fn(R_prime, **kwargs)
         R_prime = cyclic_transpose(R_prime, 1)
         
     R_prime = cyclic_transpose(R_prime, -2)
@@ -176,7 +181,7 @@ def calc_data_shape(X):
         return (X.shape[-1],)
         
     # Otherwise assume it's an iterable of arrays
-    return sum([(x_i.shape[-1],) for x_i in X])
+    return sum([(x_i.shape[-1],) for x_i in X], ())
 
     
 @custom_jvp

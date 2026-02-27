@@ -44,7 +44,10 @@ class HODLR(CovType):
         return self, {"logdetK": self.logdet}
 
     def matrix_sqrt(self, R, **kwargs):
-         return self.gp_hodlr.solver.apply_sqrt(R)
+         raise Exception("george backend doesn't implement matrix_inv_sqrt for HODLR solver")
+
+    def matrix_sqrt(self, R, **kwargs):
+         raise Exception("george backend doesn't implement matrix_sqrt for HODLR solver")
 
     def dot_solve(self, R):
         return self.gp_hodlr.solver.dot_solve(R)
@@ -57,13 +60,6 @@ class HODLR(CovType):
         
         return self.gp_hodlr.apply_inverse(R)
 
-    def eigendecomp(self, x, wn = True, **kwargs):
-        raise Exception("Not implemented")
-
-    # There's a faster way of doing this I've yet to implement
-    def matmul(self, x1, x2, wR, n = True, **kwargs):
-        raise Exception("Not implemented")
-        
     def scale(self, c):
         return HODLR(self.kf_hodlr * c, diag = self.diag * c, wn_diag = self.wn_diag * c, tol = self.tol)
 

@@ -1,3 +1,4 @@
+import tinygp
 from tinygp.kernels.quasisep import Quasisep
 import jax.numpy as jnp
 import jax.scipy as jsp
@@ -6,6 +7,18 @@ import equinox as eqx
 import numpy as np
 import matplotlib.pyplot as plt
 from luas.luas_types import JAXArray
+
+
+@tinygp.helpers.dataclass
+class Multiband(tinygp.kernels.quasisep.Wrapper):
+    amplitudes: jnp.ndarray
+
+    def coord_to_sortable(self, X):
+        return X[0]
+
+    def observation_model(self, X):
+        return self.amplitudes[X[1]] * self.kernel.observation_model(X[0])
+
 
 class MaternNuHalf(Quasisep):
     nu: int = eqx.field(static=True)

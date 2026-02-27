@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import jax.scipy.linalg as JLA
 from jax.flatten_util import ravel_pytree
 
-from luas.kernels.covtype import CovType
+from luas.kernels.covtype import CovType, General
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar
 from luas.kronecker_fns import make_vec, make_mat, kron_prod, tensor_mult
 from luas.jax_convenience_fns import array_to_pytree_2D
@@ -62,9 +62,13 @@ class GeneralKernel(CovType):
         use_stored_values = False,
     ):
         # Function used to build the covariance matrix K
-        if isinstance(Sigma, CovType):
+        if isinstance(Sigma, CovType) and K_list != ():
+            # Case of a single Kronecker term (optimised version is SingleKronTermKernel)
             self.Sigma = (Sigma,) + K_list
             self.K_list = ()
+        elif isinstance(Sigma, CovType) and K_list == ():
+            # Case of a one dimensional GP, implemented with General as this term expects a tuple for regression variables
+            self = General(kf = lambda hp, x1, x2, **kwargs: Sigma.evaluate(x1, x2, **kwargs))
         else:
             self.Sigma = Sigma
             self.K_list = K_list

@@ -1,12 +1,8 @@
-from luas.kernels import (
-    WhiteNoiseKernel as WhiteNoiseKernel,
-    SingleKronTermKernel as SingleKronTermKernel,
-    GeneralKernel as GeneralKernel,
-    LuasKernel as LuasKernel,
-    LuasLasrachKernel as LuasLasrachKernel,
-)
-
-from luas import (
-    kernels as kernels,
-    GP as GP,
-)
+from luas.kernels.WhiteNoiseKernel import WhiteNoiseKernel
+from luas.kernels.GeneralKernel import GeneralKernel
+from luas.kernels.SingleKronTermKernel import SingleKronTermKernel
+from luas.kernels.LuasKernel import LuasKernel
+from luas.kernels.LuasLasrachKernel import LuasLasrachKernel, LuasLasrachKernelBlackboxDim
+from luas.kernels.MultiTermKernel import MultiTermKernel
+from luas import kernels as kernels
+from luas.GP import GP

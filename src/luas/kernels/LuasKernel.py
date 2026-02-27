@@ -75,17 +75,11 @@ class LuasKernel(CovType):
         Sigma,
         K,
         use_stored_values: Optional[bool] = False,
-        eigen_dims = None,
     ):
         
         self.Sigma = Sigma
         self.K = K
         self.dim = len(Sigma)
-        
-        if eigen_dims is None:
-            self.eigen_dims = range(self.dim)
-        else:
-            self.eigen_dims = eigen_dims
         
         self.K_list = [K]
            
@@ -130,13 +124,13 @@ class LuasKernel(CovType):
         
         gp_dim = len(X)
 
-        sigma_decomp_mats = ()
-        eigen_decomp_mats = ()
+        self.sigma_decomp_mats = ()
+        self.eigen_decomp_mats = ()
         all_lam = jnp.ones(1)
         all_lam_shape = ()
         stored_values["logdetK"] = 0.
 
-        for d in self.eigen_dims:
+        for d in range(gp_dim):
             Sigma_d_new, stored_values_d = self.Sigma[d].decompose(X[d])
 
             if isinstance(self.K[d], Outer):
@@ -157,8 +151,8 @@ class LuasKernel(CovType):
             all_lam = jnp.kron(all_lam.reshape(all_lam_shape + (1,)), stored_values[f"lam_{d}"])
             all_lam_shape = all_lam.shape
             
-            sigma_decomp_mats += (Sigma_d_new,)
-            eigen_decomp_mats += (stored_values[f"Q_{d}"],)
+            self.sigma_decomp_mats += (Sigma_d_new,)
+            self.eigen_decomp_mats += (stored_values[f"Q_{d}"],)
             stored_values["logdetK"] += (total_size/X[d].shape[-1])*stored_values_d["logdetK"]
 
         def transform_fn(R, transpose = 0):
@@ -167,15 +161,13 @@ class LuasKernel(CovType):
 
             if transpose:
                 for d in range(gp_dim):
-                    if d in self.eigen_dims:
-                        R_prime = sigma_decomp_mats[d].matrix_sqrt(R_prime, transpose = 1)
-                        R_prime = eigen_decomp_mats[d].T @ R_prime
+                    R_prime = self.sigma_decomp_mats[d].matrix_sqrt(R_prime, transpose = 1)
+                    R_prime = self.eigen_decomp_mats[d].T @ R_prime
                     R_prime = cyclic_transpose(R_prime, 1)
             else:
                 for d in range(gp_dim):
-                    if d in self.eigen_dims:
-                        R_prime = eigen_decomp_mats[d] @ R_prime
-                        R_prime = sigma_decomp_mats[d].matrix_sqrt(R_prime, transpose = 0)
+                    R_prime = self.eigen_decomp_mats[d] @ R_prime
+                    R_prime = self.sigma_decomp_mats[d].matrix_sqrt(R_prime, transpose = 0)
                     R_prime = cyclic_transpose(R_prime, 1)
 
             R_prime = cyclic_transpose(R_prime, -2)
@@ -187,15 +179,13 @@ class LuasKernel(CovType):
 
             if transpose:
                 for d in range(gp_dim):
-                    if d in self.eigen_dims:
-                        R_prime = eigen_decomp_mats[d] @ R_prime
-                        R_prime = sigma_decomp_mats[d].matrix_inv_sqrt(R_prime, transpose = 1)
+                    R_prime = self.eigen_decomp_mats[d] @ R_prime
+                    R_prime = self.sigma_decomp_mats[d].matrix_inv_sqrt(R_prime, transpose = 1)
                     R_prime = cyclic_transpose(R_prime, 1)
             else:
                 for d in range(gp_dim):
-                    if d in self.eigen_dims:
-                        R_prime = sigma_decomp_mats[d].matrix_inv_sqrt(R_prime, transpose = 0)
-                        R_prime = eigen_decomp_mats[d].T @ R_prime
+                    R_prime = self.sigma_decomp_mats[d].matrix_inv_sqrt(R_prime, transpose = 0)
+                    R_prime = self.eigen_decomp_mats[d].T @ R_prime
                     R_prime = cyclic_transpose(R_prime, 1)
 
             R_prime = cyclic_transpose(R_prime, -2)
@@ -262,6 +252,70 @@ class LuasKernel(CovType):
         K_R += tensor_mult(self.K, X1, X2, R, **kwargs)
         
         return K_R
+
+    def fast_LA(self, D_tensor, b_mat, stored_values, vec_dim = 1):
+        
+        assert self.dim == 2
+        
+        N_b, N_l, N_t = D_tensor.shape
+
+        assert b_mat.shape == (N_b, D_tensor.shape[vec_dim+1])
+
+        b_vecs_transf = self.sigma_decomp_mats[vec_dim].matrix_inv_sqrt(b_mat.T, transpose = 0)
+        b_vecs_transf = (self.eigen_decomp_mats[vec_dim].T @ b_vecs_transf).T
+
+        block_dot_solve_vmap = jax.vmap(jax.vmap(self.kf_tilde.block_dot_solve, in_axes = (0, None, None)), in_axes = (None, 0, None))
+        diag_tilde_tensor = self.kf_tilde.block_dot_solve(b_vecs_transf, b_vecs_transf, vec_dim)
+
+        def D_transform_fn(D_tensor):
+            D_tensor_tilde = cyclic_transpose(D_tensor, 2)
+            for d in range(gp_dim):
+                if d != vec_sim:
+                    D_tensor_tilde = self.sigma_decomp_mats[vec_dim].matrix_inv_sqrt(D_tensor_tilde)
+                    D_tensor_tilde = self.eigen_decomp_mats[vec_dim].T @ D_tensor_tilde
+                    D_tensor_tilde = cyclic_transpose(D_tensor_tilde, 1)
+            D_tensor_tilde = cyclic_transpose(D_tensor_tilde, -2)
+
+            return D_tensor_tilde
+
+        D_tensor_tilde = jax.vmap(D_transform_fn, in_axes = 0)(D_tensor)
+
+        T_tilde = jnp.tensordot(diag_tilde_tensor, D_tensor_tilde, axes = ([0], [0]))
+        TKT = jnp.tensordot(D_tensor_tilde.T, T_tilde, axes = ([0], [0]))
+        
+
+        # Calc celerite block inverse times each time vector
+        b_vecs = jnp.kron(b_mat, jnp.ones((N_l, 1, 1)))
+        L_inv_b = calc_Linv_mat_vmap(*stored_values["cel_decomp"], b_vecs)
+
+        # Multiply each pair of time vectors and sum over time dimension
+        # Computes diagonal entries of diagonal matrices D_ij
+        D_ij = L_inv_b[None, :, :, :] * L_inv_b[:, None, :, :]
+        D_ij = D_ij.sum(3)
+        
+        # JAX/NumPy treats tensor matrix multiplication as if it is a stack of matrices stored in last two dimensions
+        # Which works here as D_tensor is of shape (N_b, N_l, N_l)
+        W_l_D = stored_values["W_l"].T @ D_tensor
+        
+        # Dj_W_l_D shape will initially be (N_b, N_b, N_l, N_l)
+        Dj_W_l_D = D_ij[:, :, :, jnp.newaxis] * W_l_D[:, :, :]
+
+        # We then sum over axis 1, summing over j
+        Dj_W_l_D = Dj_W_l_D.sum(1)
+
+        # Must be careful to transpose W_l_D just along the two wavelength axes
+        # Broadcasting will result in N_b stacks of matrices multiplying together
+        TKT = jnp.transpose(W_l_D, (0, 2, 1)) @ Dj_W_l_D
+
+        # We then do our second sum over axis 0, summing over i
+        TKT = TKT.sum(0)
+
+        # Finally we invert T.T K^-1 T to get our covariance matrix
+        Sigma_d = jnp.linalg.inv(TKT)
+        logdetSigma_d = -jnp.linalg.slogdet(TKT)[1]
+    
+        return Sigma_d, logdetSigma_d
+
     
     
     def logL_hessianable(

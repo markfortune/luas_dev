@@ -33,11 +33,11 @@ from typing import Optional, Tuple
 
 from luas.kernels.covtype import CovType
 from luas.luas_types import PyTree, JAXArray, Scalar
-from luas.kronecker_fns import calc_total_size, cyclic_transpose, vmap_for_tensors
+from luas.kronecker_fns import calc_total_size, cyclic_transpose, vmap_for_tensors, tensor_mult
 
 __all__ = [
-    "LuasLasrachKernelND",          # callback-friendly (keeps CovType blackbox optimisations)
-    "LuasLasrachKernelNDJIT",       # fully JIT-friendly (dense blackbox blocks)
+    "LuasLasrachKernelBlackboxDim",          # callback-friendly (keeps CovType blackbox optimisations)
+    "LuasLasrachKernel",       # fully JIT-friendly (dense blackbox blocks)
 ]
 
 jax.config.update("jax_enable_x64", True)
@@ -424,16 +424,6 @@ class BlackBoxTildeKernelJITVmap(CovType):
         block_logdets = jax.vmap(block_logdet)(self.lambdas)
         return self, {"logdetK": jnp.sum(block_logdets)}
 
-    def _reshape_to_blocks(self, R: JAXArray):
-        R_perm = jnp.moveaxis(R, self.bb_dim, -1)
-        shape_perm = R_perm.shape
-        R_blocks = R_perm.reshape((-1, self.bb_size))
-        return R_blocks, shape_perm
-
-    def _reshape_from_blocks(self, R_blocks: JAXArray, shape_perm: Tuple[int, ...]):
-        R_perm = R_blocks.reshape(shape_perm)
-        return jnp.moveaxis(R_perm, -1, self.bb_dim)
-
     def matrix_sqrt(self, R: JAXArray, transpose=0) -> JAXArray:
         R_blocks, shape_perm = self._reshape_to_blocks(R)
 
@@ -479,6 +469,17 @@ class BlackBoxTildeKernelJITVmap(CovType):
 
     def logL(self, R: JAXArray, stored_values: PyTree, **kwargs) -> Scalar:
         return -0.5 * self.dot_solve(R) - 0.5 * stored_values["logdetK"] - 0.5 * R.size * jnp.log(2 * jnp.pi)
+    
+    def _reshape_to_blocks(self, R: JAXArray):
+        R_perm = jnp.moveaxis(R, self.bb_dim, -1)
+        shape_perm = R_perm.shape
+        R_blocks = R_perm.reshape((-1, self.bb_size))
+        return R_blocks, shape_perm
+
+    def _reshape_from_blocks(self, R_blocks: JAXArray, shape_perm: Tuple[int, ...]):
+        R_perm = R_blocks.reshape(shape_perm)
+        return jnp.moveaxis(R_perm, -1, self.bb_dim)
+
 
 
 class _LuasLasrachKernelNDBase(CovType):
@@ -519,22 +520,6 @@ class _LuasLasrachKernelNDBase(CovType):
     def _build_kf_tilde(self, lambdas: JAXArray):
         raise NotImplementedError
 
-    def evaluate(self, *X, **kwargs):
-        """Construct the full dense covariance matrix.
-
-        Primarily useful for diagnostics and small-scale validation since this
-        explicitly forms Kronecker products in dense form.
-        """
-        dim = len(X)
-        Sigma_full = self.Sigma[0].evaluate(X[0], X[0], **kwargs)
-        for d in range(1, dim):
-            Sigma_full = jnp.kron(Sigma_full, self.Sigma[d].evaluate(X[d], X[d], **kwargs))
-
-        K_full = self.K[0].evaluate(X[0], X[0], **kwargs)
-        for d in range(1, dim):
-            K_full = jnp.kron(K_full, self.K[d].evaluate(X[d], X[d], **kwargs))
-
-        return Sigma_full + K_full
 
     def eigendecomp_no_stored_values(self, *X: Tuple, stored_values: Optional[PyTree] = None):
         """Decompose kernel without attempting reuse of previous stored values.
@@ -674,8 +659,65 @@ class _LuasLasrachKernelNDBase(CovType):
         logL_tilde = self.kf_tilde.logL(R_prime, stored_values["kf_tilde_stored"])
         return logL_tilde - 0.5 * stored_values["logdetK"]
 
+    
+    def evaluate(self, *X, **kwargs):
+        """Construct the full dense covariance matrix.
 
-class LuasLasrachKernelND(_LuasLasrachKernelNDBase):
+        Primarily useful for diagnostics and small-scale validation since this
+        explicitly forms Kronecker products in dense form.
+        """
+
+        dim = len(X)
+        Sigma = self.Sigma[0].evaluate(X[0], X[0], **kwargs)
+        
+        for d in range(1, dim):
+            Sigma = jnp.kron(Sigma, self.Sigma[d].evaluate(X[d], X[d], **kwargs))
+        
+        for i in range(len(self.K_list)):
+            K = self.K_list[i][0].evaluate(X[0], X[0], **kwargs)
+            for d in range(1, dim):
+                K = jnp.kron(K, self.K_list[i][d].evaluate(X[d], X[d], **kwargs))
+            
+            Sigma += K
+        
+        return Sigma
+
+    def matmul(
+        self,
+        X1,
+        X2,
+        R: JAXArray,
+        **kwargs,
+    ) -> JAXArray:
+        r"""Calculates the product of the covariance matrix with a vector, represented by a JAXArray of shape ``(N_l, N_t)`.
+        Useful for testing for numerical stability.
+        
+        Args:
+            hp (Pytree): Hyperparameters needed to build the covariance matrix ``K``. Will be
+                unaffected if additional mean function parameters are also included.
+            x_l (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
+                for the observed locations. May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l``
+                different wavelength/vertical regression variables.
+            x_t (JAXArray): Array containing time/horizontal dimension regression variable(s) for the
+                observed locations. May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different
+                time/horizontal regression variables.
+            R (JAXArray): JAXArray of shape ``(N_l, N_t)`` representing the vector to multiply on the right by
+                the covariance matrix ``K``.
+                
+        Returns:
+            JAXArray: The result of multiplying the covariance matrix ``K`` by the vector ``R``.
+        
+        """
+
+        R_prime = tensor_mult(self.Sigma, X1, X2, R, **kwargs)
+
+        for i in range(len(self.K_list)):
+            R_prime += tensor_mult(self.K_list[i], X1, X2, R, **kwargs)
+        
+        return R_prime
+
+
+class LuasLasrachKernelBlackboxDim(_LuasLasrachKernelNDBase):
     """ND LuasLasrach kernel with optional callback-based blackbox execution.
 
     Use this class when your blackbox ``CovType`` includes non-JAX code or
@@ -704,11 +746,11 @@ class LuasLasrachKernelND(_LuasLasrachKernelNDBase):
         This substantially accelerates logL-only workloads for non-JAX backends.
     """
 
-    def __init__(self, *args, use_pure_callback: bool = True, callback_mode: str = "per_block_vmap", cache_blocks: bool = True, **kwargs):
+    def __init__(self, *args, use_pure_callback: bool = True, callback_mode: str = "per_block_vmap", use_stored_values: bool = True, **kwargs):
         super().__init__(*args, **kwargs)
         self.use_pure_callback = use_pure_callback
         self.callback_mode = callback_mode
-        self.cache_blocks = cache_blocks
+        self.cache_blocks = use_stored_values
 
     def _build_kf_tilde(self, lambdas: JAXArray):
         return BlackBoxTildeKernelCallback(
@@ -722,7 +764,7 @@ class LuasLasrachKernelND(_LuasLasrachKernelNDBase):
         )
 
 
-class LuasLasrachKernelNDJIT(_LuasLasrachKernelNDBase):
+class LuasLasrachKernel(_LuasLasrachKernelNDBase):
     """Fully JAX/JIT-compatible ND LuasLasrach kernel.
 
     This variant assumes all operations in the blackbox ``CovType`` are JAX
@@ -740,10 +782,3 @@ class LuasLasrachKernelNDJIT(_LuasLasrachKernelNDBase):
             lambdas=lambdas,
             bb_dim=self.blackbox_dim,
         )
-
-def LuasLasrachKernel(jit = True, **kwargs):
-    if jit:
-        return LuasLasrachKernelNDJIT(**kwargs)
-    else:
-        return LuasLasrachKernelND(**kwargs)
-
