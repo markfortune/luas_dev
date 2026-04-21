@@ -78,24 +78,23 @@ class GeneralKernel(CovType):
         self.logL_hessianable = self.logL
     
     
-    def evaluate(self, *X, **kwargs):
+    def evaluate(self, *X, full = True, **kwargs):
 
         dim = len(X)
-        Sigma = self.Sigma[0].evaluate(X[0], X[0], **kwargs)
+        Sigma = self.Sigma[0].evaluate(X[0], X[0], full = full, **kwargs)
         
         for d in range(1, dim):
-            Sigma = jnp.kron(Sigma, self.Sigma[d].evaluate(X[d], X[d], **kwargs))
+            Sigma = jnp.kron(Sigma, self.Sigma[d].evaluate(X[d], X[d], full = full, **kwargs))
         
         for i in range(len(self.K_list)):
-            K = self.K_list[i][0].evaluate(X[0], X[0], **kwargs)
+            K = self.K_list[i][0].evaluate(X[0], X[0], full = full, **kwargs)
             for d in range(1, dim):
-                K = jnp.kron(K, self.K_list[i][d].evaluate(X[d], X[d], **kwargs))
+                K = jnp.kron(K, self.K_list[i][d].evaluate(X[d], X[d], full = full, **kwargs))
             
             Sigma += K
         
         return Sigma
     
-        
     def decompose(
         self,
         *X,
@@ -104,13 +103,12 @@ class GeneralKernel(CovType):
         
         # Simply builds the covariance matrix and decomposes it into a Cholesky factor L
         # and precomputes the log determinant of K for log likelihood calculations
-        K = self.evaluate(*X)
+        K = self.evaluate(*X, full = True)
         self.factor = JLA.cholesky(K, lower = True)
-        stored_values["logdetK"] = 2*jnp.log(jnp.diag(self.factor)).sum()
+        self.logdet = 2*jnp.log(jnp.diag(self.factor)).sum()
         
-        return self, stored_values
+        return self, {"logdet":self.logdet}
 
-    
     def matrix_inv_sqrt(self, R, transpose = 0):
         
         R_shape = R.shape
@@ -124,7 +122,6 @@ class GeneralKernel(CovType):
         r = R.ravel("C")
         r_prime = self.factor @ r
         return r_prime.reshape(R_shape)
-
     
     def dot_solve(self, R):
         
@@ -132,12 +129,6 @@ class GeneralKernel(CovType):
         r_prime = JLA.solve_triangular(self.factor, r, lower = True, trans = 0)
         return jnp.square(r_prime).sum()
 
-    
-    def logL(self, R, stored_values, **kwargs):
-        
-        return - 0.5 * self.dot_solve(R) - 0.5 * stored_values["logdetK"] - 0.5 * R.size * jnp.log(2*jnp.pi)
-
-    
     def matmul(
         self,
         X1,
@@ -171,8 +162,6 @@ class GeneralKernel(CovType):
             R_prime += tensor_mult(self.K_list[i], X1, X2, R, **kwargs)
         
         return R_prime
-
-        
     
     def predict(
         self,

@@ -2,9 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import jax.numpy as jnp
 import jax
-from jax import grad, value_and_grad, hessian, vmap, custom_jvp, jit
-from jax.flatten_util import ravel_pytree
-from copy import deepcopy
+
 from tqdm import tqdm
 from typing import Callable, Tuple, Union, Any, Optional
 from functools import partial
@@ -14,14 +12,12 @@ from luas.luas_types import Kernel, PyTree, JAXArray, Scalar
 from luas.kronecker_fns import kron_prod, calc_total_size, calc_data_shape, cyclic_transpose, tensor_mult, vmap_for_tensors
 from luas.jax_convenience_fns import array_to_pytree_2D, get_corr_mat
 
-
 __all__ = [
     "SingleKronTermKernel",
 ]
 
 # Ensure we are using double precision floats as JAX uses single precision by default
 jax.config.update("jax_enable_x64", True)
-
 
 class SingleKronTermKernel(CovType):
     r"""Kernel class which solves for the log likelihood for any covariance matrix which
@@ -90,7 +86,6 @@ class SingleKronTermKernel(CovType):
             self.decompose = self.decompose_use_stored_values
         else:
             self.decompose = self.decompose_no_stored_values
-
     
     def evaluate(self, *X, **kwargs):
 
@@ -101,18 +96,18 @@ class SingleKronTermKernel(CovType):
             Sigma = jnp.kron(Sigma, self.Sigma[d].evaluate(X[d], X[d], **kwargs))
         
         return Sigma
-        
     
     def decompose_no_stored_values(
         self,
         *X: JAXArray,
         stored_values: Optional[PyTree] = {},
+        **kwargs,
     ) -> PyTree:
 
         total_size = calc_total_size(X)
         gp_dim = len(X)
         
-        stored_values["logdetK"] =  0.
+        stored_values["logdet"] =  0.
         sigma_decomp = ()
         for d in range(gp_dim):
             Sigma_d_new, stored_values_d = self.Sigma[d].decompose(X[d])
@@ -122,11 +117,12 @@ class SingleKronTermKernel(CovType):
                 Sigma_d_new.matrix_inv_sqrt = vmap_for_tensors(Sigma_d_new.matrix_inv_sqrt)
 
             sigma_decomp += (Sigma_d_new,)
-            stored_values["logdetK"] += (total_size/X[d].shape[-1])*stored_values_d["logdetK"]
+            stored_values["logdet"] += (total_size/X[d].shape[-1])*stored_values_d["logdet"]
 
         self.Sigma = sigma_decomp
-        return self, stored_values
+        self.logdet = stored_values["logdet"]
 
+        return self, stored_values
     
     def matrix_sqrt(self, R, transpose = 0):
 
@@ -139,7 +135,6 @@ class SingleKronTermKernel(CovType):
         R_prime = cyclic_transpose(R_prime, -2)
         
         return R_prime
-
     
     def matrix_inv_sqrt(
         self,
@@ -156,15 +151,6 @@ class SingleKronTermKernel(CovType):
         R_prime = cyclic_transpose(R_prime, -2)
         
         return R_prime
-        
-
-    def inverse(self, R):
-
-        R_prime = self.matrix_inv_sqrt(R, transpose=0)
-        K_inv_R = self.matrix_inv_sqrt(R_prime, transpose=1)
-
-        return K_inv_R
-
 
     def eigendecomp(
         self,
@@ -186,35 +172,9 @@ class SingleKronTermKernel(CovType):
             eigen_decomp_mats += (Q_d,)
 
         return all_lam, eigen_decomp_mats
-
-
-    def dot_solve(self, R):
-        
-        L_inv_R = self.matrix_inv_sqrt(R, transpose = 0)
-        return jnp.square(L_inv_R).sum()
-
-
-    def logL(self, R, stored_values, **kwargs):
-        
-        return - 0.5 * self.dot_solve(R) - 0.5 * stored_values["logdetK"] - 0.5 * R.size * jnp.log(2*jnp.pi)
-
     
     def matmul(self, X1, X2, R, **kwargs):
         
         R_prime = tensor_mult(self.Sigma, X1, X2, R, **kwargs)
         
         return R_prime
-
-        
-    # def __add__(self, other):
-
-    #     if self.data_shape is None:
-    #         data_shape = self.dim
-
-    #     if type(K) == SingleKronTermKernel:
-    #         kernel_choice = kernel_selector(self.Sigma, K)
-    #     else:
-    #         raise Exception(f"{type(K)} not recognised or addition not supported yet")
-            
-    #     return K_sum
-        

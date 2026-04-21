@@ -1,93 +1,849 @@
+from __future__ import annotations
 import tinygp
 from tinygp.kernels.quasisep import Quasisep
+from tinygp.solvers.quasisep.core import DiagQSM, StrictLowerTriQSM, StrictUpperTriQSM, SymmQSM, SquareQSM
+from tinygp.noise import Noise
 import jax.numpy as jnp
 import jax.scipy as jsp
+import jax
 from jax import lax
+from jax.scipy.special import gammaln
 import equinox as eqx
 import numpy as np
-import matplotlib.pyplot as plt
-from luas.luas_types import JAXArray
+from luas.luas_types import JAXArray, is_scalar
+from luas.kernels.modal_decomp_calc import stoc_diff_coeffs_from_roots, modal_decomp_SDE
+import os.path
+
+# Module-level: load once at import, not inside JIT. Uses precomputed SSM matrices which are not JIT-friendly to calculate
+_module_dir = os.path.dirname(__file__)
+sq_exp_decomp_data = np.load(os.path.join(_module_dir, 'data', 'sq_exp_modal_decomps.npz'))
+matern_general_decomp_data = np.load(os.path.join(_module_dir, 'data', 'matern_SSMs_stable.npz'))
+
+
+def _get_sq_exp_decomp_arrays(order: int):
+    """Called at init time with static order — pure Python, not traced."""
+    prefix = f"{order}__"
+    return {k[len(prefix):]: jnp.asarray(sq_exp_decomp_data[k]) 
+            for k in sq_exp_decomp_data if k.startswith(prefix)}
+
+def _get_matern_general_decomp_arrays(order: int):
+    """Called at init time with static order — pure Python, not traced."""
+    prefix = f"{order}__"
+    return {k[len(prefix):]: jnp.asarray(matern_general_decomp_data[k]) 
+            for k in matern_general_decomp_data if k.startswith(prefix)}
+
+
+class Sum(tinygp.kernels.quasisep.Sum):
+
+    kernel1: Quasisep
+    kernel2: Quasisep
+    use_block: bool = eqx.field(static=True, default=True)
+
+    
+class Product(tinygp.kernels.quasisep.Product):
+    """A helper to represent the product of two quasiseparable kernels"""
+
+    kernel1: Quasisep
+    kernel2: Quasisep
+
+
+class Scale(tinygp.kernels.quasisep.Scale):
+    """The product of a scalar and a quasiseparable kernel"""
+    scale: JAXArray | float
+    
+    def observation_model(self, X: JAXArray) -> JAXArray:
+        return self.kernel.observation_model(X)
+
+    def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
+        return self.kernel.transition_matrix(
+            X1, X2
+        )
+
+
+@tinygp.helpers.dataclass
+class HandleIdx(tinygp.kernels.quasisep.Wrapper):
+    def coord_to_sortable(self, X):
+        return X[0]
+
+
+@tinygp.helpers.dataclass
+class ScaledKernel(tinygp.kernels.quasisep.Wrapper):
+    """A base class for wrapping kernels with some custom implementations"""
+    amplitudes: JAXArray
+
+    def __init__(self, kernel, amplitudes):
+        self.kernel = kernel
+
+        if isinstance(kernel, ScaledKernel):
+            self.amplitudes = amplitudes * kernel.amplitudes
+        else:
+            self.amplitudes = amplitudes
+
+    def observation_model(self, X):
+        _, idx = X
+        return self.amplitudes[idx] * self.kernel.observation_model(X)
+    
+    def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
+        return self.kernel.transition_matrix(
+            X1, X2
+        )
 
 
 @tinygp.helpers.dataclass
 class Multiband(tinygp.kernels.quasisep.Wrapper):
-    amplitudes: jnp.ndarray
-
-    def coord_to_sortable(self, X):
-        return X[0]
+    """A base class for wrapping kernels with some custom implementations"""
+    band_amplitudes: JAXArray
 
     def observation_model(self, X):
-        return self.amplitudes[X[1]] * self.kernel.observation_model(X[0])
+        x_vec, idx = X
 
-
-class MaternNuHalf(Quasisep):
-    nu: int = eqx.field(static=True)
-    scale: JAXArray | float
-    sigma: JAXArray | float = eqx.field(default_factory=lambda: jnp.ones(()))
-
-    def _f(self):
-        return jnp.sqrt(self.nu - ((self.nu - 1) % 2)) / self.scale
-
-    def design_matrix(self):
-        f = self._f()
-        dtype = jnp.result_type(f, self.sigma)
-        C = companion_C((self.nu - 1)//2, dtype)
-        return f * C
-
-    def stationary_covariance(self):
-        dtype = jnp.result_type(self.scale, self.sigma)
-        return stationary_covariance_C((self.nu - 1)//2, dtype)
-
-    def observation_model(self, X):
-        del X
-        h = jnp.zeros(((self.nu + 1)//2,), dtype=jnp.result_type(self.sigma))
-        return h.at[0].set(self.sigma)
-
-    def transition_matrix(self, X1, X2):
-        dt = X2 - X1
-        tau = dt * self._f()
-        dtype = jnp.result_type(tau, self.sigma)
-        C = companion_C((self.nu - 1)//2, dtype)
-
-        # print(dt, self.p, self.scale, self.sigma)
-
-        # optional safety cutoff for huge tau
-        tau_max = 80.0
-        return lax.cond(
-            tau > tau_max,
-            lambda _: jnp.zeros_like(C),
-            lambda _: jsp.linalg.expm(C.T * tau),
-            operand=None,
+        return self.band_amplitudes[idx % self.band_amplitudes.size] * self.kernel.observation_model((x_vec, idx // self.band_amplitudes.size))
+    
+    def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
+        return self.kernel.transition_matrix(
+            X1, X2
         )
 
-def solve_continuous_lyapunov_kron(F, Q):
-    n = F.shape[0]
-    I = jnp.eye(n, dtype=F.dtype)
-    A = jnp.kron(I, F) + jnp.kron(F, I)
-    b = -Q.reshape(-1)
-    P = jnp.linalg.solve(A, b).reshape(n, n)
-    return 0.5 * (P + P.T)
 
-def binom_row(n, dtype):
-    # Returns [C(n,0), C(n,1), ..., C(n,n-1)]
-    ks = jnp.arange(n, dtype=dtype)
+class LowRankProduct(Noise):
+    P: JAXArray
+    Q: JAXArray
 
-    def step(c, k):
-        c_next = c * (n - k) / (k + 1)
-        return c_next, c
+    def __check_init__(self) -> None:
+        if jnp.ndim(self.P) != 2:
+            raise ValueError(
+                "Shape must be (n_data, n_vec)"
+            )
+        if jnp.ndim(self.Q) != 2:
+            raise ValueError(
+                "Shape must be (n_data, n_vec)"
+            )
+        if self.P.shape != self.Q.shape:
+            raise ValueError(
+                "Shape of P and Q must be the same"
+            )
 
-    _, coeffs = lax.scan(step, jnp.array(1.0, dtype), ks)
-    return coeffs
+    def diagonal(self) -> JAXArray:
+        return (self.P * self.Q).sum(1)
+    
+    def _add(self, other):
+        P_comb = jnp.concatenate([self.P, other.P], axis = 1)
+        Q_comb = jnp.concatenate([self.Q, other.Q], axis = 1)
+        return LowRankProduct(P_comb, Q_comb)
+    
+    def __add__(self, other: JAXArray) -> JAXArray:
+        return self._add(other)
 
-def companion_C(p, dtype):
-    n = p + 1
-    coeffs = binom_row(n, dtype)
-    C = jnp.eye(n, k=1, dtype=dtype)
-    return C.at[-1, :].set(-coeffs)
+    def __radd__(self, other: JAXArray) -> JAXArray:
+        return self._add(other)
 
-def stationary_covariance_C(p, dtype):
-    C = companion_C(p, dtype)
-    n = p + 1
-    E = jnp.zeros((n, n), dtype=dtype).at[-1, -1].set(1.0)
-    P0 = solve_continuous_lyapunov_kron(C, E)
-    return P0 / P0[0, 0]  # normalized, independent of scale
+    def __mul__(self, other):
+        if is_scalar(other):
+            return self.scale(other)
+        else:
+            raise Exception("Not implemented!")
+
+    def __rmul__(self, other):
+        return self.__mul__(other)
+
+    def __matmul__(self, other: JAXArray) -> JAXArray:
+        H_T_other = self.Q.T @ other
+        return self.P @ H_T_other
+
+    def scale(self, c):
+        return LowRankProduct(self.P * c, self.Q)
+    
+    def to_qsm(self):
+
+        diag_term = DiagQSM(d=self.diagonal())
+        lower_term = StrictLowerTriQSM(p=self.P, q=self.Q, a=jnp.kron(jnp.ones((self.P.shape[0], 1, 1)), jnp.eye(self.P.shape[1])))
+        
+        return SymmQSM(diag=diag_term, lower=lower_term)
+
+
+@tinygp.helpers.dataclass
+class Constant(Quasisep):
+    const: JAXArray | float
+    
+    def design_matrix(self) -> JAXArray:
+            return jnp.zeros((1, 1))
+        
+    def stationary_covariance(self) -> JAXArray:
+            return self.const*jnp.ones((1, 1))
+        
+    def observation_model(self, X: JAXArray) -> JAXArray:
+            del X
+            return jnp.array([1.])
+      
+    def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
+            return jnp.ones((1, 1))
+
+
+# @tinygp.helpers.dataclass
+# class Linear(Quasisep):
+#     alpha: JAXArray
+
+#     def coord_to_sortable(self, X):
+#         return X[0]
+    
+#     def design_matrix(self) -> JAXArray:
+#             return jnp.zeros((1, 1))
+        
+#     def stationary_covariance(self) -> JAXArray:
+#             return jnp.ones((1, 1))
+        
+#     def observation_model(self, X: JAXArray) -> JAXArray:
+#             return self.alpha[X[1]] * jnp.ones(1)
+      
+#     def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
+#             return jnp.ones((1, 1))
+
+
+@tinygp.helpers.dataclass
+class CalibrationErrors(Quasisep):
+    cal_times: JAXArray | float
+    sigma: float = 1.
+    
+    def design_matrix(self) -> JAXArray:
+            return jnp.zeros((1, 1))
+        
+    def stationary_covariance(self) -> JAXArray:
+            return self.sigma*jnp.ones((1, 1))
+        
+    def observation_model(self, X: JAXArray) -> JAXArray:
+            del X
+            return jnp.array([1.])
+      
+    def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
+            same_cal = jax.lax.cond(jnp.all((X2 - self.cal_times) * (X1 - self.cal_times) >= 0.), lambda _: 1., lambda _: 0., 1.)
+            return same_cal * jnp.ones((1, 1))
+
+
+@tinygp.helpers.dataclass
+class MaternNuHalf(Quasisep):
+    double_nu: int = eqx.field(static=True)
+    scale: JAXArray | float
+    sigma: JAXArray | float = eqx.field(default_factory=lambda: jnp.ones(()))
+    _F: JAXArray
+    _P_inf: JAXArray
+
+    def __init__(self, double_nu, scale, sigma = 1):
+        assert double_nu % 2 == 1, "Only odd positive integer double_nu supported for MaternNuHalf"
+        assert double_nu >= 1, "Only odd positive integer double_nu supported for MaternNuHalf"
+        assert double_nu <= 21, "Matern general only supported up to double_nu = 21 (due to numerical stability issues)"
+
+        self.double_nu = double_nu
+
+        # State space matrices calculated with a reference length scale of sqrt(double_nu) for numerical stability
+        ref_scale = jnp.sqrt(double_nu)
+        self.scale = scale/ref_scale
+        self.sigma = sigma
+
+        SSM_arrays = _get_matern_general_decomp_arrays(self.double_nu)
+        self._F = SSM_arrays["F_ref"]
+        self._P_inf = SSM_arrays["P_inf_ref"]
+     
+    def stationary_covariance(self):
+
+        return self._P_inf
+
+    def design_matrix(self):
+        powers = jnp.arange((self.double_nu+1)//2)
+        scale_diag = self.scale**powers
+
+        F_ref = self._F
+
+        return (1/self.scale) * jnp.diag(scale_diag) @ F_ref @ jnp.diag(1/scale_diag)
+        
+    def transition_matrix(self, X1, X2):
+
+        tau = (X2 - X1)/self.scale
+        
+        return jsp.linalg.expm(self._F.T * tau)
+    
+    def observation_model(self, X):
+        
+        H = jnp.zeros((self.double_nu+1)//2)
+        H = H.at[0].set(self.sigma)
+
+        return H
+
+
+@tinygp.helpers.dataclass
+class SquaredExpApprox(Quasisep):
+    scale: JAXArray | float
+    order: int = eqx.field(static=True)
+    _P_inf: JAXArray
+    T: JAXArray
+    T_inv: JAXArray
+    total_kernel: tinygp.kernels.quasisep.Quasisep
+    sigma: JAXArray | float = 1.
+    _F: JAXArray
+    use_block: bool = True
+    
+    def __init__(self, scale, order, sigma = 1, use_block = True):
+        self.scale = scale
+        self.order = order
+        self.sigma = sigma
+        self.use_block = use_block
+
+        assert order % 2 == 0, "Only even orders supported for squared exponential approximation"
+        assert order <= 18, "Modal decompositions only precomputed up to order 18"
+
+        modal_decomp = _get_sq_exp_decomp_arrays(order)
+        self.T = modal_decomp["T_modal"]
+        self.T_inv = modal_decomp["T_modal_inv"]
+        self._F = modal_decomp["F_ref"]
+        self._P_inf = modal_decomp["P_inf_ref"]
+        real_parts = modal_decomp["all_real_parts"]
+        imag_parts = modal_decomp["imag_parts"]
+
+        self.total_kernel = self._build_kernel(real_parts, imag_parts)
+
+    def _build_kernel(self, real_parts, imag_parts):
+
+        n_real = real_parts.size - imag_parts.size
+        start = True
+        for i in range(real_parts.size):
+            kernel_term = tinygp.kernels.quasisep.Exp(-1/real_parts[i])
+            if i >= n_real:
+                kernel_term *= tinygp.kernels.quasisep.Cosine(2 * jnp.pi/imag_parts[i - n_real])
+
+            if start:
+                total_kernel = kernel_term
+                start = False
+            else:
+                total_kernel = tinygp.kernels.quasisep.Sum(total_kernel, kernel_term, use_block = self.use_block)
+
+        return total_kernel
+    
+    def stationary_covariance(self):
+
+        powers = jnp.arange(int(self.order), dtype=jnp.result_type(self.scale))
+        scale_diag = self.scale**powers
+
+        P_inf_ref = self._P_inf
+
+        return self.T.T @ P_inf_ref @ self.T
+
+    def design_matrix(self):
+        powers = jnp.arange(int(self.order), dtype=jnp.result_type(self.scale))
+        scale_diag = self.scale**powers
+
+        F_ref = self._F
+
+        return (1/self.scale) * self.T @ jnp.diag(scale_diag) @ F_ref @ self.T_inv @ jnp.diag(1/scale_diag)
+        
+    def transition_matrix(self, X1, X2):
+
+        A_ref = self.total_kernel.transition_matrix(X1 / self.scale, X2 / self.scale)
+        
+        return A_ref
+    
+    def observation_model(self, X):
+        
+        H = jnp.zeros(self.order)
+        H = H.at[0].set(self.sigma)
+        H = H @ self.T_inv.T
+
+        return H
+
+
+@tinygp.helpers.dataclass
+class ExpSineSquaredApprox(Quasisep):
+    """
+    Credit: smolgp (Rubenzahl et al. 2026), original derivation from Solin & Särkkä (2014)
+    """
+
+    period: JAXArray | float
+    gamma: JAXArray | float
+    sigma: JAXArray | float = 1.
+    order: int | None = None
+    kernel: Quasisep
+    periodic_scale: float
+    use_block: bool
+
+    def __init__(self, period, gamma, order = None, sigma = 1, use_block = True):
+
+        self.period = period
+        self.gamma = gamma
+        self.sigma = sigma
+        self.use_block = use_block
+
+        self.periodic_scale = jnp.sqrt(2/self.gamma)
+        recommended_min_order = self._order_fn(self.periodic_scale)
+        
+        # order gives the number of cosine terms which will be added. Quasisep rank will be J = 1 + 2 * order
+        if order is None:
+            order = recommended_min_order
+            # if self.periodic_scale < 1/6:
+            #     warnings.warn(
+            #         "ExpSineSquared kernel with scale < 0.25 (gamma > 16) may require a high order approximation; "
+            #         "it may be worthwhile to change units to a more compatible scale (recommended) "
+            #         "or specify the 'order' parameter explicitly."
+            #     )
+        # elif order < self.periodic_scale:
+        #     warnings.warn(
+        #             f"""Chosen order of approximation {order} lower than recommended minimum of {recommended_min_order} for this
+        #               value of gamma ({gamma}). Note that for large values of gamma the approximation order must be large
+        #               to accurately replicate the kernel function."""
+        #         )
+        
+        self.order = order
+        self.kernel = self._build_kernel()
+    
+    def _build_kernel(self):
+
+        q0 = self._Ij(0, self.periodic_scale) / jnp.exp(1/self.periodic_scale**2)
+        kernel = self.sigma**2 * q0 * Constant(1.)
+        
+        for j in range(1, self.order+1):
+            q_j2 = 2 * self._Ij(j, self.periodic_scale) / jnp.exp(1/self.periodic_scale**2)
+            new_term = self.sigma**2 * q_j2 * tinygp.kernels.quasisep.Cosine(self.period/j)
+            kernel = tinygp.kernels.quasisep.Sum(kernel, new_term, use_block = self.use_block)
+
+        return kernel
+
+    
+    def _order_fn(self, scale):
+        # This function roughly 
+
+        max_order = jax.lax.cond(scale < 1/6, lambda _: 16, lambda _: (jnp.floor(4. * scale**-0.8)).astype("int"), scale)
+        order = jax.lax.cond(scale > 1., lambda _: 4, lambda _: max_order, scale)
+        return order-1
+    
+    
+    def _Ij(self, j, scale, terms=50) -> JAXArray:
+        """
+        The modified Bessel function of the first kind, order j, at scale.
+        Approximated via a truncated Taylor series expansion.
+        """
+        i = jnp.arange(terms)
+        log_terms = -gammaln(i + 1) - gammaln(i + j + 1) - (j + 2 * i) * jnp.log(2*scale**2)
+        return jnp.sum(jnp.exp(log_terms))
+
+
+    def stationary_covariance(self):
+
+        return self.kernel.stationary_covariance()
+
+    def design_matrix(self):
+        
+        return self.kernel.design_matrix()
+        
+    def transition_matrix(self, X1, X2):
+    
+        return self.kernel.transition_matrix( X1, X2)
+    
+    def observation_model(self, X):
+
+        return self.kernel.observation_model(X)
+
+
+
+@tinygp.helpers.dataclass
+class QuasiperiodicApprox(Quasisep):
+    """
+    Credit: smolgp (Rubenzahl et al. 2026), original derivation from Solin & Särkkä (2014)
+    """
+
+    period: JAXArray | float
+    gamma: JAXArray | float
+    decay_kernel: Quasisep
+    sigma: JAXArray | float = 1.
+    order: int | None = None
+    kernel: Quasisep
+    periodic_scale: float
+
+    def __init__(self, period, gamma, decay_kernel, sigma = 1, order = None):
+
+        self.period = period
+        self.gamma = gamma
+        self.sigma = sigma
+        self.decay_kernel = decay_kernel
+
+        self.periodic_scale = jnp.sqrt(2/self.gamma)
+        
+        # order gives the number of cosine terms which will be added. Quasisep rank will be J = 1 + 2 * order
+        if order is None:
+            order = self._order_fn(self.periodic_scale)
+        
+        self.order = order
+        self.kernel = self._build_kernel()
+    
+    def _build_kernel(self):
+
+        q0 = self._Ij(0, self.periodic_scale) / jnp.exp(1/self.periodic_scale**2)
+        kernel = self.sigma**2 * q0 * Constant(1.) * self.decay_kernel
+        
+        for j in range(1, self.order + 1):
+            q_j2 = 2 * self._Ij(j, self.periodic_scale) / jnp.exp(1/self.periodic_scale**2)
+            new_term = self.sigma**2 * q_j2 * tinygp.kernels.quasisep.Cosine(self.period/j) * self.decay_kernel
+            kernel = tinygp.kernels.quasisep.Sum(kernel, new_term, use_block = True)
+
+        return kernel
+
+    
+    def _order_fn(self, scale):
+
+        max_order = jax.lax.cond(scale < 1/6, lambda _: 16, lambda _: (jnp.floor(4. * scale**-0.8)).astype("int"), scale)
+        order = jax.lax.cond(scale > 1., lambda _: 4, lambda _: max_order, scale)
+        return order - 1
+    
+    
+    def _Ij(self, j, scale, terms=50) -> JAXArray:
+        """
+        The modified Bessel function of the first kind, order j, at scale.
+        Approximated via a truncated Taylor series expansion.
+        """
+        i = jnp.arange(terms)
+        log_terms = -gammaln(i + 1) - gammaln(i + j + 1) - (j + 2 * i) * jnp.log(2*scale**2)
+        return jnp.sum(jnp.exp(log_terms))
+
+
+    def stationary_covariance(self):
+
+        return self.kernel.stationary_covariance()
+
+    def design_matrix(self):
+        
+        return self.kernel.design_matrix()
+        
+    def transition_matrix(self, X1, X2):
+    
+        return self.kernel.transition_matrix(X1, X2)
+    
+    def observation_model(self, X):
+
+        return self.kernel.observation_model(X)
+
+
+
+@tinygp.helpers.dataclass
+class GeneralCARMA(Quasisep):
+    roots: JAXArray | float
+    scale: JAXArray | float
+    _P_inf: JAXArray
+    T: JAXArray
+    T_inv: JAXArray
+    total_kernel: tinygp.kernels.quasisep.Quasisep
+    sigma: JAXArray | float = 1.
+    _F: JAXArray
+    order: int
+    
+    def __init__(self, roots, scale, sigma = 1):
+        self.roots = roots
+        self.scale = scale
+        self.sigma = sigma
+        self.order = roots.size
+
+        stoc_diff_coeffs = stoc_diff_coeffs_from_roots(roots)
+
+        print("h_{m-1}, h_{m-2}, .., h_0:", stoc_diff_coeffs[::-1])
+        self.T, self.T_inv, real_parts, imag_parts, self._F, self._P_inf = modal_decomp_SDE(stoc_diff_coeffs)
+        
+        self.total_kernel = self._build_kernel(real_parts, imag_parts)
+        
+    def _build_kernel(self, real_parts, imag_parts):
+
+        n_real = real_parts.size - imag_parts.size
+        start = True
+        for i in range(real_parts.size):
+            kernel_term = tinygp.kernels.quasisep.Exp(-1/real_parts[i])
+            if i >= n_real:
+                kernel_term *= tinygp.kernels.quasisep.Cosine(2 * jnp.pi/imag_parts[i - n_real])
+
+            if start:
+                total_kernel = kernel_term
+                start = False
+            else:
+                total_kernel += kernel_term
+
+        return total_kernel
+
+
+    def to_symm_qsm(self, X):
+
+        a = jax.vmap(self.total_kernel.transition_matrix)(
+            jax.tree_util.tree_map(lambda y: jnp.append(y[0], y[:-1]), X/self.scale), X/self.scale
+        )
+        h = jax.vmap(self.observation_model)(X)
+
+        # powers = jnp.arange(int(self.order), dtype=jnp.result_type(self.scale))
+        # scale_diag = self.scale**powers
+
+        q = h @ self.T_inv.T
+        p = (h @ self._P_inf) @ self.T
+        d = jnp.sum(p * q, axis=1)
+        
+        p = jax.vmap(lambda x, y: x @ y)(p, a)
+
+        return SymmQSM(diag=DiagQSM(d=d), lower=StrictLowerTriQSM(p=p, q=q, a=a))
+    
+    
+    def stationary_covariance(self):
+
+        powers = jnp.arange(int(self.order), dtype=jnp.result_type(self.scale))
+        scale_diag = self.scale**powers
+
+        P_inf_ref = self._P_inf
+
+        return jnp.diag(1/scale_diag) @ P_inf_ref @ jnp.diag(1/scale_diag)
+
+
+    def design_matrix(self):
+        powers = jnp.arange(int(self.order), dtype=jnp.result_type(self.scale))
+        scale_diag = self.scale**powers
+
+        F_ref = self._F
+
+        return (1/self.scale) * jnp.diag(scale_diag) @ self.T @ F_ref @ self.T_inv @ jnp.diag(1/scale_diag)
+        
+    def transition_matrix(self, X1, X2):
+
+        # F(scale)^T = D @ (F_ref^T / scale) @ D^{-1}, D=diag(scale^k)
+
+        A_ref = self.total_kernel.transition_matrix(X1 / self.scale, X2 / self.scale)
+        powers = jnp.arange(int(self.order), dtype=jnp.result_type(self.scale))
+        d = self.scale**powers
+    
+        return jnp.diag(d) @ self.T @ A_ref @ self.T_inv @ jnp.diag(1/d) 
+    
+    def observation_model(self, X):
+        
+        H = jnp.zeros(self.order)
+        H = H.at[0].set(self.sigma)
+
+        return H
+
+
+# class MaternNuHalf(Quasisep):
+#     nu: int = eqx.field(static=True)
+#     scale: JAXArray | float
+#     sigma: JAXArray | float = eqx.field(default_factory=lambda: jnp.ones(()))
+
+#     def __init__(self, double_nu, scale, sigma = 1):
+#         assert double_nu % 2 == 1, "Only odd integer double_nu supported for MaternNuHalf"
+#         self.nu = double_nu
+#         self.scale = scale
+#         self.sigma = sigma
+
+#     def _f(self):
+#         return jnp.sqrt(self.nu - ((self.nu - 1) % 2)) / self.scale
+
+#     def design_matrix(self):
+#         f = self._f()
+#         dtype = jnp.result_type(f, self.sigma)
+#         C = companion_C((self.nu - 1)//2, dtype)
+#         return f * C
+
+#     def stationary_covariance(self):
+#         dtype = jnp.result_type(self.scale, self.sigma)
+#         return stationary_covariance_C((self.nu - 1)//2, dtype)
+
+#     def observation_model(self, X):
+#         del X
+#         h = jnp.zeros(((self.nu + 1)//2,), dtype=jnp.result_type(self.sigma))
+#         return h.at[0].set(self.sigma)
+
+#     def transition_matrix(self, X1, X2):
+#         dt = X2 - X1
+#         tau = dt * self._f()
+#         dtype = jnp.result_type(tau, self.sigma)
+#         C = companion_C((self.nu - 1)//2, dtype)
+
+#         # print(dt, self.p, self.scale, self.sigma)
+
+#         # optional safety cutoff for huge tau
+#         tau_max = 80.0
+#         return lax.cond(
+#             tau > tau_max,
+#             lambda _: jnp.zeros_like(C),
+#             lambda _: jsp.linalg.expm(C.T * tau),
+#             operand=None,
+#         )
+
+# def solve_continuous_lyapunov_kron(F, Q):
+#     n = F.shape[0]
+#     I = jnp.eye(n, dtype=F.dtype)
+#     A = jnp.kron(I, F) + jnp.kron(F, I)
+#     b = -Q.reshape(-1)
+#     P = jnp.linalg.solve(A, b).reshape(n, n)
+#     return 0.5 * (P + P.T)
+
+# def binom_row(n, dtype):
+#     # Returns [C(n,0), C(n,1), ..., C(n,n-1)]
+#     ks = jnp.arange(n, dtype=dtype)
+
+#     def step(c, k):
+#         c_next = c * (n - k) / (k + 1)
+#         return c_next, c
+
+#     _, coeffs = lax.scan(step, jnp.array(1.0, dtype), ks)
+#     return coeffs
+
+# def companion_C(p, dtype):
+#     n = p + 1
+#     coeffs = binom_row(n, dtype)
+#     C = jnp.eye(n, k=1, dtype=dtype)
+#     return C.at[-1, :].set(-coeffs)
+
+# def stationary_covariance_C(p, dtype):
+#     C = companion_C(p, dtype)
+#     n = p + 1
+#     E = jnp.zeros((n, n), dtype=dtype).at[-1, -1].set(1.0)
+#     P0 = solve_continuous_lyapunov_kron(C, E)
+#     return P0 / P0[0, 0]  # normalized, independent of scale
+
+
+
+# """Taylor-spectrum quasisep approximation to the squared exponential kernel.
+
+# Trainable/JIT-friendly design:
+# - Root solving and polynomial algebra are done once at construction time for
+#   a reference scale (=1.0).
+# - For arbitrary scale ``ell``, AR coefficients are scaled analytically, so
+#   ``scale`` remains differentiable and JIT-compatible.
+# - Runtime methods are pure JAX.
+# """
+
+
+# def _inverse_psd_taylor_poly(scale: float, order: int) -> np.ndarray:
+#     """p(s) = sum_{k=0}^order [(-1)^k (0.5*scale^2)^k / k!] s^(2k)."""
+#     if order < 1:
+#         raise ValueError("order must be >= 1")
+#     a = 0.5 * float(scale) ** 2
+#     coeffs = np.zeros(2 * order + 1, dtype=np.float64)
+#     for k in range(order + 1):
+#         idx = 2 * order - 2 * k
+#         coeffs[idx] = ((-1) ** k) * (a**k) / math.factorial(k)
+#     return coeffs
+
+
+# def _stable_ar_coeffs(scale: float, order: int) -> np.ndarray:
+#     """Return monic AR polynomial coefficients [a0, ..., a_{p-1}] for p(s)."""
+#     poly = _inverse_psd_taylor_poly(scale=scale, order=order)
+#     roots = np.roots(poly)
+
+#     tol = 1e-10
+#     stable = roots[np.real(roots) < -tol]
+#     if stable.size != order:
+#         idx = np.argsort(np.real(roots))
+#         stable = roots[idx[:order]]
+
+#     monic_desc = np.poly(stable)  # [1, a_{p-1}, ..., a0]
+#     monic_desc = np.real_if_close(monic_desc, tol=1e4).astype(np.float64)
+#     return monic_desc[1:][::-1]
+
+
+# def _solve_continuous_lyapunov_kron(F: JAXArray, Q: JAXArray) -> JAXArray:
+#     n = F.shape[0]
+#     I = jnp.eye(n, dtype=F.dtype)
+#     A = jnp.kron(I, F) + jnp.kron(F, I)
+#     b = -Q.reshape(-1)
+#     P = jnp.linalg.solve(A, b).reshape(n, n)
+#     return 0.5 * (P + P.T)
+
+
+@tinygp.helpers.dataclass
+class SquaredExpApprox2(Quasisep):
+    scale: JAXArray | float
+    order: int = eqx.field(static=True)
+    _P_inf: JAXArray
+    T: JAXArray
+    T_inv: JAXArray
+    total_kernel: tinygp.kernels.quasisep.Quasisep
+    sigma: JAXArray | float = 1.
+    _F: JAXArray
+    use_block: bool = True
+    
+    def __init__(self, scale, order, sigma = 1, use_block = True):
+        self.scale = scale
+        self.order = order
+        self.sigma = sigma
+        self.use_block = use_block
+
+        assert order % 2 == 0, "Only even orders supported for squared exponential approximation"
+        assert order <= 18, "Modal decompositions only precomputed up to order 18"
+
+        modal_decomp = _get_sq_exp_decomp_arrays(order)
+        self.T = modal_decomp["T_modal"]
+        self.T_inv = modal_decomp["T_modal_inv"]
+        self._F = modal_decomp["F_ref"]
+        self._P_inf = modal_decomp["P_inf_ref"]
+        real_parts = modal_decomp["all_real_parts"]
+        imag_parts = modal_decomp["imag_parts"]
+
+        self.total_kernel = self._build_kernel(real_parts, imag_parts)
+        
+    def _build_kernel(self, real_parts, imag_parts):
+
+        n_real = real_parts.size - imag_parts.size
+        start = True
+        for i in range(real_parts.size):
+            kernel_term = tinygp.kernels.quasisep.Exp(-1/real_parts[i])
+            if i >= n_real:
+                kernel_term *= tinygp.kernels.quasisep.Cosine(2 * jnp.pi/imag_parts[i - n_real])
+
+            if start:
+                total_kernel = kernel_term
+                start = False
+            else:
+                total_kernel = tinygp.kernels.quasisep.Sum(total_kernel, kernel_term, use_block = self.use_block)
+
+        return total_kernel
+
+
+    def to_symm_qsm(self, X):
+
+        a = jax.vmap(self.total_kernel.transition_matrix)(
+            jax.tree_util.tree_map(lambda y: jnp.append(y[0], y[:-1]), X/self.scale), X/self.scale
+        )
+        h = jax.vmap(self.observation_model)(X)
+
+        q = h @ self.T_inv.T
+        p = (h @ self._P_inf) @ self.T
+        d = jnp.sum(p * q, axis=1)
+        
+        p = jax.vmap(lambda x, y: x @ y)(p, a)
+
+        return SymmQSM(diag=DiagQSM(d=d), lower=StrictLowerTriQSM(p=p, q=q, a=a))
+    
+    def to_general_qsm(self, X1, X2):
+        raise Exception("Not implemented!")
+    
+    
+    def stationary_covariance(self):
+
+        powers = jnp.arange(int(self.order), dtype=jnp.result_type(self.scale))
+        scale_diag = self.scale**powers
+
+        P_inf_ref = self._P_inf
+
+        return jnp.diag(1/scale_diag) @ P_inf_ref @ jnp.diag(1/scale_diag)
+
+
+    def design_matrix(self):
+        powers = jnp.arange(int(self.order), dtype=jnp.result_type(self.scale))
+        scale_diag = self.scale**powers
+
+        F_ref = self._F
+
+        return (1/self.scale) * jnp.diag(scale_diag) @ self.T @ F_ref @ self.T_inv @ jnp.diag(1/scale_diag)
+        
+    def transition_matrix(self, X1, X2):
+
+        # F(scale)^T = D @ (F_ref^T / scale) @ D^{-1}, D=diag(scale^k)
+
+        A_ref = self.total_kernel.transition_matrix(X1 / self.scale, X2 / self.scale)
+        powers = jnp.arange(int(self.order), dtype=jnp.result_type(self.scale))
+        d = self.scale**powers
+    
+        return jnp.diag(d) @ self.T @ A_ref @ self.T_inv @ jnp.diag(1/d) 
+    
+    def observation_model(self, X):
+        
+        H = jnp.zeros(self.order)
+        H = H.at[0].set(self.sigma)
+
+        return H

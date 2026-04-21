@@ -77,10 +77,10 @@ class GP(object):
         logPrior: Optional[Callable] = None,
         jit: Optional[bool] = True,
         use_kernel: Kernel = None,
-        kernel_kwargs: Optional[PyTree] = {},
+        kernel_select_kwargs: Optional[PyTree] = {},
         verbose = False,
         data_shape = None,
-        **kwargs,
+        **kernel_kwargs,
     ):
         self.x = regressors
         self.dim = len(regressors)
@@ -91,13 +91,16 @@ class GP(object):
             for reg_vecs in self.x:
                 self.data_shape.append(reg_vecs.shape[-1])
 
-
         if kf is None and use_kernel is None:
             if verbose:
                 print("No kernel function specified, defaulting to least squares")
             self.build_kf = lambda p, *regressors: WhiteNoiseKernel(wn_diag = 1.0)
 
-        elif use_kernel == GeneralKernel and self.dim == 1:
+        elif isinstance(kf, CovType) and use_kernel is None:
+            # Just a fixed kernel not given as a function
+            self.build_kf = lambda p, *regressors: kf
+
+        elif isinstance(use_kernel, GeneralKernel) and self.dim == 1:
             def general_kf(hp, *regressors, **kwargs):
                 cov_form = kf(hp, *regressors)
                 return General(lambda p, *regressors, **kwargs: cov_form.evaluate(*regressors, **kwargs))
@@ -106,14 +109,17 @@ class GP(object):
             
         elif use_kernel is not None and kf is not None:
             cov_form = kf(p, *regressors)
+
             if isinstance(cov_form, tuple): 
-                self.build_kf = lambda p, *regressors: use_kernel(*cov_form, **kernel_kwargs)
+                self.build_kf = lambda p, *regressors: use_kernel(*kf(p, *regressors), **kernel_kwargs)
             else:
-                self.build_kf = lambda p, *regressors: use_kernel(cov_form, **kernel_kwargs)
-                
+                self.build_kf = lambda p, *regressors: use_kernel(kf(p, *regressors), **kernel_kwargs)
+
         elif use_kernel is not None and kf is None:
+            # Least squares or some other CovType without parameters
             self.build_kf = lambda p, *regressors: use_kernel(**kernel_kwargs)
-        else:
+
+        else: # use_kernel is None
             cov_form = kf(p, *regressors)
             
             if isinstance(cov_form, CovType):
@@ -122,7 +128,7 @@ class GP(object):
                 self.build_kf = lambda p, *regressors: SingleKronTermKernel(*kf(p, *regressors), **kernel_kwargs)
             else:
                 use_kernel, new_kernel_kwargs = kernel_selector(regressors, *kf(p, *regressors),
-                                                                verbose = verbose, **kwargs)
+                                                                verbose = verbose, **kernel_select_kwargs)
                 new_kernel_kwargs.update(kernel_kwargs)
                 self.build_kf = lambda p, *regressors: use_kernel(*kf(p, *regressors), **new_kernel_kwargs)
         
@@ -198,9 +204,10 @@ class GP(object):
         self.kf = self.build_kf(p, *self.x)
         
         self.kf, stored_values = self.kf.decompose(*self.x, stored_values = {"R_shape":self.data_shape})
-        logL = self.kf.logL(R, stored_values)
         
-        return logL
+        logL_val = self.kf.logL(R)
+        
+        return logL_val
 
     def apply_inverse(
         self,
@@ -233,6 +240,7 @@ class GP(object):
         self,
         p: PyTree,
         R: JAXArray,
+        full = True,
         **kwargs,
     ) -> Scalar:
         """Computes the log likelihood without returning any stored values from the
@@ -251,9 +259,9 @@ class GP(object):
         self.kf = self.build_kf(p, *self.x)
 
         if len(self.x) == 1:
-            K_R = self.kf.matmul(self.x[0], self.x[0], R, **kwargs)
+            K_R = self.kf.matmul(self.x[0], self.x[0], R, full = full, **kwargs)
         else:
-            K_R = self.kf.matmul(self.x, self.x, R, **kwargs)
+            K_R = self.kf.matmul(self.x, self.x, R, full = full, **kwargs)
         
         return K_R
         
@@ -654,15 +662,16 @@ class GP(object):
         
         # GP mean calculation
         R = Y - M_obs
-        
+
         self.kf = self.build_kf(p_obs, *x_obs)
-        K_inv_R, stored_values_K = self.kf.solve(p_obs, *x_obs, R, {})
+        self.kf, stored_values = self.kf.decompose(*x_obs)
+        K_inv_R = self.kf.matrix_inv_sqrt(R)
         
         K_inv_R_to_mult = jnp.zeros((N_l_total, N_t_total))
         K_inv_R_to_mult = K_inv_R_to_mult.at[observed_ind].set(K_inv_R)
 
         self.kf_total = self.build_kf(p_total, *x_total)
-        Ks_Kinv_R_term = self.kf_total.K_mult_vec(p_total, *x_total, K_inv_R_to_mult, {}, wn = False)
+        Ks_Kinv_R_term = self.kf_total.matmul(x_total, x_total, K_inv_R_to_mult, wn = False, full = True)
         
         gp_mean_pred = M_pred + Ks_Kinv_R_term[predicted_ind]
 
@@ -675,11 +684,11 @@ class GP(object):
                 K_pred_draw = K_pred_draw.at[observed_ind].set(0.)
 
         if return_K_pred_inv:
-            _, K_full_stored_values = self.kf_total.solve(p_total, *x_total, jnp.zeros(x_total_shape), {})
+            self.kf_total, stored_values_total = self.kf_total.decompose(*x_obs)
             
             def K_pred_inv_fn(R):
                 R_pred = R.at[observed_ind].set(0.)
-                K_pred_inv_R, _ = self.kf_total.solve(p_total, *x_total, R_pred, K_full_stored_values)
+                K_pred_inv_R = self.kf_total.inverse(R_pred)
                 return K_pred_inv_R
         
         if sample and return_K_pred_inv:
@@ -1455,12 +1464,11 @@ class GP(object):
             self.kf.Sigma = (self.kf,)
         K_list = []
         for d in range(self.dim):
-            K_list.append([self.kf.Sigma[d].evaluate(self.x[d], self.x[d], wn = wn)])
+            K_list.append([self.kf.Sigma[d].evaluate(self.x[d], self.x[d], wn = wn, full = True)])
             
             # Build each component matrix
             for i in range(N_kron_terms-1):
-                K_list[-1].append(self.kf.K_list[i][d].evaluate(self.x[d], self.x[d], wn = wn))
-            
+                K_list[-1].append(self.kf.K_list[i][d].evaluate(self.x[d], self.x[d], wn = wn, full = True))
 
         if full:
             # Plot full covariance matrix K
@@ -1549,7 +1557,7 @@ class GP(object):
         
         res = Y - M
         K_inv_R = self.apply_inverse(p, res)
-        gp_mean = M + self.matmul(p, K_inv_R, wn = False)
+        gp_mean = M + self.matmul(p, K_inv_R, wn = False, full = True)
         
         fig = plt.figure(figsize = (20, 5))
 

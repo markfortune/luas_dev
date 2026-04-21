@@ -98,6 +98,78 @@ def eclipse_light_curve(par, t):
     return baseline*(1 + flux)
     
 
+eclipse_light_curve_vmap = jax.vmap(eclipse_light_curve,
+                                    in_axes=({
+                                        # Parameters to be shared between all wavelengths
+                                        "T0":None, "P":None, "a":None, "b":None, 
+                                        
+                                        # Parameters to be separate for each wavelength
+                                        "rho":None, "d":0, "Foot":0, "Tgrad":0}, 
+                                        
+                                        # Array of timestamps to be the same for each wavelength
+                                        None, 
+                                        ), 
+                                    # Will output extra flux values for each light curve as additional rows
+                                    out_axes = 0 
+                                   ) 
+
+
+def eclipse_2D(p: PyTree, x_l: JAXArray, x_t: JAXArray) -> JAXArray:
+    r"""Uses ``jax.vmap`` on the ``transit_light_curve`` function to generate a 2D ``JAXArray`` of
+    transit light curves for multiple wavelengths simultaneously.
+    
+    This is just meant to be a simple example for generating multiple simultaneous light curves
+    in wavelength, it should be easy to modify for different limb darkening parameterisations, etc.
+    See the package `jaxoplanet <https://github.com/exoplanet-dev/jaxoplanet>`_ to see the range of
+    currently implemented light curve models.
+    
+    Note:
+        Unlike ``transit_light_curve``, input limb darkening parameters are assumed to follow
+        the `Kipping (2013) <https://arxiv.org/abs/1308.0009>`_ parameterisation and are converted
+        to standard limb darkening coefficients. Also assumed that the transit depth d = rho^2 is
+        being input which is then converted to radius ratio values for ``transit_light_curve``.
+    
+    .. code-block:: python
+
+        >>> from luas.exoplanet import transit_2D
+        >>> import jax.numpy as jnp
+        >>> N_l = 16 # Number of wavelength channels
+        >>> par = {
+        >>> ... "T0":0.*jnp.ones(1),        # Central transit time (days)
+        >>> ... "P":3.4*jnp.ones(1),        # Period (days)
+        >>> ... "a":8.2*jnp.ones(1),        # Semi-major axis to stellar ratio (aka a/R*)
+        >>> ... "d":0.01*jnp.ones(N_l),     # Transit depth (aka (Rp/R*)^2 or rho^2)
+        >>> ... "b":0.5*jnp.ones(1),        # Impact parameter
+        >>> ... # Kipping (2013) limb darkening parameterisation is used
+        >>> ... "q1":0.36*jnp.ones(N_l),    # First quadratic limb darkening coefficient for each wv
+        >>> ... "q2":0.416*jnp.ones(N_l),   # Second quadratic limb darkening coefficient for each wv
+        >>> ... "Foot":1.*jnp.ones(N_l),    # Baseline flux out of transit for each wv
+        >>> ... "Tgrad":0.*jnp.ones(N_l),   # Gradient in baseline flux for each wv (hrs^-1)
+        >>> }
+        >>> x_l = jnp.linspace(4000, 7000, N_l)
+        >>> x_t = jnp.linspace(-0.1, 0.1, 100)
+        >>> flux = transit_2D(par, x_l, x_t)
+    
+    Args:
+        par (PyTree): The transit parameters stored in a PyTree/dictionary (see example above).
+        x_l (JAXArray): Array of wavelengths, not used but included for compatibility with :class:`luas.GP`.
+        x_t (JAXArray): Array of times to calculate the light curve at.
+            
+    Returns:
+        JAXArray: 2D array of flux values in a wavelength by time grid of shape ``(N_l, N_t)``.
+        
+    """
+    
+    # vmap requires that we only input the parameters which have been explicitly defined how they vectorise
+    transit_params = ["T0", "P", "a", "b", "rho", "d", "Foot", "Tgrad"]
+    mfp = {k:p[k] for k in transit_params}
+    
+    # Use the vmap of transit_light_curve to calculate a 2D array of shape (M, N) of flux values
+    # For M wavelengths and N time points.
+    return eclipse_light_curve_vmap(mfp, x_t)
+
+
+
 def eclipse_light_curve_ecc(par, t, light_delay = False):
     # Define the orbit
     

@@ -10,7 +10,7 @@ import jax.scipy.linalg as JLA
 from jax.flatten_util import ravel_pytree
 
 from luas.kernels.covtype import CovType
-from luas.luas_types import Kernel, PyTree, JAXArray, Scalar
+from luas.luas_types import Kernel, PyTree, JAXArray, Scalar, is_scalar
 from luas.kronecker_fns import make_vec, make_mat
 from luas.jax_convenience_fns import array_to_pytree_2D
 
@@ -72,12 +72,20 @@ class WhiteNoiseKernel(CovType):
     def evaluate(
         self,
         *X: JAXArray,
+        wn = True,
+        full = True,
+        row_idx = None,
+        col_idx = None,
         **kwargs,
     ) -> JAXArray:
-
-        self.D = self.diag + wn * self.wn_diag
-        return jnp.diag(self.D.ravel())
         
+        if not full or is_scalar(diag):
+            raise Exception("Not implemented")
+        
+        diag_mat = jnp.diag(self.diag + wn * self.wn_diag)
+
+        return diag_mat
+
     def decompose(
         self,
         *X: JAXArray,
@@ -86,9 +94,9 @@ class WhiteNoiseKernel(CovType):
     ) -> JAXArray:
 
         self.D = self.diag + wn * self.wn_diag
-        logdetK = jnp.log(self.D).sum()
+        self.logdet = jnp.log(self.D).sum()
         
-        return self, {"logdetK":logdetK}
+        return self, {"logdet":self.logdet}
 
     def matrix_sqrt(
         self,
@@ -132,11 +140,6 @@ class WhiteNoiseKernel(CovType):
         diag_vals = jnp.tensordot(1/self.D, vec_prod, axes=([vec_dim], [0]))
 
         return diag_vals
-        
-    
-    def logL(self, R, stored_values, **kwargs):
-        
-        return - 0.5 * self.dot_solve(R) - 0.5 * stored_values["logdetK"] - 0.5 * R.size * jnp.log(2*jnp.pi)
 
     def matmul(
         self,
@@ -144,10 +147,18 @@ class WhiteNoiseKernel(CovType):
         X2: Tuple,
         R: JAXArray,
         wn = True,
+        full = True,
+        row_idx = None,
+        col_idx = None,
+        **kwargs,
     ) -> JAXArray:
         
-        self.D = self.diag + wn * self.wn_diag
-        return R * self.D
+        diag = self.diag + wn * self.wn_diag
+
+        if not full and not is_scalar(diag):
+            raise Exception("Not implemented")
+
+        return R * diag
         
     
     def predict(

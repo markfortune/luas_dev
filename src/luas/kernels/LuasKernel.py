@@ -89,7 +89,6 @@ class LuasKernel(CovType):
             self.decompose = self.eigendecomp_use_stored_values
         else:
             self.decompose = self.eigendecomp_no_stored_values
-
     
     def evaluate(self, *X, **kwargs):
 
@@ -106,7 +105,6 @@ class LuasKernel(CovType):
         Sigma += K
         
         return Sigma
-        
     
     def eigendecomp_no_stored_values(
         self,
@@ -128,7 +126,7 @@ class LuasKernel(CovType):
         self.eigen_decomp_mats = ()
         all_lam = jnp.ones(1)
         all_lam_shape = ()
-        stored_values["logdetK"] = 0.
+        stored_values["logdet"] = 0.
 
         for d in range(gp_dim):
             Sigma_d_new, stored_values_d = self.Sigma[d].decompose(X[d])
@@ -153,53 +151,55 @@ class LuasKernel(CovType):
             
             self.sigma_decomp_mats += (Sigma_d_new,)
             self.eigen_decomp_mats += (stored_values[f"Q_{d}"],)
-            stored_values["logdetK"] += (total_size/X[d].shape[-1])*stored_values_d["logdetK"]
-
-        def transform_fn(R, transpose = 0):
-            
-            R_prime = cyclic_transpose(R, 2)
-
-            if transpose:
-                for d in range(gp_dim):
-                    R_prime = self.sigma_decomp_mats[d].matrix_sqrt(R_prime, transpose = 1)
-                    R_prime = self.eigen_decomp_mats[d].T @ R_prime
-                    R_prime = cyclic_transpose(R_prime, 1)
-            else:
-                for d in range(gp_dim):
-                    R_prime = self.eigen_decomp_mats[d] @ R_prime
-                    R_prime = self.sigma_decomp_mats[d].matrix_sqrt(R_prime, transpose = 0)
-                    R_prime = cyclic_transpose(R_prime, 1)
-
-            R_prime = cyclic_transpose(R_prime, -2)
-                
-            return R_prime
-
-        def inv_transform_fn(R, transpose = 0):
-            R_prime = cyclic_transpose(R, 2)
-
-            if transpose:
-                for d in range(gp_dim):
-                    R_prime = self.eigen_decomp_mats[d] @ R_prime
-                    R_prime = self.sigma_decomp_mats[d].matrix_inv_sqrt(R_prime, transpose = 1)
-                    R_prime = cyclic_transpose(R_prime, 1)
-            else:
-                for d in range(gp_dim):
-                    R_prime = self.sigma_decomp_mats[d].matrix_inv_sqrt(R_prime, transpose = 0)
-                    R_prime = self.eigen_decomp_mats[d].T @ R_prime
-                    R_prime = cyclic_transpose(R_prime, 1)
-
-            R_prime = cyclic_transpose(R_prime, -2)
-            return R_prime
-
-        self.transform_fn = transform_fn
-        self.inv_transform_fn = inv_transform_fn
+            stored_values["logdet"] += (total_size/X[d].shape[-1])*stored_values_d["logdet"]
 
         K_tilde_diag = all_lam + 1
         
         self.kf_tilde = WhiteNoiseKernel(diag = K_tilde_diag, wn_diag = 0.)
         self.kf_tilde, stored_values["kf_tilde_stored"] = self.kf_tilde.decompose(*X)
 
+        stored_values["logdet"] += stored_values["kf_tilde_stored"]["logdet"]
+        self.logdet = stored_values["logdet"]
+
         return self, stored_values
+
+
+    def transform_fn(self, R, transpose = 0):
+        
+        R_prime = cyclic_transpose(R, 2)
+
+        if transpose:
+            for d in range(self.dim):
+                R_prime = self.sigma_decomp_mats[d].matrix_sqrt(R_prime, transpose = 1)
+                R_prime = self.eigen_decomp_mats[d].T @ R_prime
+                R_prime = cyclic_transpose(R_prime, 1)
+        else:
+            for d in range(self.dim):
+                R_prime = self.eigen_decomp_mats[d] @ R_prime
+                R_prime = self.sigma_decomp_mats[d].matrix_sqrt(R_prime, transpose = 0)
+                R_prime = cyclic_transpose(R_prime, 1)
+
+        R_prime = cyclic_transpose(R_prime, -2)
+            
+        return R_prime
+
+
+    def inv_transform_fn(self, R, transpose = 0):
+        R_prime = cyclic_transpose(R, 2)
+
+        if transpose:
+            for d in range(self.dim):
+                R_prime = self.eigen_decomp_mats[d] @ R_prime
+                R_prime = self.sigma_decomp_mats[d].matrix_inv_sqrt(R_prime, transpose = 1)
+                R_prime = cyclic_transpose(R_prime, 1)
+        else:
+            for d in range(self.dim):
+                R_prime = self.sigma_decomp_mats[d].matrix_inv_sqrt(R_prime, transpose = 0)
+                R_prime = self.eigen_decomp_mats[d].T @ R_prime
+                R_prime = cyclic_transpose(R_prime, 1)
+
+        R_prime = cyclic_transpose(R_prime, -2)
+        return R_prime
 
 
     def matrix_sqrt(
@@ -232,19 +232,6 @@ class LuasKernel(CovType):
             R_prime = self.kf_tilde.matrix_inv_sqrt(R_prime, transpose = 0)
         
         return R_prime
-        
-
-    def logL(
-        self,
-        R: JAXArray,
-        stored_values: PyTree,
-    ) -> Tuple[Scalar, PyTree]:
-        
-        R_prime = self.inv_transform_fn(R, transpose = 0)
-        logL_tilde = self.kf_tilde.logL(R_prime, stored_values["kf_tilde_stored"])
-        
-        return logL_tilde - 0.5 * stored_values["logdetK"]
-
 
     def matmul(self, X1, X2, R, **kwargs):
 
@@ -315,8 +302,6 @@ class LuasKernel(CovType):
         logdetSigma_d = -jnp.linalg.slogdet(TKT)[1]
     
         return Sigma_d, logdetSigma_d
-
-    
     
     def logL_hessianable(
         self,
@@ -369,8 +354,6 @@ class LuasKernel(CovType):
         logL =  -0.5 * rKr - 0.5 * logdetK  - 0.5 * R.size * jnp.log(2*jnp.pi)
 
         return  logL, stored_values
-        
-
     
     def predict(
         self,
