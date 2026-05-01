@@ -20,60 +20,21 @@ __all__ = [
 jax.config.update("jax_enable_x64", True)
 
 class SingleKronTermKernel(CovType):
-    r"""Kernel class which solves for the log likelihood for any covariance matrix which
-    is the sum of two kronecker products of the covariance matrix in each of two dimensions
-    i.e. the full covariance matrix K is given by:
-    
-    .. math::
-        K = K_l \otimes K_t + S_l \otimes S_t
-    
-    although we can avoid calculating ``K`` for many calculations implemented here.
-        
-    The ``Kl`` and ``Sl`` functions should both return ``(N_l, N_l)`` matrices which will be the covariance
-    matrices in the wavelength/vertical direction.
-    
-    The ``Kt`` and ``St`` functions should both return ``(N_t, N_t)`` matrices which will by the covariance
-    matrices in the time/horizontal direction.
-    
-    .. code-block:: python
-
-        >>> from luas import LuasKernel, kernels
-        >>> def Kl_fn(hp, x_l1, x_l2, wn = True):
-        >>> ... return hp["h"]**2*kernels.squared_exp(x_l1, x_l2, hp["l_l"])
-        >>> def Kt_fn(hp, x_t1, x_t2, wn = True):
-        >>> ... return kernels.squared_exp(x_t1, x_t2, hp["l_t"])
-        >>> # ... And similarly for Sl_fn, St_fn
-        >>> kernel = LuasKernel(Kl = Kl_fn, Kt = Kt_fn, Sl = Sl_fn, St = St_fn)
-        ... )
-    
-    See https://luas.readthedocs.io/en/latest/tutorials.html for more detailed tutorials on how to use.
-        
-    Args:
-        Kl (Callable): Function which returns the covariance matrix Kl, should be of the form
-            ``Kl(hp, x_l1, x_l2, wn = True)``.
-        Kt (Callable): Function which returns the covariance matrix Kt, should be of the form
-            ``Kt(hp, x_t1, x_t2, wn = True)``.
-        Sl (Callable): Function which returns the covariance matrix Sl, should be of the form
-            ``Sl(hp, x_l1, x_l2, wn = True)``.
-        St (Callable): Function which returns the covariance matrix St, should be of the form
-            ``St(hp, x_t1, x_t2, wn = True)``.
-        use_stored_values (bool, optional): Whether to perform checks if any of the component
-            covariance matrices have changed and to make use of previously stored values for
-            the decomposition of those matrices if they're the same. If ``False`` then will
-            not perform these checks and will compute the eigendecomposition of all matrices
-            for every calculation.
-    
-    """
     
     def __init__(
         self,
         *Sigma,
         use_stored_values: Optional[bool] = False,
         data_shape: Optional[Tuple] = None,
+        inv_dims: bool = False,
     ):
 
         self.Sigma = Sigma
         self.dim = len(Sigma)
+        self.inv_dims = inv_dims
+
+        if inv_dims:
+            self.dot_solve = self.dot_solve_w_inv_dims
         
         # Define for consistency with other kernel objects
         self.K_list = []
@@ -87,7 +48,7 @@ class SingleKronTermKernel(CovType):
         else:
             self.decompose = self.decompose_no_stored_values
     
-    def evaluate(self, *X, **kwargs):
+    def evaluate(self, X, **kwargs):
 
         dim = len(X)
         Sigma = self.Sigma[0].evaluate(X[0], X[0], **kwargs)
@@ -99,8 +60,9 @@ class SingleKronTermKernel(CovType):
     
     def decompose_no_stored_values(
         self,
-        *X: JAXArray,
+        X: JAXArray,
         stored_values: Optional[PyTree] = {},
+        full = True,
         **kwargs,
     ) -> PyTree:
 
@@ -123,6 +85,22 @@ class SingleKronTermKernel(CovType):
         self.logdet = stored_values["logdet"]
 
         return self, stored_values
+    
+    def dot_solve_w_inv_dims(self, R):
+        R_prime = cyclic_transpose(R, 2)
+        R_T = R_prime.copy()
+
+        for d in range(self.dim):
+            try:
+                R_prime = self.Sigma[d].matrix_inv_sqrt(R_prime, transpose = 0)
+                R_T = self.Sigma[d].matrix_inv_sqrt(R_T, transpose = 0)
+            except:
+                R_prime = self.Sigma[d].inverse(R_prime)
+            
+            R_prime = cyclic_transpose(R_prime, 1)
+            R_T = cyclic_transpose(R_T, 1)
+
+        return (R_T * R_prime).sum()
     
     def matrix_sqrt(self, R, transpose = 0):
 
@@ -154,7 +132,7 @@ class SingleKronTermKernel(CovType):
 
     def eigendecomp(
         self,
-        *X,
+        X,
         **kwargs,
     ):
 
@@ -165,7 +143,7 @@ class SingleKronTermKernel(CovType):
         eigen_decomp_mats = ()
         
         for d in jnp.arange(dim):
-            lam_d, Q_d = self.Sigma[d].eigendecomp(R_prime)
+            lam_d, Q_d = self.Sigma[d].eigendecomp(X)
 
             all_lam = jnp.kron(all_lam.reshape(all_lam_shape + (1,)), lam_d)
             all_lam_shape = all_lam.shape

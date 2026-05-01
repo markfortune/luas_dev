@@ -12,11 +12,13 @@ from tinygp.solvers.quasisep.core import SymmQSM, StrictLowerTriQSM, DiagQSM
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar, CovType, is_scalar
 from luas.kronecker_fns import vmap_for_tensors
 import luas.kernels.tinygp_ext
-from luas.kernels.tinygp_ext import ScaledKernel
-    
+from luas.kernels.tinygp_ext import ScaledKernel, HandleIdx
+
+
 class CovType():
     K_list = []
     params = None
+    use_inv = False
 
     def evaluate(self, x1, x2, **kwargs):
         raise Exception("Not implemented")
@@ -34,25 +36,30 @@ class CovType():
         raise Exception("Not implemented")
     
     def eigendecomp(self, x, wn = True, **kwargs):
-        
         K = self.evaluate(x, x, full = True, wn = wn, **kwargs)
         return jnp.linalg.eigh(K)
     
     def inverse(self, R):
-
         R_prime = self.matrix_inv_sqrt(R, transpose=0)
         K_inv_R = self.matrix_inv_sqrt(R_prime, transpose=1)
 
         return K_inv_R
     
     def dot_solve(self, R):
-        
-        L_inv_R = self.matrix_inv_sqrt(R, transpose = 0)
-        return jnp.square(L_inv_R).sum()
+        if self.use_inv:
+            # For some optimisations its easier to get the inverse then the matrix inverse sqrt
+            K_inv_R = self.inverse(R)
+            return (R * K_inv_R).sum()
+        else:
+            L_inv_R = self.matrix_inv_sqrt(R, transpose = 0)
+            return jnp.square(L_inv_R).sum()
+    
+    def logdet_calc(self):
+        # Defining a function makes it easier to define custom derivatives to avoid numerical stability issues
+        return self.logdet
 
     def logL(self, R, **kwargs):
-        
-        return - 0.5 * self.dot_solve(R) - 0.5 * self.logdet - 0.5 * R.size * jnp.log(2*jnp.pi)
+        return - 0.5 * self.dot_solve(R) - 0.5 * self.logdet_calc() - 0.5 * R.size * jnp.log(2*jnp.pi)
     
     def inv_sqrt_transform(self, K):
         
@@ -60,18 +67,7 @@ class CovType():
             alpha_tilde = self.matrix_inv_sqrt(K.alpha, transpose=0)
             K_tilde = Outer(alpha = alpha_tilde)
 
-        elif isinstance(K, LowRank):
-            # Define a new General covtype for K where it's kernel function transforms it
-            def kf_transf(hp, x1, x2, **kwargs):
-                K_eval = K.evaluate(x1, x2, **kwargs)
-                K_prime = self.matrix_inv_sqrt(K_eval, transpose=0)
-                K_tilde = self.matrix_inv_sqrt(K_prime.T, transpose=0)
-                
-                return K_tilde
-
-            K_tilde = LowRank(kf_transf, rank = K.fixed_rank)
-
-        else:
+        elif isinstance(K, (General, GeneralQuasisep, GeneralQuasisepPlusNoise, Identity, ScaledIdentity, Diagonal, OuterPlusScaledIdentity)):
             # Define a new General covtype for K where it's kernel function transforms it
             def kf_transf(hp, x1, x2, **kwargs):
                 K_eval = K.evaluate(x1, x2, **kwargs)
@@ -82,7 +78,21 @@ class CovType():
 
             K_tilde = General(kf_transf)
 
+        else:
+            try:
+                K_tilde = K.transform_with_inv_sqrt(self.matrix_inv_sqrt)
+            except:
+                raise Exception(f"Don't know how to transform this matrix type {type(K)} to K_tilde = L^-1 K L^-T")
+        
         return K_tilde
+
+
+    def general_transf(self, mat):
+        def kf_transf(hp, x1, x2, **kwargs):
+                K_eval = mat @ self.evaluate(x1, x2, **kwargs) @ mat.T
+                return K_eval
+        return General(kf_transf)
+
 
     def matmul(self, x1, x2, R, **kwargs):
         return self.evaluate(x1, x2, **kwargs) @ R
@@ -114,15 +124,16 @@ class General(CovType):
         self.params = params
         
     def evaluate(self, x1, x2, **kwargs):
+        K = self.kf(self.hp, x1, x2, **kwargs)
 
-        return self.kf(self.hp, x1, x2, **kwargs)
+        return K
 
-    def decompose(self, x, **kwargs):
+    def decompose(self, x, full = True, idx = None, **kwargs):
         # By default returns the lower triangular Cholesky factor
         # i.e. K = L @ L.T
         # Matches with tinygp default but not scipy or jax.scipy default
         
-        K = self.evaluate(x, x, full = True, **kwargs)
+        K = self.evaluate(x, x, full = full, row_idx = idx, col_idx = idx, **kwargs)
         
         self.factor = JLA.cholesky(K, lower=True)
         self.logdet = 2*jnp.log(jnp.diag(self.factor)).sum()
@@ -145,6 +156,29 @@ class General(CovType):
     def scale(self, c):
         return General(kf = lambda hp, x1, x2, **kwargs: c*self.evaluate(x1, x2, **kwargs))
     
+    def householder_transform(self, x, u):
+        w_i = self.matmul(x, x, u, full = True)
+        u_dot_w = jnp.dot(u, w_i)
+
+        def new_kf(hp, x1, x2, full = True, row_idx = None, col_idx = None, **kwargs):
+            K = self.kf(hp, x1, x2, full = full,
+                        row_idx = row_idx, col_idx = col_idx, **kwargs)
+
+            if row_idx is not None and col_idx is not None:
+                u_row, u_col = u[row_idx], u[col_idx]
+                w_i_row, w_i_col = w_i[row_idx], w_i[col_idx]
+            elif full == True:
+                u_row, u_col = u.copy(), u.copy()
+                w_i_row, w_i_col = w_i.copy(), w_i.copy()
+            else:
+                raise Exception("AHHHH")
+            
+            K += 4 * u_dot_w * jnp.outer(u_row, u_col)
+            K += 2 * (jnp.outer(u_row, w_i_col) + jnp.outer(w_i_row, u_col))
+            return K
+        
+        return General(new_kf)
+    
     def __add__(self, other):
         if isinstance(other, CovType):
             return General(kf = lambda hp, x1, x2, **kwargs: self.evaluate(x1, x2, **kwargs) + other.evaluate(x1, x2, **kwargs))
@@ -162,28 +196,6 @@ class General(CovType):
             return General(kf = lambda hp, x1, x2, **kwargs: self.evaluate(x1, x2, **kwargs) * other)
         else:
             raise Exception("Not implemented")
-        
-
-class LowRank(General):
-    def __init__(self, kf, hp = {}, rank = None, params = None):
-        self.kf = kf
-        self.hp = hp
-        self.fixed_rank = rank
-        self.params = params
-
-    def eigendecomp(self, x, wn = True, **kwargs):
-        
-        K = self.evaluate(x, x, full = True, wn = wn, **kwargs)
-        lam, Q = jnp.linalg.eigh(K)
-        
-        return lam, Q
-    
-    def rank(self, x):
-        return self.fixed_rank
-
-    def scale(self, c):
-        return LowRank(kf = lambda hp, x1, x2, **kwargs: c*self.evaluate(x1, x2, **kwargs), rank = self.fixed_rank)
-
 
 
 class Identity(CovType):
@@ -194,7 +206,7 @@ class Identity(CovType):
         self.logdet = 0.
         self.params = []
 
-    def evaluate(self, x1, x2, row_idx = None, col_idx = None, full = False, **kwargs):
+    def evaluate(self, x1, x2, row_idx = None, col_idx = None, full = True, **kwargs):
 
         if full:
             mat = jnp.eye(x1.shape[-1])
@@ -232,6 +244,9 @@ class Identity(CovType):
         
     def inv_sqrt_transform(self, K, **kwargs):
         return K
+    
+    def householder_transform(self, x, u):
+        return self
 
     def scale(self, c):
         return ScaledIdentity(diag = c)
@@ -244,7 +259,7 @@ class Identity(CovType):
             return mat @ R
     
     def __add__(self, K):
-        if isinstance(K, (Exp, GeneralQuasisep, GeneralQuasisepPlusNoise)):
+        if isinstance(K, (GeneralQuasisep, GeneralQuasisepPlusNoise)):
             K_sum = GeneralQuasisepPlusNoise(K.tinygp_kf, diag = K.diag + 1., wn_diag = K.wn_diag, use_block = K.use_block, noise_model = K.noise_model)
 
         elif isinstance(K, Outer):
@@ -340,12 +355,15 @@ class ScaledIdentity(CovType):
             # Could do something more efficient, return certain elements of R after scaling
             mat = self.evaluate(x1, x2, wn = wn, full = False, **kwargs)
             return mat @ R
+        
+    def householder_transform(self, x, u):
+        return self
 
     def scale(self, c):
         return ScaledIdentity(diag = self.diag * c, wn_diag = self.wn_diag * c)
 
     def __add__(self, K):
-        if isinstance(K, (Exp, GeneralQuasisep, GeneralQuasisepPlusNoise)):
+        if isinstance(K, (GeneralQuasisep, GeneralQuasisepPlusNoise)):
             K_sum = GeneralQuasisepPlusNoise(K.tinygp_kf, diag = self.diag + K.diag, wn_diag = self.wn_diag + K.wn_diag,
                                              noise_model = K.noise_model, use_block = K.use_block)
             
@@ -383,7 +401,7 @@ class Diagonal(CovType):
         assert self.diag.ndim == 1
         assert self.wn_diag.ndim == 1
     
-    def evaluate(self, x1, x2, wn = True, row_idx = None, col_idx = None, full = False, **kwargs):
+    def evaluate(self, x1, x2, wn = True, row_idx = None, col_idx = None, full = True, **kwargs):
 
         if full:
             diag_mat = jnp.diag(self.diag + wn*self.wn_diag)
@@ -402,7 +420,6 @@ class Diagonal(CovType):
                                 Either specify the row and col indices by the keyword arguments row_idx and col_idx
                                 or specify that the full covariance matrix is being evaluated by setting full = True"""
                             )
-        
         return diag_mat
     
     def decompose(self, x, wn = True, **kwargs):
@@ -432,7 +449,7 @@ class Diagonal(CovType):
     
     def inv_sqrt_transform(self, K):
 
-        if isinstance(K, Diagonal):
+        if isinstance(K, (ScaledIdentity, Diagonal)):
             K_tilde = Diagonal(diag = K.diag/self.D, wn_diag = K.wn_diag/self.D)
 
         elif isinstance(K, Identity):
@@ -441,8 +458,8 @@ class Diagonal(CovType):
         elif isinstance(K, Outer):
             K_tilde = Outer(alpha = K.alpha_init/jnp.sqrt(self.D))
         
-        elif isinstance(K, (Exp, GeneralQuasisep, GeneralQuasisepPlusNoise)):
-            new_kf = ScaledKernel(K.tinygp_kf, 1/jnp.sqrt(self.D))
+        elif isinstance(K, (GeneralQuasisep, GeneralQuasisepPlusNoise)):
+            new_kf = ScaledKernel(kernel = K.tinygp_kf, amplitudes = 1/jnp.sqrt(self.D))
             new_diag = K.diag/self.D
             new_wn_diag = K.wn_diag/self.D
 
@@ -451,23 +468,20 @@ class Diagonal(CovType):
 
             K_tilde = GeneralQuasisepPlusNoise(new_kf, diag = new_diag, wn_diag = new_wn_diag, use_block = K.use_block)
         
-        elif isinstance(K, LowRank):
+
+        elif isinstance(K, General):
             # Define a new General covtype for K where it's kernel function transforms it
             def kf_transf(hp, x1, x2, **kwargs):
-                
-                D_inv_sqrt = 1/jnp.sqrt(self.D)
-                return jnp.outer(D_inv_sqrt, D_inv_sqrt) * K.evaluate(x1, x2, **kwargs)
-
-            K_tilde = LowRank(kf_transf, rank = K.fixed_rank)
-
-        else:
-            # Define a new General covtype for K where it's kernel function transforms it
-            def kf_transf(hp, x1, x2, **kwargs):
-                
                 D_inv_sqrt = 1/jnp.sqrt(self.D)
                 return jnp.outer(D_inv_sqrt, D_inv_sqrt) * K.evaluate(x1, x2, **kwargs)
 
             K_tilde = General(kf_transf)
+
+        else:
+            try:
+                K_tilde = K.transform_with_inv_sqrt(self.matrix_inv_sqrt)
+            except:
+                raise Exception(f"Don't know how to transform this matrix type {type(K)} to K_tilde = L^-1 K L^-T")
             
         return K_tilde
     
@@ -488,9 +502,21 @@ class Diagonal(CovType):
 
     def scale(self, c):
         return Diagonal(diag = self.diag * c, wn_diag = self.wn_diag * c)
+    
+    def householder_transform(self, x, u):
+        w_i = self.matmul(x, x, u, full = True)
+
+        # Can this ever be super close to zero? Would be very numerically unstable but seems unlikely?
+        u_dot_w = jnp.dot(u, w_i)
+        alpha = 2 * u_dot_w * u - w_i
+
+        new_tinygp_kf = luas.kernels.tinygp_ext.Linear(alpha = alpha, const = 1/u_dot_w)
+        new_tinygp_kf += luas.kernels.tinygp_ext.Linear(alpha = w_i, const = -1/u_dot_w)
+        
+        return GeneralQuasisepPlusNoise(new_tinygp_kf, diag = self.diag, wn_diag = self.wn_diag)
 
     def __add__(self, K):
-        if isinstance(K, (Exp, GeneralQuasisep, GeneralQuasisepPlusNoise)):
+        if isinstance(K, (GeneralQuasisep, GeneralQuasisepPlusNoise)):
             K_sum = GeneralQuasisepPlusNoise(K.tinygp_kf, diag = self.diag + K.diag, wn_diag = self.wn_diag + K.wn_diag,
                                              noise_model = K.noise_model, use_block = K.use_block)
 
@@ -522,7 +548,7 @@ class GeneralQuasisepPlusNoise(CovType):
         self.params = params
 
 
-    def _tinygp_coords(self, x1, x2, row_idx = None, col_idx = None, full = False):
+    def _tinygp_coords(self, x1, x2, row_idx = None, col_idx = None, full = True):
 
         if full:
             X1 = (x1, jnp.arange(x1.shape[-1]))
@@ -542,25 +568,32 @@ class GeneralQuasisepPlusNoise(CovType):
         return X1, X2
 
 
-    def _to_symm_qsm(self, x, wn = True, idx = None, stored_values = {}):
+    def _to_symm_qsm(self, x, wn = True, full = True, idx = None, stored_values = {}):
+        if full:
+            idx = jnp.arange(x.shape[-1])
+        else:
+            assert idx is not None
+
+        diag = (self.diag + wn*self.wn_diag)
         
-        diag = (self.diag + wn*self.wn_diag)*jnp.ones(x.shape[-1])
-        noise_model = tinygp.noise.Diagonal(diag=diag).to_qsm()
+        if is_scalar(diag):
+            diag = diag*jnp.ones(x.shape[-1])
+        else:
+            diag = diag[idx]
+        
+        qsm_matrix = tinygp.noise.Diagonal(diag=diag).to_qsm()
 
         if self.noise_model is not None:
-            noise_model += self.noise_model
+            qsm_matrix += self.noise_model
 
-        if idx is None:
-            idx = jnp.arange(x.shape[-1])
-
-        matrix = self.tinygp_kf.to_symm_qsm((x, idx))
-        matrix += noise_model
+        if self.tinygp_kf is not None:
+            qsm_matrix += self.tinygp_kf.to_symm_qsm((x, idx))
     
-        return matrix
+        return qsm_matrix
     
-    def decompose(self, x, wn = True, **kwargs):
+    def decompose(self, x, wn = True, full = True, **kwargs):
 
-        matrix = self._to_symm_qsm(x, wn = wn, **kwargs)
+        matrix = self._to_symm_qsm(x, wn = wn, full = full, **kwargs)
         self.factor = matrix.cholesky()
         self.logdet = 2*jnp.sum(jnp.log(self.factor.diag.d))
         
@@ -582,7 +615,7 @@ class GeneralQuasisepPlusNoise(CovType):
         else:
             return self.factor @ R
     
-    def evaluate(self, x1, x2, wn = True, row_idx = None, col_idx = None, full = False, **kwargs):
+    def evaluate(self, x1, x2, wn = True, row_idx = None, col_idx = None, full = True, **kwargs):
 
         X1, X2 = self._tinygp_coords(x1, x2, row_idx = row_idx, col_idx = col_idx, full = full)
 
@@ -611,13 +644,14 @@ class GeneralQuasisepPlusNoise(CovType):
         X1 = (x1, jnp.arange(x1.shape[-1]))
         X2 = (x2, jnp.arange(x2.shape[-1]))
         
-        if full:
-            R_prime = self.tinygp_kf.matmul(X1, R)
-        else:
-            R_prime = self.tinygp_kf.matmul(X1, X2, R)
-
         diag_eval = (self.diag + wn*self.wn_diag)*jnp.ones(x1.shape[-1])
-        R_prime += jnp.einsum('i,i...->i...', diag_eval, R)
+        R_prime = jnp.einsum('i,i...->i...', diag_eval, R)
+
+        if self.tinygp_kf is not None:
+            if full:
+                R_prime += self.tinygp_kf.matmul(X1, R)
+            else:
+                R_prime += self.tinygp_kf.matmul(X1, X2, R)
 
         if self.noise_model is not None:
             R_prime += self.noise_model @ R
@@ -626,7 +660,10 @@ class GeneralQuasisepPlusNoise(CovType):
 
 
     def scale(self, c):
-        scaled_kernel = luas.kernels.tinygp_ext.Scale(kernel = self.tinygp_kf, scale = c)
+        if self.tinygp_kf is not None: 
+            scaled_kernel = luas.kernels.tinygp_ext.Scale(kernel = self.tinygp_kf, scale = c)
+        else:
+            scaled_kernel = None
 
         if self.noise_model is None:
                 new_noise_model = None
@@ -635,19 +672,39 @@ class GeneralQuasisepPlusNoise(CovType):
 
         return GeneralQuasisepPlusNoise(scaled_kernel, diag = self.diag * c, wn_diag = self.wn_diag * c,
                                         noise_model = new_noise_model, use_block = self.use_block)
+    
+
+    def householder_transform(self, x, u):
+        w_i = self.matmul(x, x, u, full = True)
+
+        # Can this ever be super close to zero? Would be very numerically unstable but seems unlikely?
+        u_dot_w = jnp.dot(u, w_i)
+        alpha = 2 * u_dot_w * u - w_i
+
+        new_tinygp_kf = self.tinygp_kf + luas.kernels.tinygp_ext.Linear(alpha = alpha, const = 1/u_dot_w)
+        new_tinygp_kf += luas.kernels.tinygp_ext.Linear(alpha = w_i, const = -1/u_dot_w)
         
+        return GeneralQuasisepPlusNoise(new_tinygp_kf, diag = self.diag, wn_diag = self.wn_diag,
+                                        noise_model = self.noise_model, use_block = self.use_block)
+    
+
     def __add__(self, K):
 
         if isinstance(K, (Identity, ScaledIdentity, Diagonal)):
             K_sum = GeneralQuasisepPlusNoise(self.tinygp_kf, diag = self.diag + K.diag, wn_diag = self.wn_diag + K.wn_diag,
                                             noise_model = self.noise_model, use_block = self.use_block)
 
-        elif isinstance(K, (Exp, GeneralQuasisep)):
+        elif isinstance(K, GeneralQuasisep):
             kernel_sum = luas.kernels.tinygp_ext.Sum(self.tinygp_kf, K.tinygp_kf, use_block = self.use_block)
             K_sum = GeneralQuasisepPlusNoise(kernel_sum, diag = self.diag, wn_diag = self.wn_diag, noise_model = self.noise_model)
 
         elif isinstance(K, (GeneralQuasisepPlusNoise)):
-            kernel_sum = luas.kernels.tinygp_ext.Sum(self.tinygp_kf, K.tinygp_kf, use_block = self.use_block)
+            if self.tinygp_kf is None:
+                new_tinygp_kf = K.tinygp_kf
+            elif K.tinygp_kf is None:
+                new_tinygp_kf = self.tinygp_kf
+            else:
+                new_tinygp_kf = luas.kernels.tinygp_ext.Sum(self.tinygp_kf, K.tinygp_kf, use_block = self.use_block)
 
             if self.noise_model is not None and K.noise_model is not None:
                 new_noise_model = self.noise_model + K.noise_model
@@ -658,7 +715,7 @@ class GeneralQuasisepPlusNoise(CovType):
             else:
                 new_noise_model = None
 
-            K_sum = GeneralQuasisepPlusNoise(kernel_sum, diag = self.diag + K.diag, wn_diag = self.wn_diag + K.wn_diag,
+            K_sum = GeneralQuasisepPlusNoise(new_tinygp_kf, diag = self.diag + K.diag, wn_diag = self.wn_diag + K.wn_diag,
                                              noise_model = new_noise_model, use_block = self.use_block)
             
         elif isinstance(K, SymmQSM):
@@ -669,8 +726,17 @@ class GeneralQuasisepPlusNoise(CovType):
 
             K_sum = GeneralQuasisepPlusNoise(self.tinygp_kf, use_block = self.use_block,
                                             diag = self.diag, wn_diag = self.wn_diag, noise_model = new_noise_model)
+            
+        elif isinstance(K, (Outer, OuterPlusScaledIdentity)):
+            if self.tinygp_kf is None:
+                new_tinygp_kf = K.tinygp_kf
+            else:
+                new_tinygp_kf = luas.kernels.tinygp_ext.Sum(self.tinygp_kf, K.tinygp_kf, use_block = self.use_block)
 
-        elif isinstance(K, (Outer, General, OuterPlusScaledIdentity)):
+            K_sum = GeneralQuasisepPlusNoise(new_tinygp_kf, diag = self.diag + K.diag, wn_diag = self.wn_diag + K.wn_diag,
+                                             use_block = self.use_block, noise_model = self.noise_model)
+
+        elif isinstance(K, (General)):
             # Should update as don't lose quasiseparability for Outer
             K_sum = General(lambda hp, x1, x2, **kwargs: self.evaluate(x1, x2, **kwargs) + K.evaluate(x1, x2, **kwargs))
 
@@ -680,20 +746,38 @@ class GeneralQuasisepPlusNoise(CovType):
         return K_sum
         
     # Should implement multiplying celerite kernels together but noise model terms need separate calc
-    def __mul__(self, K) -> Kernel:
-        if is_scalar(K):
-            K_mult = self.scale(K)
+    def __mul__(self, other) -> Kernel:
+        if is_scalar(other):
+            K_mult = self.scale(other)
 
-        elif isinstance(K, (Exp, GeneralQuasisep)):
-            # Haven't implemented multplication with a noise_model
-            assert self.noise_model is None
+        elif isinstance(other, GeneralQuasisep) and self.noise_model is None:
 
-            K_mult = luas.kernels.tinygp_ext.Product(self.tinygp_kf, K.tinygp_kf)
-            new_diag = self.diag * K.tinygp_kf.evaluate_diag((jnp.zeros(1), 0))
-            new_wn_diag = self.wn_diag * K.tinygp_kf.evaluate_diag((jnp.zeros(1), 0))
+            K_mult = luas.kernels.tinygp_ext.Product(self.tinygp_kf, other.tinygp_kf)
+            new_diag = self.diag * other.tinygp_kf.evaluate_diag((jnp.zeros(1), 0))
+            new_wn_diag = self.wn_diag * other.tinygp_kf.evaluate_diag((jnp.zeros(1), 0))
             
             K_mult = GeneralQuasisepPlusNoise(K_mult, diag = new_diag, wn_diag = new_wn_diag,
                                             use_block = self.use_block, noise_model = None)
+            
+        elif isinstance(other, Outer):
+            if is_scalar(other.alpha_init):
+                K_mult = self.scale(other.alpha_init**2)
+            else:
+                new_kf = ScaledKernel(kernel = self.tinygp_kf, amplitudes = other.alpha_init)
+
+                if self.noise_model is not None:
+                    diag_term = DiagQSM(d=self.noise_model.diag.d * other.alpha_init**2)
+
+                    p_new = jnp.einsum('i,i...->i...', diag_term, self.noise_model.lower.p)
+                    q_new = jnp.einsum('i,i...->i...', diag_term, self.noise_model.lower.q)
+                    lower_term = StrictLowerTriQSM(p=p_new, q=q_new, a=self.noise_model.lower.a)
+
+                    new_noise_model = SymmQSM(diag=diag_term, lower=lower_term)
+                else:
+                    new_noise_model = None
+
+                K_mult = GeneralQuasisepPlusNoise(new_kf, diag = self.diag * other.alpha_init**2, wn_diag = self.wn_diag * other.alpha_init**2,
+                                                use_block = self.use_block, noise_model = new_noise_model)
         
         else:
             raise Exception("Multiplication of Quasisep kernels which are non-stationary or include a noise model not yet implemented")
@@ -718,7 +802,7 @@ class GeneralQuasisep(CovType):
         matrix = self.tinygp_kf.to_symm_qsm((x, idx))
         return matrix
     
-    def _tinygp_coords(self, x1, x2, row_idx = None, col_idx = None, full = False):
+    def _tinygp_coords(self, x1, x2, row_idx = None, col_idx = None, full = True):
 
         X1 = (x1, jnp.arange(x1.shape[-1]))
         X2 = (x2, jnp.arange(x2.shape[-1]))
@@ -768,24 +852,42 @@ class GeneralQuasisep(CovType):
             R_prime = self.tinygp_kf.matmul(X1, X2, R)
         
         return R_prime
+    
+    def householder_transform(self, x, u):
+        w_i = self.matmul(x, x, u, full = True)
+
+        # Can this ever be super close to zero? Would be very numerically unstable but seems unlikely?
+        u_dot_w = jnp.dot(u, w_i)
+        alpha = 2 * u_dot_w * u - w_i
+
+        new_tinygp_kf = self.tinygp_kf + luas.kernels.tinygp_ext.Linear(alpha = alpha, const = 1/u_dot_w)
+        new_tinygp_kf += luas.kernels.tinygp_ext.Linear(alpha = w_i, const = -1/u_dot_w)
+        
+        return GeneralQuasisepPlusNoise(new_tinygp_kf, use_block = self.use_block)
 
     def __add__(self, K):
 
         if isinstance(K, Identity) or isinstance(K, ScaledIdentity) or isinstance(K, Diagonal):
             K_sum = GeneralQuasisepPlusNoise(self.tinygp_kf, diag = K.diag, wn_diag = K.wn_diag, use_block = self.use_block)
 
-        elif isinstance(K, GeneralQuasisepPlusNoise):
+        elif isinstance(K, GeneralQuasisep):
             sum_kernel = luas.kernels.tinygp_ext.Sum(self.tinygp_kf, K.tinygp_kf, use_block = self.use_block)
-            K_sum = GeneralQuasisepPlusNoise(sum_kernel, diag = K.diag, wn_diag = K.wn_diag, noise_model = K.noise_model, use_block = self.use_block)
+            K_sum = GeneralQuasisep(sum_kernel, use_block = self.use_block)
+
+        elif isinstance(K, GeneralQuasisepPlusNoise):
+            if K.tinygp_kf is not None:
+                new_tinygp_kf = luas.kernels.tinygp_ext.Sum(self.tinygp_kf, K.tinygp_kf, use_block = self.use_block)
+            else:
+                new_tinygp_kf = self.tinygp_kf
+            K_sum = GeneralQuasisepPlusNoise(new_tinygp_kf, diag = K.diag, wn_diag = K.wn_diag, noise_model = K.noise_model, use_block = self.use_block)
 
         elif isinstance(K, SymmQSM):
             K_sum = GeneralQuasisepPlusNoise(self.tinygp_kf, use_block = self.use_block, noise_model = K)
 
-        elif isinstance(K, (Exp, GeneralQuasisep)):
-            sum_kernel = luas.kernels.tinygp_ext.Sum(self.tinygp_kf, K.tinygp_kf, use_block = self.use_block)
-            K_sum = GeneralQuasisep(sum_kernel, use_block = self.use_block)
+        elif isinstance(K, (Outer, OuterPlusScaledIdentity)):
+            K_sum = GeneralQuasisepPlusNoise(self.tinygp_kf + K.tinygp_kf, diag = K.diag, wn_diag = K.wn_diag, use_block = self.use_block)
 
-        elif isinstance(K, (Outer, OuterPlusScaledIdentity, General)):
+        elif isinstance(K, (General)):
             # Should update as don't lose quasiseparability
             K_sum = General(lambda hp, x1, x2, **kwargs: self.evaluate(x1, x2, **kwargs) + K.evaluate(x1, x2, **kwargs))
 
@@ -795,17 +897,14 @@ class GeneralQuasisep(CovType):
         return K_sum
     
     def __mul__(self, other) -> Kernel:
-        if isinstance(other, (Exp, GeneralQuasisep)):
+        if isinstance(other, GeneralQuasisep):
             product_kernel = luas.kernels.tinygp_ext.Product(kernel1 = self.tinygp_kf, kernel2 = other.tinygp_kf)
             K_mult = GeneralQuasisep(product_kernel, use_block = self.use_block)
         
         elif is_scalar(other):
             K_mult = self.scale(other)
         
-        elif isinstance(other, GeneralQuasisepPlusNoise):
-            # Haven't implemented multplication with a noise_model
-            assert other.noise_model is None
-
+        elif isinstance(other, GeneralQuasisepPlusNoise) and other.noise_model is None:
             K_mult = luas.kernels.tinygp_ext.Product(self.tinygp_kf, other.tinygp_kf)
             new_diag = other.diag * self.tinygp_kf.evaluate_diag((jnp.zeros(1), 0))
             new_wn_diag = other.wn_diag * self.tinygp_kf.evaluate_diag((jnp.zeros(1), 0))
@@ -813,14 +912,27 @@ class GeneralQuasisep(CovType):
             K_mult = GeneralQuasisepPlusNoise(K_mult, diag = new_diag, wn_diag = new_wn_diag,
                                             use_block = self.use_block, noise_model = None)
             
+        elif isinstance(other, Outer):
+            if is_scalar(other.alpha_init):
+                K_mult = self.scale(other.alpha_init**2)
+            else:
+                new_kf = ScaledKernel(kernel = self.tinygp_kf, amplitudes = other.alpha_init)
+                K_mult = GeneralQuasisepPlusNoise(new_kf, use_block = self.use_block)
+            
         else:
             raise Exception(f"Multiplication between Quasisep kernels and non Quasisep kernels not implemented")
         
         return K_mult
-        
     
-class Exp(CovType):
-    def __init__(self, tinygp_kf, scale, sigma = 1., params = None, use_block = True):
+
+class PeriodicQuasisep(GeneralQuasisep):
+    def scale(self, c):
+        scaled_kernel = luas.kernels.tinygp_ext.Scale(kernel = self.tinygp_kf, scale = c)
+        return PeriodicQuasisep(scaled_kernel, use_block = self.use_block)
+
+
+class Exp(GeneralQuasisep):
+    def __init__(self, tinygp_kf, scale, sigma = 1., params = None, use_block = True, fast_eigen = False):
         self.len_scale = scale
         self.sigma = sigma
         self.tinygp_kf = tinygp_kf
@@ -829,53 +941,18 @@ class Exp(CovType):
         self.noise_model = None
         self.use_block = use_block
         self.params = params
+        self.fast_eigen = fast_eigen
 
-    def _tinygp_coords(self, x1, x2, row_idx = None, col_idx = None, full = False):
+        if self.fast_eigen:
+            # Note gradients not implemented yet for this method
+            self.eigendecomp = self.eigendecomp_fast
 
-        X1 = (x1, jnp.arange(x1.shape[-1]))
-        X2 = (x2, jnp.arange(x2.shape[-1]))
-        
-        return X1, X2
+    def scale(self, c):
+        scaled_kernel = luas.kernels.tinygp_ext.Scale(kernel = self.tinygp_kf, scale = c)
+        return Exp(scaled_kernel, self.len_scale, sigma = self.sigma * jnp.sqrt(c),
+                   use_block = self.use_block, fast_eigen = self.fast_eigen)
 
-    def _to_symm_qsm(self, x, wn = True, idx = None, stored_values = {}):
-
-        if idx is None:
-            idx = jnp.arange(x.shape[-1])
-        
-        matrix = self.tinygp_kf.to_symm_qsm((x, idx))
-    
-        return matrix
-    
-    def evaluate(self, x1, x2, wn = True, **kwargs):
-
-        X1, X2 = self._tinygp_coords(x1, x2, **kwargs)
-        return self.tinygp_kf(X1, X2)
-    
-    def decompose(self, x, **kwargs):
-        
-        matrix = self._to_symm_qsm(x, **kwargs)
-        self.factor = matrix.cholesky()
-        self.logdet = 2*jnp.sum(jnp.log(self.factor.diag.d))
-        return self, {"logdet":self.logdet}
-        
-    def matrix_sqrt(self, R, transpose = 0):
-
-        if transpose:
-            return self.transpose().factor @ R
-        else:
-            return self.factor @ R
-
-    def matrix_inv_sqrt(self, R, transpose=0):
-
-        if transpose:
-            R_prime = self.factor.transpose().solve(R)
-        else:
-            R_prime = self.factor.solve(R)
-            
-        return R_prime
-        
-    def eigendecomp(self, x, **kwargs):
-        
+    def eigendecomp_fast(self, x, **kwargs):
         N = x.shape[-1]
         result_shape = (jax.ShapeDtypeStruct((N,), x.dtype), jax.ShapeDtypeStruct((N, N), x.dtype))
         lam, Q = jax.pure_callback(self.fast_exp_eigh_scipy, result_shape, x, self.len_scale)
@@ -898,65 +975,6 @@ class Exp(CovType):
         
         return 1/lam, Q
     
-    def matmul(self, x1, x2, R, wn = True, full = True, **kwargs):
-
-        X1, X2 = self._tinygp_coords(x1, x2, full = full, **kwargs)
-
-        if full:
-            R_prime = self.tinygp_kf.matmul(X1, R)
-        else:
-            R_prime = self.tinygp_kf.matmul(X1, X2, R)
-        
-        return R_prime
-
-    def scale(self, c):
-        scaled_kernel = luas.kernels.tinygp_ext.Scale(kernel = self.tinygp_kf, scale = c)
-        return Exp(scaled_kernel, self.len_scale, sigma = self.sigma * jnp.sqrt(c), use_block = self.use_block)
-
-    def __add__(self, K):
-        if isinstance(K, (Identity, ScaledIdentity, Diagonal)):
-            K_sum = GeneralQuasisepPlusNoise(self.tinygp_kf, diag = K.diag, wn_diag = K.wn_diag, use_block = self.use_block)
-
-        elif isinstance(K, (Exp, GeneralQuasisep)):
-            sum_kernel = luas.kernels.tinygp_ext.Sum(kernel1 = self.tinygp_kf, kernel2 = K.tinygp_kf, use_block = self.use_block)
-            K_sum = GeneralQuasisep(sum_kernel, use_block = self.use_block)
-
-        elif isinstance(K, GeneralQuasisepPlusNoise):
-            kernel_sum = luas.kernels.tinygp_ext.Sum(self.tinygp_kf, K.tinygp_kf, use_block = self.use_block)
-            K_sum = GeneralQuasisepPlusNoise(kernel_sum, diag = K.diag, wn_diag = K.wn_diag, noise_model = K.noise_model)
-
-        elif isinstance(K, (Outer, OuterPlusScaledIdentity)):
-            K_sum = General(lambda hp, x1, x2, **kwargs: self.evaluate(x1, x2) + K.evaluate(x1, x2, **kwargs))
-
-        else:
-            raise Exception(f"{type(K)} not recognised or addition not supported")
-            
-        return K_sum
-
-    def __mul__(self, other) -> Kernel:
-
-        if isinstance(other, (Exp, GeneralQuasisep)):
-            product_kernel = luas.kernels.tinygp_ext.Product(kernel1 = self.tinygp_kf, kernel2 = other.tinygp_kf)
-            K_mult = GeneralQuasisep(product_kernel, use_block = self.use_block)
-
-        elif is_scalar(other):
-            K_mult = self.scale(other)
-        
-        elif isinstance(other, GeneralQuasisepPlusNoise):
-            # Haven't implemented multplication with a noise_model
-            assert other.noise_model is None
-
-            K_mult = luas.kernels.tinygp_ext.Product(self.tinygp_kf, other.tinygp_kf)
-            new_diag = other.diag * self.tinygp_kf.evaluate_diag((jnp.zeros(1), 0))
-            new_wn_diag = other.wn_diag * self.tinygp_kf.evaluate_diag((jnp.zeros(1), 0))
-            
-            K_mult = GeneralQuasisepPlusNoise(K_mult, diag = new_diag, wn_diag = new_wn_diag,
-                                            use_block = self.use_block, noise_model = None)
-            
-        else:
-            raise Exception(f"Multiplication between Quasisep kernels and non Quasisep kernels not implemented")
-
-        return K_mult
 
 
 class Outer(CovType):
@@ -966,15 +984,20 @@ class Outer(CovType):
         self.wn_diag = 0.
         self.params = params
 
+        if is_scalar(alpha):
+            self.tinygp_kf = HandleIdx(luas.kernels.tinygp_ext.Constant(const = alpha**2))
+        else:
+            self.tinygp_kf = luas.kernels.tinygp_ext.Linear(alpha = alpha)
+
         assert is_scalar(self.alpha_init) or self.alpha_init.ndim == 1
 
     def rank(self, x):
         return 1
 
-    def evaluate(self, x1, x2, wn = True, row_idx = None, col_idx = None, full = False, **kwargs):
+    def evaluate(self, x1, x2, wn = True, row_idx = None, col_idx = None, full = True, **kwargs):
 
         if is_scalar(self.alpha_init):
-            mat = self.alpha_init * jnp.ones((x1.shape[-1], x2.shape[-1]))
+            mat = self.alpha_init**2 * jnp.ones((x1.shape[-1], x2.shape[-1]))
         elif full:
             mat = jnp.outer(self.alpha_init, self.alpha_init)
         else:
@@ -1027,7 +1050,7 @@ class Outer(CovType):
     def matmul(self, x1, x2, R, **kwargs):
 
         if is_scalar(self.alpha_init):
-            return self.alpha_init * R.sum()
+            return jnp.outer(jnp.ones(x1.shape[-1]) * self.alpha_init**2, R.sum(0))
         else:
             self.vec1 = self.alpha_init * jnp.ones(x1.shape[-1])
             self.vec2 = self.alpha_init * jnp.ones(x2.shape[-1])
@@ -1038,17 +1061,28 @@ class Outer(CovType):
                 return jnp.outer(self.vec1, self.vec2 @ R)
             else:
                 raise Exception("Not implemented")
+        
             
+
     def __add__(self, K):
 
         if isinstance(K, (Identity, ScaledIdentity)):
             K_sum = OuterPlusScaledIdentity(self.alpha_init, diag = K.diag, wn_diag = K.wn_diag)
 
-        elif isinstance(K, (General, Outer)):
+        elif isinstance(K, Outer):
+            # Could do something better here
             K_sum = General(lambda hp, x1, x2, **kwargs: self.evaluate(x1, x2, **kwargs) + K.evaluate(x1, x2, **kwargs))
 
-        # Could actually add to quasisep by forming a noise model, worth doing?
-        elif isinstance(K, (GeneralQuasisep, Exp, Diagonal, OuterPlusScaledIdentity)):
+        elif isinstance(K, (GeneralQuasisepPlusNoise, GeneralQuasisep, Exp)):
+            if K.tinygp_kf is not None:
+                new_tinygp_kf = luas.kernels.tinygp_ext.Sum(self.tinygp_kf, K.tinygp_kf, use_block = K.use_block)
+            else:
+                new_tinygp_kf = self.tinygp_kf
+
+            K_sum = GeneralQuasisepPlusNoise(new_tinygp_kf, diag = K.diag, wn_diag = K.wn_diag,
+                                             noise_model = K.noise_model,  use_block = K.use_block)
+
+        elif isinstance(K, (Diagonal, OuterPlusScaledIdentity, General)):
             # Should update as you can always add outer products without losing quasiseparability
             K_sum = General(lambda hp, x1, x2, **kwargs: self.evaluate(x1, x2, **kwargs) + K.evaluate(x1, x2, **kwargs))
 
@@ -1059,13 +1093,15 @@ class Outer(CovType):
 
     # Could implement an efficient Quasisep multiplication
     def __mul__(self, K) -> Kernel:
-
         if is_scalar(K):
             K_mul = self.scale(K)
+
+        elif is_scalar(self.alpha_init) and isinstance(K, CovType):
+            K_mul = K.scale(self.alpha_init**2)
         
-        elif isinstance(K, (Exp, GeneralQuasisep)):
+        elif isinstance(K, GeneralQuasisep):
             new_kf = ScaledKernel(kernel = K.tinygp_kf, amplitudes = self.alpha_init)
-            K_mul = GeneralQuasisep(new_kf, use_block = K.use_block)
+            K_mul = GeneralQuasisepPlusNoise(new_kf, use_block = K.use_block)
         
         elif isinstance(K, GeneralQuasisepPlusNoise):
             new_kf = ScaledKernel(kernel = K.tinygp_kf, amplitudes = self.alpha_init)
@@ -1105,6 +1141,12 @@ class OuterPlusScaledIdentity(CovType):
         self.diag = diag
         self.wn_diag = wn_diag
         self.params = params
+
+        if is_scalar(alpha):
+            self.tinygp_kf = HandleIdx(luas.kernels.tinygp_ext.Constant(const = alpha**2))
+        else:
+            const_kf = HandleIdx(luas.kernels.tinygp_ext.Constant(1.))
+            self.tinygp_kf = ScaledKernel(kernel = const_kf, amplitudes = alpha)
 
         assert is_scalar(self.alpha_init) or self.alpha_init.ndim == 1
         assert is_scalar(self.diag)
@@ -1183,94 +1225,25 @@ class OuterPlusScaledIdentity(CovType):
     def __add__(self, K):
         if isinstance(K, (Identity, ScaledIdentity)):
             K_sum = OuterPlusScaledIdentity(self.alpha, diag = self.diag + K.diag, wn_diag = self.wn_diag + K.wn_diag)
-        elif isinstance(K, CovType):
+
+        elif isinstance(K, (GeneralQuasisepPlusNoise, GeneralQuasisep)):
+            if is_scalar(self.alpha_init):
+                outer_kf = luas.kernels.quasisep.Constant(self.alpha_init**2)
+            else:
+                outer_kf = luas.kernels.quasisep.Linear(self.alpha_init)
+
+            if K.tinygp_kf is not None:
+                new_tinygp_kf = luas.kernels.tinygp_ext.Sum(outer_kf, K.tinygp_kf, use_block = K.use_block)
+            else:
+                new_tinygp_kf = outer_kf
+
+            K_sum = GeneralQuasisepPlusNoise(new_tinygp_kf, diag = self.diag + K.diag, wn_diag = self.wn_diag + K.wn_diag,
+                                             noise_model = K.noise_model,  use_block = K.use_block)
+            
+        elif isinstance(K, (Diagonal, Outer, OuterPlusScaledIdentity, General)):
             K_sum = General(kf = lambda hp, x1, x2, **kwargs: self.evaluate(x1, x2, **kwargs) + K.evaluate(x1, x2, **kwargs))
+
         else:
             raise Exception("Addition of kernels not implemented")
         return K_sum
-        
 
-
-@tree_util.register_pytree_node_class
-class HouseholderTransform:
-    def __init__(self, vec, i = -1):
-        self.vec = vec
-        self.T = self
-        basis_vec = jnp.zeros_like(vec)
-        basis_vec = basis_vec.at[i].set(1)
-
-        norm_alpha = jnp.linalg.norm(self.vec)
-
-        alpha_normalised = self.vec/norm_alpha
-        u = alpha_normalised - basis_vec
-        self.u_hat = u/jnp.linalg.norm(u)
-        self.lam = norm_alpha**2 * basis_vec
-
-    def __matmul__(self, other):
-        if other.ndim == 1:
-            return other - 2 * jnp.kron(self.u_hat, self.u_hat @ other)
-        elif other.ndim == 2:
-            return other - 2 * jnp.outer(self.u_hat, self.u_hat @ other)
-        elif other.ndim > 2:
-            return vmap_for_tensors(self.__matmul__)(other)
-        else:
-            raise Exception("Not implemented")
-
-    def __rmatmul__(self, other):
-        if other.ndim == 1:
-            return other - 2 * jnp.kron(other @ self.u_hat, self.u_hat)
-        elif other.ndim == 2:
-            return other - 2 * jnp.outer(other @ self.u_hat, self.u_hat @ other)
-        else:
-            raise Exception("Not implemented")
-
-    def __repr__(self):
-        dense_mat = self.to_dense()
-        return f"HouseholderTransform({dense_mat})"
-
-    def to_dense(self):
-        self.dense = jnp.eye(self.u_hat.size) - 2 * jnp.outer(self.u_hat, self.u_hat)
-        return self.dense
-        
-    # Required for JAX
-    def tree_flatten(self):
-        return (self.__repr__(),), None
-
-    @classmethod
-    def tree_unflatten(cls, aux_data, children):
-        return cls(*children)
-
-
-class Toeplitz(CovType):
-    def __init__(self, kf):
-        self.kf = kf
-
-class Banded(CovType):
-    def __init__(self, kf):
-        self.kf = kf
-
-class Lowrank(CovType):
-    def __init__(self, kf):
-        self.kf = kf
-
-class Periodic(CovType):
-    def __init__(self, kf):
-        self.kf = kf
-
-
-class General2D(CovType):
-    def __init__(self, kf):
-        self.kf = kf
-
-class Block2D(CovType):
-    def __init__(self, kf):
-        self.kf = kf
-
-class Diagonal2D(CovType):
-    def __init__(self, diag):
-        self.diag = diag
-
-class Quasisep2D(CovType):
-    def __init__(self, kf):
-        self.kf = kf
-        

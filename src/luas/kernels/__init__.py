@@ -1,4 +1,7 @@
 from luas.kernels.base import (
+    Custom,
+    Noise,
+    KroneckerDelta,
     Exp,
     SquaredExp,
     PoweredExp,
@@ -9,7 +12,8 @@ from luas.kernels.base import (
     ExpSineSquared,
     Cosine,
     Constant,
-    Outer,
+    Linear,
 )
 import luas.kernels.diagonal
 import luas.kernels.quasisep
+import luas.kernels.lowrank

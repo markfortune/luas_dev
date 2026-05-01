@@ -96,7 +96,7 @@ def vmap_for_tensors(f):
         
         R_flat = R.reshape(-1, N_l, N_t)
         
-        f_new = lambda R, **kwargs: f(R, **kwargs)
+        f_new = lambda R: f(R, **kwargs)
         R_prime_flat = jax.vmap(f_new)(R_flat)
         
         return R_prime_flat.reshape(*leading, *R_prime_flat.shape[1:])

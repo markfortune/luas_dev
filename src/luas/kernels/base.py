@@ -7,6 +7,8 @@ from luas.luas_types import JAXArray, Scalar, PyTree, is_scalar
 import luas.kernels.covtype as covtype
 
 __all__ = [
+    "KroneckerDelta",
+    "Noise",
     "evaluate_kernel",
     "distanceL1",
     "distanceL2Sq",
@@ -19,6 +21,8 @@ __all__ = [
     "Cosine",
     "PoweredExp",
 ]
+
+from luas.kernels.diagonal import KroneckerDelta, Noise
 
 def evaluate_kernel(kernel_fn: Callable, x: JAXArray, y: JAXArray, *args, axes = None) -> JAXArray:
     """Uses the ``jax.vmap`` function to efficiently build the covariance matrix from
@@ -139,7 +143,7 @@ def exp_calc(x: JAXArray, y: JAXArray, L: Scalar) -> JAXArray:
     delta_t = distanceL1(x, y, L).sum()
     return jnp.exp(-delta_t)
 
-def Custom(kf: Callable, hp: PyTree, params = None) -> JAXArray:
+def Custom(kf: Callable, hp: PyTree, params = None, kf_args = (), kf_kwargs = {}) -> JAXArray:
     r"""Powered exponential kernel function, a family of kernel functions which
     include the exponential and squared exponential kernels as special cases. 
     Equivalent to the exponential kernel for k = 1 and the squared exponential kernel
@@ -160,8 +164,10 @@ def Custom(kf: Callable, hp: PyTree, params = None) -> JAXArray:
     Returns:
         Scalar: Covariance between two input vectors
     """
-
-    return covtype.General(lambda x1, x2, **kwargs: kf(hp, x1, x2, **kwargs), params = params)
+    custom_kf = lambda _, x1, x2, full = True, row_idx = None, col_idx = None, **kwargs: kf(hp, x1, x2,
+                                                                                            *kf_args, **kf_kwargs,
+                                                                                            **kwargs)
+    return covtype.General(custom_kf, params = params)
 
 
 def PoweredExp(scale: Scalar, k: Scalar) -> JAXArray:
@@ -193,11 +199,11 @@ def powered_exp_calc(x: JAXArray, y: JAXArray, L: Scalar, k: Scalar) -> JAXArray
     """Function used by powered_exp to evaluate the powered exponential kernel function. 
     """
 
-    tau_sq = jnp.power(distanceL1(x1, x2, L), k)
+    tau_sq = jnp.power(distanceL1(x, y, L), k)
     return jnp.exp(-tau_sq.sum())
 
 
-def Outer(alpha: JAXArray) -> JAXArray:
+def Linear(alpha: JAXArray) -> JAXArray:
     r"""Matern 3/2 kernel function, used with ``luas.kernels.evaluate_kernel``
     to build covariance matrices.
     
@@ -236,7 +242,7 @@ def Constant(const: JAXArray) -> JAXArray:
         
     """
     
-    return covtype.Outer(alpha = const)
+    return covtype.Outer(alpha = jnp.sqrt(const))
 
 
 def Matern32(scale: Scalar) -> JAXArray:
@@ -337,54 +343,54 @@ def matern_p_calc(x: JAXArray, y: JAXArray, L: Scalar, p: int) -> JAXArray:
     return const * poly_term * jnp.exp(-delta_t)
 
     
-def Independent(diag = None) -> JAXArray:
-    r"""Matern 5/2 kernel function, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices.
+# def Independent(diag = None) -> JAXArray:
+#     r"""Matern 5/2 kernel function, used with ``luas.kernels.evaluate_kernel``
+#     to build covariance matrices.
     
-    .. math::
+#     .. math::
 
-        k(x, y) = \Bigg(1 + \sqrt{5} \frac{|x - y|}{L} + \frac{5|x - y|^2}{3L^2}\Bigg) \exp\Bigg( -\sqrt{5}\frac{|x - y|}{L}\Bigg)
+#         k(x, y) = \Bigg(1 + \sqrt{5} \frac{|x - y|}{L} + \frac{5|x - y|^2}{3L^2}\Bigg) \exp\Bigg( -\sqrt{5}\frac{|x - y|}{L}\Bigg)
     
-    Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
+#     Args:
+#         x (JAXArray): Input vector 1
+#         y (JAXArray): Input vector 2
+#         L (Scalar): Length scale
         
-    Returns:
-        Scalar: Covariance between two input vectors
+#     Returns:
+#         Scalar: Covariance between two input vectors
         
-    """
-    if diag is not None:
-        if is_scalar(diag):
-            return covtype.ScaledIdentity(diag = diag)
-        else:
-            return covtype.Diagonal(diag = diag)
-    else:
-        return covtype.Identity()
+#     """
+#     if diag is not None:
+#         if is_scalar(diag):
+#             return covtype.ScaledIdentity(diag = diag)
+#         else:
+#             return covtype.Diagonal(diag = diag)
+#     else:
+#         return covtype.Identity()
 
 
-def Noise(diag) -> JAXArray:
-    r"""Matern 5/2 kernel function, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices.
+# def Noise(diag) -> JAXArray:
+#     r"""Matern 5/2 kernel function, used with ``luas.kernels.evaluate_kernel``
+#     to build covariance matrices.
     
-    .. math::
+#     .. math::
 
-        k(x, y) = \Bigg(1 + \sqrt{5} \frac{|x - y|}{L} + \frac{5|x - y|^2}{3L^2}\Bigg) \exp\Bigg( -\sqrt{5}\frac{|x - y|}{L}\Bigg)
+#         k(x, y) = \Bigg(1 + \sqrt{5} \frac{|x - y|}{L} + \frac{5|x - y|^2}{3L^2}\Bigg) \exp\Bigg( -\sqrt{5}\frac{|x - y|}{L}\Bigg)
     
-    Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
+#     Args:
+#         x (JAXArray): Input vector 1
+#         y (JAXArray): Input vector 2
+#         L (Scalar): Length scale
         
-    Returns:
-        Scalar: Covariance between two input vectors
+#     Returns:
+#         Scalar: Covariance between two input vectors
         
-    """
+#     """
     
-    if is_scalar(diag):
-        return covtype.ScaledIdentity(wn_diag = diag)
-    else:
-        return covtype.Diagonal(wn_diag = diag)
+#     if is_scalar(diag):
+#         return covtype.ScaledIdentity(wn_diag = diag)
+#     else:
+#         return covtype.Diagonal(wn_diag = diag)
 
     
 def RationalQuadratic(scale: Scalar, alpha: Scalar) -> JAXArray:
@@ -417,7 +423,7 @@ def rational_quadratic_calc(x: JAXArray, y: JAXArray, L: Scalar, alpha: Scalar) 
     return (1. + 0.5*tau_sq/alpha)**(-alpha)
 
 
-def ExpSineSquared(scale: Scalar, P: Scalar) -> JAXArray:
+def ExpSineSquared(gamma: Scalar, period: Scalar, sigma: Scalar = 1.) -> JAXArray:
     r"""Exponential sine squared kernel, used with evaluate_kernel
     to build covariance matrices which have periodic covariance.
     
@@ -435,19 +441,19 @@ def ExpSineSquared(scale: Scalar, P: Scalar) -> JAXArray:
         JAXArray: Covariance between two input vectors
         
     """
-    return covtype.General(lambda hp, x, y, **kwargs: evaluate_kernel(exp_sine_squared_calc, x, y, scale, P))
+    return covtype.General(lambda hp, x, y, **kwargs: sigma**2 * evaluate_kernel(exp_sine_squared_calc, x, y, gamma, period))
 
 
-def exp_sine_squared_calc(x: JAXArray, y: JAXArray, L: Scalar, P: Scalar) -> JAXArray:
+def exp_sine_squared_calc(x: JAXArray, y: JAXArray, gamma: Scalar, period: Scalar) -> JAXArray:
     """Function used by exp_sine_squared to evaluate the exponential sine squared kernel function.
     
     """
 
-    tau_sq = (jnp.sum(jnp.square(jnp.sin(jnp.pi*(x - y)/P)/L))).sum()
-    return jnp.exp(-2.0 * tau_sq)
+    sine_sq = jnp.square(jnp.sin(jnp.pi*(x - y)/period))
+    return jnp.exp(-gamma * sine_sq).sum()
     
 
-def Cosine(P: Scalar) -> JAXArray:
+def Cosine(period: Scalar) -> JAXArray:
     r"""Cosine kernel, used with ``luas.kernels.evaluate_kernel``
     to build covariance matrices which have periodic covariance.
     
@@ -465,14 +471,14 @@ def Cosine(P: Scalar) -> JAXArray:
         
     """
 
-    return covtype.General(lambda hp, x, y, **kwargs: evaluate_kernel(cosine_calc, x, y, P))
+    return covtype.General(lambda hp, x, y, **kwargs: evaluate_kernel(cosine_calc, x, y, period))
 
 
-def cosine_calc(x: JAXArray, y: JAXArray, P: Scalar) -> JAXArray:
+def cosine_calc(x: JAXArray, y: JAXArray, period: Scalar) -> JAXArray:
     """Function used by cosine to evaluate the cosine kernel function. 
     
     """
         
-    delta_t = distanceL1(x, y, P).sum()
+    delta_t = distanceL1(x, y, period).sum()
     return jnp.cos(2*jnp.pi*delta_t)
 

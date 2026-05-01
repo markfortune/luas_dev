@@ -16,13 +16,23 @@ __all__ = [
     "Exp",
     "Matern32",
     "Matern52",
-    "MaternNuHalf",
+    "Matern",
     "Outer",
     "Constant",
     "SHO",
     "Cosine",
-    "SETaylor",
+    "KroneckerDelta",
+    "Noise",
 ]
+
+from luas.kernels.diagonal import KroneckerDelta, Noise
+
+def Banded(diag: JAXArray, off_diags: JAXArray, use_block: bool = True) -> covtype.CovType:
+    
+    symm_qsm = tinygp.noise.Banded(diag, off_diags).to_qsm()
+
+    # Don't use HandleIdx here as need the location in matrix for non-stationary kernels
+    return covtype.GeneralQuasisepPlusNoise(None, noise_model = symm_qsm, use_block = use_block)
 
 
 def CustomTinygp(kf_tinygp: Callable, params = None) -> JAXArray:
@@ -47,32 +57,11 @@ def CustomTinygp(kf_tinygp: Callable, params = None) -> JAXArray:
         Scalar: Covariance between two input vectors
     """
 
-    return covtype.GeneralQuasisep(HandleIdx(kf_tinygp), params = params)
+    return covtype.GeneralQuasisepPlusNoise(HandleIdx(kf_tinygp), params = params)
 
 
 
-# def Outer(alpha: JAXArray) -> JAXArray:
-#     r"""Matern 3/2 kernel function, used with ``luas.kernels.evaluate_kernel``
-#     to build covariance matrices.
-    
-#     .. math::
-
-#         k(x, y) = \Bigg(1 + \sqrt{3} \frac{|x - y|}{L}\Bigg) \exp\Bigg( -\sqrt{3} \frac{|x - y|}{L}\Bigg)
-    
-#     Args:
-#         x (JAXArray): Input vector 1
-#         y (JAXArray): Input vector 2
-#         L (Scalar): Length scale
-        
-#     Returns:
-#         Scalar: Covariance between two input vectors
-        
-#     """
-    
-#     return covtype.Outer(alpha = alpha)
-
-
-def Constant(const: JAXArray, use_block: bool = True) -> JAXArray:
+def Constant(const: JAXArray) -> JAXArray:
     r"""Matern 3/2 kernel function, used with ``luas.kernels.evaluate_kernel``
     to build covariance matrices.
     
@@ -91,11 +80,10 @@ def Constant(const: JAXArray, use_block: bool = True) -> JAXArray:
     """
     assert is_scalar(const)
 
-    tinygp_kf = luas.kernels.tinygp_ext.Constant(const = const)
-    return covtype.GeneralQuasisep(HandleIdx(tinygp_kf), use_block = use_block)
+    return covtype.Outer(alpha = jnp.sqrt(const))
 
 
-def Linear(alpha: JAXArray, use_block: bool = True, const: float = 1.) -> JAXArray:
+def Linear(alpha: JAXArray, use_block: bool = True, const: None = None) -> JAXArray:
     r"""Matern 3/2 kernel function, used with ``luas.kernels.evaluate_kernel``
     to build covariance matrices.
     
@@ -114,14 +102,15 @@ def Linear(alpha: JAXArray, use_block: bool = True, const: float = 1.) -> JAXArr
     """
     assert alpha.ndim == 1
 
-    const_kf = HandleIdx(luas.kernels.tinygp_ext.Constant(const))
-    tinygp_kf = ScaledKernel(kernel = const_kf, amplitudes = alpha)
+    if const is not None:
+        tinygp_kf = luas.kernels.tinygp_ext.Linear(alpha = alpha, const = const)
+        return covtype.GeneralQuasisepPlusNoise(tinygp_kf, use_block = use_block)
+    else:
+        return covtype.Outer(alpha)
 
-    # Don't use HandleIdx here as need the location in matrix for non-stationary kernels
-    return covtype.GeneralQuasisepPlusNoise(tinygp_kf, use_block = use_block)
 
 
-def CalibrationErrors(cal_times: JAXArray, sigma: Scalar = 1., use_block: bool = True) -> JAXArray:
+def ConstantBlocks(endpoints: JAXArray, sigma: Scalar = 1., use_block: bool = True) -> JAXArray:
     r"""Matern 3/2 kernel function, used with ``luas.kernels.evaluate_kernel``
     to build covariance matrices.
     
@@ -139,11 +128,11 @@ def CalibrationErrors(cal_times: JAXArray, sigma: Scalar = 1., use_block: bool =
         
     """
 
-    tinygp_kf = luas.kernels.tinygp_ext.CalibrationErrors(cal_times = cal_times, sigma = sigma)
+    tinygp_kf = luas.kernels.tinygp_ext.ConstantBlocks(endpoints = endpoints, sigma = sigma)
     return covtype.GeneralQuasisep(HandleIdx(tinygp_kf), use_block = use_block)
 
 
-def Exp(scale: Scalar, sigma: Scalar = 1.) -> JAXArray:
+def Exp(scale: Scalar, sigma: Scalar = 1., fast_eigen = False) -> JAXArray:
     r"""Exponential kernel function, also known as the Matern 1/2 kernel, used with ``luas.kernels.evaluate_kernel``
     to build covariance matrices.
     
@@ -161,7 +150,7 @@ def Exp(scale: Scalar, sigma: Scalar = 1.) -> JAXArray:
         
     """
     exp_kernel = tinygp.kernels.quasisep.Exp(scale = scale, sigma = sigma)
-    return covtype.Exp(HandleIdx(exp_kernel), scale, sigma = sigma)
+    return covtype.Exp(HandleIdx(exp_kernel), scale, sigma = sigma, fast_eigen = fast_eigen)
 
 
 def Matern32(scale: Scalar) -> JAXArray:
@@ -296,6 +285,7 @@ def ExpSineSquaredApprox(
     order: int = 5,
     use_block: bool = True,
 ):
+    # Note defaults to an order of 5 which can be inaccurate
     kf_tinygp = luas.kernels.tinygp_ext.ExpSineSquaredApprox(period=period, gamma=gamma,
                                                              sigma=sigma, order=order,
                                                              use_block = use_block)

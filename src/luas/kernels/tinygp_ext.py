@@ -1,8 +1,9 @@
 from __future__ import annotations
 import tinygp
-from tinygp.kernels.quasisep import Quasisep
+from tinygp.kernels.quasisep import Quasisep, _prod_helper
 from tinygp.solvers.quasisep.core import DiagQSM, StrictLowerTriQSM, StrictUpperTriQSM, SymmQSM, SquareQSM
 from tinygp.noise import Noise
+from tinygp.solvers.quasisep.block import Block
 import jax.numpy as jnp
 import jax.scipy as jsp
 import jax
@@ -47,9 +48,12 @@ class Product(tinygp.kernels.quasisep.Product):
     kernel2: Quasisep
 
 
-class Scale(tinygp.kernels.quasisep.Scale):
+class Scale(tinygp.kernels.quasisep.Wrapper):
     """The product of a scalar and a quasiseparable kernel"""
     scale: JAXArray | float
+
+    def stationary_covariance(self) -> JAXArray:
+        return self.scale * self.kernel.stationary_covariance()
     
     def observation_model(self, X: JAXArray) -> JAXArray:
         return self.kernel.observation_model(X)
@@ -65,6 +69,14 @@ class HandleIdx(tinygp.kernels.quasisep.Wrapper):
     def coord_to_sortable(self, X):
         return X[0]
 
+@tinygp.helpers.dataclass
+class DiagonalCorrelation(tinygp.kernels.quasisep.Wrapper):
+    u: JAXArray
+
+    def coord_to_sortable(self, X: JAXArray) -> JAXArray:
+        X_stack = jnp.stack(X)
+        return (X_stack * self.u).sum()
+
 
 @tinygp.helpers.dataclass
 class ScaledKernel(tinygp.kernels.quasisep.Wrapper):
@@ -73,14 +85,11 @@ class ScaledKernel(tinygp.kernels.quasisep.Wrapper):
 
     def __init__(self, kernel, amplitudes):
         self.kernel = kernel
-
-        if isinstance(kernel, ScaledKernel):
-            self.amplitudes = amplitudes * kernel.amplitudes
-        else:
-            self.amplitudes = amplitudes
+        self.amplitudes = amplitudes
 
     def observation_model(self, X):
         _, idx = X
+        # If kernel already a ScaledKernel object then amplitudes nest here
         return self.amplitudes[idx] * self.kernel.observation_model(X)
     
     def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
@@ -88,6 +97,57 @@ class ScaledKernel(tinygp.kernels.quasisep.Wrapper):
             X1, X2
         )
 
+class SumDiffVec(Sum):
+    """A helper to represent the sum of two quasiseparable kernels"""
+
+    kernel1: Quasisep
+    kernel2: Quasisep
+    def observation_model(self, X: JAXArray) -> JAXArray:
+        return jnp.concatenate(
+            (
+                self.kernel1.observation_model(X[0]),
+                self.kernel2.observation_model(X[1]),
+            )
+        )
+
+    def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
+        return Block(
+            self.kernel1.transition_matrix(X1[0], X2[0]),
+            self.kernel2.transition_matrix(X1[1], X2[1]),
+        )
+
+class ProductDiffVec(Product):
+    """A helper to represent the product of two quasiseparable kernels"""
+
+    kernel1: Quasisep
+    kernel2: Quasisep
+    idx1: int = eqx.field(default_factory=lambda: 0)
+    idx2: int = eqx.field(default_factory=lambda: 1)
+    sort_idx: int = eqx.field(default_factory=lambda: 0)
+
+    def __init__(self, kernel1, kernel2, idx1 = 0, idx2 = 1, sort_idx = 0):
+        self.kernel1 = kernel1
+        self.kernel2 = kernel2
+        self.idx1 = idx1
+        self.idx2 = idx2
+        self.sort_idx = sort_idx
+
+    def coord_to_sortable(self, X: JAXArray) -> JAXArray:
+        """We assume that both kernels use the same coordinates"""
+        return self.kernel1.coord_to_sortable(X[self.sort_idx])
+
+
+    def observation_model(self, X: JAXArray) -> JAXArray:
+        return _prod_helper(
+            self.kernel1.observation_model(X[self.idx1]),
+            self.kernel2.observation_model(X[self.idx2]),
+        )
+
+    def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
+        return _prod_helper(
+            self.kernel1.transition_matrix(X1[self.idx1], X2[self.idx1]),
+            self.kernel2.transition_matrix(X1[self.idx2], X2[self.idx2]),
+        )
 
 @tinygp.helpers.dataclass
 class Multiband(tinygp.kernels.quasisep.Wrapper):
@@ -95,9 +155,24 @@ class Multiband(tinygp.kernels.quasisep.Wrapper):
     band_amplitudes: JAXArray
 
     def observation_model(self, X):
-        x_vec, idx = X
+        x_vec, idx = X[0], X[1]
 
         return self.band_amplitudes[idx % self.band_amplitudes.size] * self.kernel.observation_model((x_vec, idx // self.band_amplitudes.size))
+    
+    def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
+        return self.kernel.transition_matrix(
+            X1, X2
+        )
+    
+@tinygp.helpers.dataclass
+class SpecialMultiband(tinygp.kernels.quasisep.Wrapper):
+    """A base class for wrapping kernels with some custom implementations"""
+    band_amplitudes: JAXArray
+
+    def observation_model(self, X):
+        x_vec, idx = X
+
+        return self.band_amplitudes[idx] * self.kernel.observation_model((x_vec, idx // self.band_amplitudes.size))
     
     def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
         return self.kernel.transition_matrix(
@@ -179,29 +254,30 @@ class Constant(Quasisep):
             return jnp.ones((1, 1))
 
 
-# @tinygp.helpers.dataclass
-# class Linear(Quasisep):
-#     alpha: JAXArray
+@tinygp.helpers.dataclass
+class Linear(Quasisep):
+    alpha: JAXArray
+    const: JAXArray | float = 1.
 
-#     def coord_to_sortable(self, X):
-#         return X[0]
+    def coord_to_sortable(self, X):
+        return X[0]
+
+    def design_matrix(self) -> JAXArray:
+            return jnp.zeros((1, 1))
     
-#     def design_matrix(self) -> JAXArray:
-#             return jnp.zeros((1, 1))
-        
-#     def stationary_covariance(self) -> JAXArray:
-#             return jnp.ones((1, 1))
-        
-#     def observation_model(self, X: JAXArray) -> JAXArray:
-#             return self.alpha[X[1]] * jnp.ones(1)
-      
-#     def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
-#             return jnp.ones((1, 1))
+    def stationary_covariance(self) -> JAXArray:
+            return self.const*jnp.ones((1, 1))
+    
+    def observation_model(self, X: JAXArray) -> JAXArray:
+            return self.alpha[X[1]] * jnp.ones(1)
+    
+    def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
+            return jnp.ones((1, 1))
 
 
 @tinygp.helpers.dataclass
-class CalibrationErrors(Quasisep):
-    cal_times: JAXArray | float
+class ConstantBlocks(Quasisep):
+    endpoints: JAXArray | float
     sigma: float = 1.
     
     def design_matrix(self) -> JAXArray:
@@ -215,7 +291,7 @@ class CalibrationErrors(Quasisep):
             return jnp.array([1.])
       
     def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
-            same_cal = jax.lax.cond(jnp.all((X2 - self.cal_times) * (X1 - self.cal_times) >= 0.), lambda _: 1., lambda _: 0., 1.)
+            same_cal = jax.lax.cond(jnp.all((X2 - self.endpoints) * (X1 - self.endpoints) >= 0.), lambda _: 1., lambda _: 0., 1.)
             return same_cal * jnp.ones((1, 1))
 
 
@@ -354,7 +430,7 @@ class ExpSineSquaredApprox(Quasisep):
     """
     Credit: smolgp (Rubenzahl et al. 2026), original derivation from Solin & Särkkä (2014)
     """
-
+    # Note quasisep will call this with a default order of 5 which can be inaccurate
     period: JAXArray | float
     gamma: JAXArray | float
     sigma: JAXArray | float = 1.

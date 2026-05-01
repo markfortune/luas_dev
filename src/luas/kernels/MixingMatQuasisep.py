@@ -7,7 +7,7 @@ import tinygp
 
 class MixingMatQuasisep(CovType):
     def __init__(self, mixing_mat, kernel_list, noise_model = None,
-                 diag = 0., wn_diag = 0., params = None, cel_dim = 1, use_block = True):
+                 diag = 0., wn_diag = 0., params = None, fast_dim = 1, use_block = True):
         self.mixing_mat = mixing_mat # shape [N_l, N_alpha]
         self.kernel_list = kernel_list # N_alpha list of tinygp kernel functions
         self.diag = diag
@@ -15,17 +15,17 @@ class MixingMatQuasisep(CovType):
         self.rank = mixing_mat.shape[1]
         self.noise_model = noise_model
         self.params = params
-        self.cel_dim = cel_dim
+        self.fast_dim = fast_dim
         self.use_block = use_block
     
     def _flatten_R(self, R):
-        if self.cel_dim == 0:
+        if self.fast_dim == 0:
             return R.ravel("C")
         else:
             return R.ravel("F")
 
     def _reshape_R(self, r, R_shape):
-        if self.cel_dim == 0:
+        if self.fast_dim == 0:
             return r.reshape(R_shape, order='C')
         else:
             return r.reshape(R_shape, order='F')
@@ -34,14 +34,14 @@ class MixingMatQuasisep(CovType):
     def _tinygp_coords(self, X, full = False, idx = None):
         # assert full or idx is not None
 
-        cel_vec = X[self.cel_dim]
-        non_cel_vec = X[1-self.cel_dim]
+        cel_vec = X[self.fast_dim]
+        non_cel_vec = X[1-self.fast_dim]
         
         x_t_long = jnp.kron(cel_vec, jnp.ones(non_cel_vec.shape[-1]))
         multiband_idx = jnp.arange(x_t_long.shape[-1])
 
         if idx is not None:
-            multiband_idx_2D = jnp.add.outer(idx[1-self.cel_dim], self.mixing_mat.shape[0] * idx[self.cel_dim])
+            multiband_idx_2D = jnp.add.outer(idx[1-self.fast_dim], self.mixing_mat.shape[0] * idx[self.fast_dim])
             multiband_idx = multiband_idx_2D.ravel("F")
         
         return (x_t_long, multiband_idx)
@@ -74,7 +74,7 @@ class MixingMatQuasisep(CovType):
         return quasisep_cov
         
 
-    def decompose(self, *X, wn = True, **kwargs):
+    def decompose(self, X, wn = True, **kwargs):
 
         self.quasi_mat = self._to_symm_qsm(X, wn = wn, **kwargs)
         self.factor = self.quasi_mat.cholesky()
@@ -115,18 +115,18 @@ class MixingMatQuasisep(CovType):
                 raise Exception("Not Implemented!")
 
             for i in range(self.rank):
-                K_i_eval = self.kernel_list[i](X1[self.cel_dim], X2[self.cel_dim], full = False,
-                                               row_idx = row_idx[self.cel_dim], col_idx = col_idx[self.cel_dim])
+                K_i_eval = self.kernel_list[i](X1[self.fast_dim], X2[self.fast_dim], full = False,
+                                               row_idx = row_idx[self.fast_dim], col_idx = col_idx[self.fast_dim])
 
-                mixing_eval = self.mixing_mat[row_idx[1-self.cel_dim], i:i+1] @ self.mixing_mat[col_idx[1-self.cel_dim], i:i+1].T
+                mixing_eval = self.mixing_mat[row_idx[1-self.fast_dim], i:i+1] @ self.mixing_mat[col_idx[1-self.fast_dim], i:i+1].T
 
                 if flip_kron:
-                    if self.cel_dim == 0:
+                    if self.fast_dim == 0:
                         K_kron = jnp.kron(mixing_eval, K_i_eval)
                     else:
                         K_kron = jnp.kron(K_i_eval, mixing_eval)
                 else:
-                    if self.cel_dim == 0:
+                    if self.fast_dim == 0:
                         K_kron = jnp.kron(K_i_eval, mixing_eval)
                     else:
                         K_kron = jnp.kron(mixing_eval, K_i_eval)
@@ -180,7 +180,7 @@ class MixingMatQuasisep(CovType):
         # c should be positive!
         
         return MixingMatQuasisep(self.mixing_mat * jnp.sqrt(c), self.kernel_list, diag = self.diag * c, wn_diag = self.wn_diag * c,
-                                 cel_dim = self.cel_dim, noise_model = new_noise_model)
+                                 fast_dim = self.fast_dim, noise_model = new_noise_model)
 
     def matmul(self, x1, x2, R, wn = True, **kwargs):
 
@@ -198,7 +198,7 @@ class MixingMatQuasisep(CovType):
     def householder_transform(self, X, u):
         
         for i in range(self.rank):
-            w_i = self.kernel_list[i].matmul(X[self.cel_dim], X[self.cel_dim], u, full = True)
+            w_i = self.kernel_list[i].matmul(X[self.fast_dim], X[self.fast_dim], u, full = True)
 
             # Can this ever be super close to zero? Seems unlikely?
             u_dot_w = jnp.dot(u, w_i)
@@ -208,7 +208,7 @@ class MixingMatQuasisep(CovType):
             self.kernel_list[i] += luas.kernels.quasisep.Linear(w_i, const = -1/u_dot_w)
         
         return MixingMatQuasisep(self.mixing_mat, self.kernel_list, diag = self.diag, wn_diag = self.wn_diag,
-                                 cel_dim = self.cel_dim, noise_model = self.noise_model)
+                                 fast_dim = self.fast_dim, noise_model = self.noise_model)
     
 
     def __add__(self, K):
@@ -229,7 +229,7 @@ class MixingMatQuasisep(CovType):
                 new_noise_model = None
                 
             K_sum = MixingMatQuasisep(new_mixing_mat, new_kernel_list, diag = self.diag + K.diag, wn_diag = self.wn_diag + K.wn_diag,
-                                      cel_dim = self.cel_dim, noise_model = new_noise_model)
+                                      fast_dim = self.fast_dim, noise_model = new_noise_model)
             
         else:
             raise Exception(f"{type(K)} not recognised or addition not supported")
@@ -237,53 +237,3 @@ class MixingMatQuasisep(CovType):
         return K_sum
     
 
-
-def orthonormal_nullspace_gen(A):
-    
-    N_l = A.shape[0]
-    N_alpha = A.shape[1]
-
-    V = jnp.zeros_like(A)
-    U = jnp.zeros_like(A)
-    Lam = jnp.zeros((N_alpha, N_alpha))
-
-    for i in range(N_alpha):
-        v_i = A[:, i]
-        for j in range(i):
-            Lam = Lam.at[j, i].set(jnp.dot(v_i, V[:, j]))
-            v_i -= Lam[j, i] * V[:, j]
-            
-        Lam = Lam.at[i, i].set(jnp.linalg.norm(v_i))
-        v_i /= Lam[i, i]
-        V = V.at[:, i].set(v_i)
-    
-    # Householder vector
-    for i in range(N_alpha):
-        w_i = V[:, i]
-        for j in range(i):
-            w_i -= 2 * jnp.dot(U[:, j], w_i) * U[:, j]
-
-        e_i = jnp.zeros(N_l)
-        e_i = e_i.at[i].set(1)
-        u_i = w_i - e_i
-        u_i /= jnp.linalg.norm(u_i)
-
-        U = U.at[:, i].set(u_i)
-
-    def householder_transform(R, transpose = 0):
-        R_prime = R.copy()
-
-        if transpose:
-            for i in range(N_alpha):
-                u_R_prime = U[:, -i-1].T @ R_prime
-                R_prime -= jnp.outer(2*U[:, -i-1], u_R_prime)
-        else:
-            for i in range(N_alpha):
-                u_R_prime = U[:, i].T @ R_prime
-                R_prime -= jnp.outer(2*U[:, i], u_R_prime)
-
-        return R_prime
-    
-    return Lam, U, householder_transform
-
-    

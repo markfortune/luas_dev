@@ -53,15 +53,14 @@ class HODLR(CovType):
         return self.gp_hodlr.solver.dot_solve(R)
 
     def logL(self, R, stored_values, **kwargs):
-
         return self.gp_hodlr.log_likelihood(R)
 
     def inverse(self, R, **kwargs):
-        
         return self.gp_hodlr.apply_inverse(R)
 
     def scale(self, c):
-        return HODLR(self.kf_hodlr * c, diag = self.diag * c, wn_diag = self.wn_diag * c, tol = self.tol)
+        c_np = c.astype(np.float64)
+        return HODLR(self.kf_hodlr * c_np, diag = self.diag * c_np, wn_diag = self.wn_diag * c_np, tol = self.tol)
 
     def __add__(self, K):
 
@@ -219,7 +218,6 @@ def Constant(const):
     """
     
     return HODLR(george.kernels.ConstantKernel(log_constant = np.log(const)))
-
 
 
 def Cosine(P: Scalar):

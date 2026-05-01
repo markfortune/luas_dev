@@ -85,12 +85,12 @@ class LuasKernel(CovType):
            
         # Have different decomposition functions depending on whether previous stored values
         # are to be used to avoid recalculating eigendecompositions
-        if use_stored_values:
-            self.decompose = self.eigendecomp_use_stored_values
+        if use_stored_values == True:
+            raise Exception("Use of stored_values not yet implemented in this version of luas")
         else:
             self.decompose = self.eigendecomp_no_stored_values
     
-    def evaluate(self, *X, **kwargs):
+    def evaluate(self, X, **kwargs):
 
         dim = len(X)
         Sigma = self.Sigma[0].evaluate(X[0], X[0], **kwargs)
@@ -108,8 +108,11 @@ class LuasKernel(CovType):
     
     def eigendecomp_no_stored_values(
         self,
-        *X: Tuple,
+        X: Tuple,
         stored_values: Optional[PyTree] = None,
+        full = True,
+        idx = None,
+        **kwargs,
     ) -> PyTree:
 
         stored_values = {} if stored_values is None else stored_values
@@ -119,6 +122,9 @@ class LuasKernel(CovType):
             total_size = jnp.prod(jnp.array(R_shape))
         else:
             total_size = calc_total_size(X)
+
+        if idx is None:
+            idx = (None,)*self.dim
         
         gp_dim = len(X)
 
@@ -129,10 +135,10 @@ class LuasKernel(CovType):
         stored_values["logdet"] = 0.
 
         for d in range(gp_dim):
-            Sigma_d_new, stored_values_d = self.Sigma[d].decompose(X[d])
+            Sigma_d_new, stored_values_d = self.Sigma[d].decompose(X[d], idx = idx[d])
 
             if isinstance(self.K[d], Outer):
-                K_d, _ = self.K[d].decompose(X[d])
+                K_d, _ = self.K[d].decompose(X[d], idx = idx[d])
             else:
                 K_d = self.K[d]
             
@@ -156,7 +162,7 @@ class LuasKernel(CovType):
         K_tilde_diag = all_lam + 1
         
         self.kf_tilde = WhiteNoiseKernel(diag = K_tilde_diag, wn_diag = 0.)
-        self.kf_tilde, stored_values["kf_tilde_stored"] = self.kf_tilde.decompose(*X)
+        self.kf_tilde, stored_values["kf_tilde_stored"] = self.kf_tilde.decompose(X)
 
         stored_values["logdet"] += stored_values["kf_tilde_stored"]["logdet"]
         self.logdet = stored_values["logdet"]

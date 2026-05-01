@@ -59,6 +59,7 @@ class GeneralKernel(CovType):
         self,
         Sigma,
         *K_list,
+        dense_mat = None,
         use_stored_values = False,
     ):
         # Function used to build the covariance matrix K
@@ -72,38 +73,51 @@ class GeneralKernel(CovType):
         else:
             self.Sigma = Sigma
             self.K_list = K_list
+
+        self.dense_mat = dense_mat
         
         self.dim = len(self.Sigma)
         # alias to maintain consistency with LuasKernel which has a separate fn for calculating the hessian
         self.logL_hessianable = self.logL
     
     
-    def evaluate(self, *X, full = True, **kwargs):
+    def evaluate(self, X1, X2, full = True, idx = (None, None), **kwargs):
+        # full = True
+        # idx = (None, None)
 
-        dim = len(X)
-        Sigma = self.Sigma[0].evaluate(X[0], X[0], full = full, **kwargs)
+        # print(self.Sigma, self.K_list)
+        # all_K =  (self.Sigma,) + self.K_list
+        # for K_alpha_i in all_K:
+        #     print("even later", K_alpha_i[0].alpha_init, K_alpha_i[1](X1[1], X2[1])[0, 0])
+
+
+        Sigma = self.Sigma[0].evaluate(X1[0], X2[0], full = full, row_idx = idx[0], col_idx = idx[0], **kwargs)
         
-        for d in range(1, dim):
-            Sigma = jnp.kron(Sigma, self.Sigma[d].evaluate(X[d], X[d], full = full, **kwargs))
+        for d in range(1, self.dim):
+            Sigma = jnp.kron(Sigma, self.Sigma[d].evaluate(X1[d], X2[d], full = full, row_idx = idx[d], col_idx = idx[d], **kwargs))
         
         for i in range(len(self.K_list)):
-            K = self.K_list[i][0].evaluate(X[0], X[0], full = full, **kwargs)
-            for d in range(1, dim):
-                K = jnp.kron(K, self.K_list[i][d].evaluate(X[d], X[d], full = full, **kwargs))
+            K = self.K_list[i][0].evaluate(X1[0], X2[0], full = full, row_idx = idx[0], col_idx = idx[0], **kwargs)
+            for d in range(1, self.dim):
+                K = jnp.kron(K, self.K_list[i][d].evaluate(X1[d], X2[d], row_idx = idx[d], col_idx = idx[d], full = full, **kwargs))
             
             Sigma += K
+
+        if self.dense_mat is not None:
+            Sigma += self.dense_mat
         
         return Sigma
     
     def decompose(
         self,
-        *X,
+        X,
         stored_values: Optional[PyTree] = {},
+        **kwargs,
     ) -> PyTree:
         
         # Simply builds the covariance matrix and decomposes it into a Cholesky factor L
         # and precomputes the log determinant of K for log likelihood calculations
-        K = self.evaluate(*X, full = True)
+        K = self.evaluate(X, X, **kwargs)
         self.factor = JLA.cholesky(K, lower = True)
         self.logdet = 2*jnp.log(jnp.diag(self.factor)).sum()
         
@@ -120,7 +134,11 @@ class GeneralKernel(CovType):
         
         R_shape = R.shape
         r = R.ravel("C")
-        r_prime = self.factor @ r
+
+        if transpose:
+            r_prime = self.factor.T @ r
+        else:
+            r_prime = self.factor @ r
         return r_prime.reshape(R_shape)
     
     def dot_solve(self, R):

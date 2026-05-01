@@ -11,7 +11,8 @@ from luas.luas_types import Kernel, PyTree, JAXArray, Scalar, is_scalar
 from luas.kronecker_fns import kron_prod, logdetK_calc, r_K_inv_r, K_inv_vec, logdetK_calc_hessianable, tensor_mult
 from luas.kernels.tinygp_ext import ScaledKernel, LowRankProduct
 from luas.kernels.BlockKernel import Block2x2Kernel
-from luas.kernels.MixingMatQuasisep import MixingMatQuasisep, orthonormal_nullspace_gen
+from luas.kernels.MixingMatQuasisep import MixingMatQuasisep
+from luas.kernels.householder import orthonormal_nullspace_gen
 from tinygp.solvers.quasisep.core import DiagQSM, StrictLowerTriQSM, SymmQSM
 
 __all__ = [
@@ -30,14 +31,14 @@ class MultiTermBothDimKernel(CovType):
         self,
         Sigma,
         *K_list,
-        cel_dim = 1,
+        fast_dim = 1,
         never_reduce_dim = False,
         use_stored_values: Optional[bool] = True,
     ):
         
         self.Sigma = Sigma[0], Sigma[1]
         self.K_list = K_list
-        self.cel_dim = cel_dim
+        self.fast_dim = fast_dim
         self.never_reduce_dim = never_reduce_dim
         self.N_alpha = len(K_list)
 
@@ -56,7 +57,7 @@ class MultiTermBothDimKernel(CovType):
 
     def decomp_no_stored_values(
         self,
-        *X: Tuple[JAXArray],
+        X: Tuple[JAXArray],
         stored_values: Optional[PyTree] = {},
     ) -> PyTree:
 
@@ -115,8 +116,8 @@ class MultiTermBothDimKernel(CovType):
         stored_values["J_A"], stored_values["U_A"], self.householder_transform_A = orthonormal_nullspace_gen(stored_values["A"])
         stored_values["J_B"], stored_values["U_B"], self.householder_transform_B = orthonormal_nullspace_gen(stored_values["B"])
 
-        kf_A = MixingMatQuasisep(stored_values["J_A"], stored_values["A_kernel_order"], diag = 1., cel_dim = 1)
-        kf_B = MixingMatQuasisep(stored_values["J_B"], stored_values["B_kernel_order"], diag = 1., cel_dim = 0)
+        kf_A = MixingMatQuasisep(stored_values["J_A"], stored_values["A_kernel_order"], diag = 1., fast_dim = 1)
+        kf_B = MixingMatQuasisep(stored_values["J_B"], stored_values["B_kernel_order"], diag = 1., fast_dim = 0)
 
         for i in range(self.N_alpha):
             kf_B = kf_B.householder_transform(X, stored_values["U_A"][:, i])
@@ -135,7 +136,7 @@ class MultiTermBothDimKernel(CovType):
         # if quasisep
         banded_term = as_banded(top_corner_eval, zero_pad_to_len = self.N_alpha * X[1].shape[-1])
         kf_A = MixingMatQuasisep(kf_A.mixing_mat, kf_A.kernel_list,
-                                 cel_dim = 1, noise_model = banded_term, diag = 1.)
+                                 fast_dim = 1, noise_model = banded_term, diag = 1.)
 
         non_zero_B_ind = (jnp.arange(self.N_alpha, X[0].shape[-1]), jnp.arange(self.N_beta))
         X_at_non_zero_B = (X[0][non_zero_B_ind[0]], X[1][non_zero_B_ind[1]])
@@ -160,16 +161,16 @@ class MultiTermBothDimKernel(CovType):
         C_A_inv_B = LowRankProduct(self.B_rows.T, K_A_inv_B.T).to_qsm()
         
         kf_D_corr = MixingMatQuasisep(kf_B.mixing_mat, kf_B.kernel_list,
-                                      cel_dim = 0, diag = 1., noise_model = -C_A_inv_B)
+                                      fast_dim = 0, diag = 1., noise_model = -C_A_inv_B)
 
         self.kf_D = MixingMatQuasisep(kf_B.mixing_mat, kf_B.kernel_list,
-                                      cel_dim = 0, diag = 1.)
+                                      fast_dim = 0, diag = 1.)
 
         kf_D_wn = WhiteNoiseKernel(diag = 1.)
         K_D_CAB = Block2x2Kernel(kf_A = kf_D_corr, kf_D_CAB = kf_D_wn,
                                  dim_split = 1, split_loc = self.N_beta, split_idx = True)
 
-        self.kf_tilde = Block2x2Kernel(kf_A, kf_B = self.K_B_matmul, kf_D_CAB = K_D_CAB,
+        self.kf_tilde = Block2x2Kernel(kf_A = kf_A, kf_B = self.K_B_matmul, kf_D_CAB = K_D_CAB,
                                        dim_split = 0, split_loc = self.N_alpha, split_idx = True)
         
         self.kf_tilde, stored_values["kf_tilde_stored"] = self.kf_tilde.decompose(X)

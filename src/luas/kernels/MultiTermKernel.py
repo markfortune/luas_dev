@@ -7,16 +7,15 @@ import tinygp
 
 from luas import WhiteNoiseKernel, SingleKronTermKernel
 from luas.kernels.covtype import Outer, Exp, GeneralQuasisep, CovType, Identity, ScaledIdentity, Diagonal
+from luas.kernels.householder import HouseholderProduct, orthonormal_nullspace_gen
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar
 from luas.kronecker_fns import tensor_mult
 from luas.kernels.tinygp_ext import ScaledKernel
 from luas.kernels.BlockKernel import Block2x2Kernel
-from luas.kernels.MixingMatQuasisep import MixingMatQuasisep, orthonormal_nullspace_gen
+from luas.kernels.MixingMatQuasisep import MixingMatQuasisep
 
 __all__ = [
-    "KinvR_block",
-    "logL_block",
-    "LuasLasrachKernel",
+    "MultiTermKernel",
 ]
 
 # Ensure we are using double precision floats as JAX uses single precision by default
@@ -28,14 +27,14 @@ class MultiTermKernel(CovType):
         self,
         Sigma,
         *K_list,
-        cel_dim = 1,
+        fast_dim = None,
         never_reduce_dim = False,
         use_stored_values: Optional[bool] = True,
     ):
-        
+        assert fast_dim is not None # Must specify the fast dimension
         self.Sigma = Sigma[0], Sigma[1]
         self.K_list = K_list
-        self.cel_dim = cel_dim
+        self.fast_dim = fast_dim
         self.never_reduce_dim = never_reduce_dim
         self.N_alpha = len(K_list)
 
@@ -43,17 +42,17 @@ class MultiTermKernel(CovType):
         self.decompose = self.decomp_no_stored_values
 
 
-    def _rotate_to_cel_dim_wrapper(self, fn, cel_dim):
+    def _rotate_to_fast_dim_wrapper(self, fn, fast_dim):
 
         def wrapped_fn(R, **kwargs):
-            if cel_dim == 0:
+            if fast_dim == 0:
                 R_prime = R.T
             else:
                 R_prime = R.copy()
 
             R_prime = fn(R_prime, **kwargs)
 
-            if self.cel_dim == 0:
+            if self.fast_dim == 0:
                 R_prime = R_prime.T
                 
             return R_prime
@@ -63,57 +62,67 @@ class MultiTermKernel(CovType):
 
     def decomp_no_stored_values(
         self,
-        *X: Tuple[JAXArray],
+        X: Tuple[JAXArray],
         stored_values: Optional[PyTree] = {},
     ) -> PyTree:
 
-        non_cel_vec = X[1-self.cel_dim]
-        cel_vec = X[self.cel_dim]
+        non_cel_vec = X[1-self.fast_dim]
+        cel_vec = X[self.fast_dim]
 
         # Generate transformations
-        self.Sigma_transf, stored_values_Sigma_transf = self.Sigma[1-self.cel_dim].decompose(non_cel_vec)
+        self.Sigma_transf, stored_values_Sigma_transf = self.Sigma[1-self.fast_dim].decompose(non_cel_vec, full = True)
 
         # Define transformations which diagonalise Sigma matrix
-        apply_sigma_inv_matrix_sqrt = self._rotate_to_cel_dim_wrapper(self.Sigma_transf.matrix_inv_sqrt, self.cel_dim)
+        apply_sigma_inv_matrix_sqrt = self._rotate_to_fast_dim_wrapper(self.Sigma_transf.matrix_inv_sqrt, self.fast_dim)
 
         # Computes the log determinant of K
         stored_values["logdet"] = cel_vec.shape[-1]*stored_values_Sigma_transf["logdet"]
         
         stored_values["non_cel_rank"] = 0
         for K_i in self.K_list:
-            stored_values["non_cel_rank"] += K_i[1-self.cel_dim].rank(non_cel_vec)
+            stored_values["non_cel_rank"] += K_i[1-self.fast_dim].rank(non_cel_vec)
         
         stored_values["A"] = jnp.zeros((non_cel_vec.shape[-1], stored_values["non_cel_rank"]))
         stored_values["cel_kernel_order"] = []
         
         col_i = 0
         for (i, K_i) in enumerate(self.K_list):
-            if isinstance(K_i[1-self.cel_dim], Outer):
-                K_i_non_cel, _ = K_i[1-self.cel_dim].decompose(non_cel_vec)
+            if isinstance(K_i[1-self.fast_dim], Outer):
+                K_i_non_cel, _ = K_i[1-self.fast_dim].decompose(non_cel_vec)
                 stored_values["A"] = stored_values["A"].at[:, col_i].set(K_i_non_cel.alpha)
-                stored_values["cel_kernel_order"].append(K_i[self.cel_dim])
+                stored_values["cel_kernel_order"].append(K_i[self.fast_dim])
                 col_i += 1
             else:
-                K_i_non_cel, _ = K_i[1-self.cel_dim].decompose(non_cel_vec)
+                lam, Q = K_i[1-self.fast_dim].eigendecomp(non_cel_vec)
+
+                rank_i = K_i[1-self.fast_dim].rank(non_cel_vec)
+                lam_nonzero = lam[-rank_i:]
+
+                if isinstance(Q, HouseholderProduct):
+                    alpha_eigen = Q.V[:, -rank_i:] @ jnp.diag(jnp.sqrt(lam_nonzero))
+                else:
+                    alpha_eigen = Q[:, -rank_i:] @ jnp.diag(jnp.sqrt(lam_nonzero))
                 
-                for j in range(non_cel_vec.shape[-1]):
-                    stored_values["A"] = stored_values["A"].at[:, col_i].set(K_i_non_cel.factor[:, j])
-                    stored_values["cel_kernel_order"].append(K_i[self.cel_dim])
+                for j in range(rank_i):
+                    stored_values["A"] = stored_values["A"].at[:, col_i].set(alpha_eigen[:, j])
+                    
+                    # Could accept a list of kernels in K_i[self.fast_dim]
+                    stored_values["cel_kernel_order"].append(K_i[self.fast_dim])
                     col_i += 1
         
         # Transform vectors 
         stored_values["J"] = apply_sigma_inv_matrix_sqrt(stored_values["A"], transpose = 0)
 
-        # Handle Sigma mat in the cel_dim, likely just diagonal
-        if type(self.Sigma[self.cel_dim]) in [GeneralQuasisep, Exp]:
+        # Handle Sigma mat in the fast_dim, likely just diagonal
+        if type(self.Sigma[self.fast_dim]) in [GeneralQuasisep, Exp]:
             stored_values["J"] = jnp.stack([stored_values["J"], jnp.eye(non_cel_vec.shape[-1])], axis = 1)
 
             for j in range(non_cel_vec.shape[-1]):
-                stored_values["cel_kernel_order"].append(self.Sigma[self.cel_dim])
+                stored_values["cel_kernel_order"].append(self.Sigma[self.fast_dim])
                 
             cel_diag = jnp.zeros(cel_vec.shape[-1])
         else:
-            cel_diag = (self.Sigma[self.cel_dim].diag + self.Sigma[self.cel_dim].wn_diag)*jnp.ones(cel_vec.shape[-1])
+            cel_diag = (self.Sigma[self.fast_dim].diag + self.Sigma[self.fast_dim].wn_diag)*jnp.ones(cel_vec.shape[-1])
 
 
         # If the total rank is less than the length of that dimension, we can reduce the dimension by exploiting sparsity
@@ -127,29 +136,29 @@ class MultiTermKernel(CovType):
             total_cel_diag = jnp.kron(cel_diag, jnp.ones(non_cel_vec.shape[-1]))
             
         kf_quasi2D = MixingMatQuasisep(mixing_mat = stored_values["J"], kernel_list = stored_values["cel_kernel_order"],
-                                        diag = total_cel_diag, cel_dim = self.cel_dim)
+                                        diag = total_cel_diag, fast_dim = self.fast_dim)
 
         if self.reduce_dim:
-            if isinstance(self.Sigma[self.cel_dim], (Identity, ScaledIdentity, Diagonal)):
+            if isinstance(self.Sigma[self.fast_dim], (Identity, ScaledIdentity, Diagonal)):
                 null_space_rank = non_cel_vec.shape[-1] - stored_values["non_cel_rank"]
-                if self.cel_dim == 0:
+                if self.fast_dim == 0:
                     rest_cel_diag = jnp.outer(cel_diag, jnp.ones(null_space_rank))
                 else:
                     rest_cel_diag = jnp.outer(jnp.ones(null_space_rank), cel_diag)
                     
                 kf_D = WhiteNoiseKernel(diag = rest_cel_diag)
             else:
-                if self.cel_dim == 0:
-                    kf_D = SingleKronTermKernel((self.Sigma[self.cel_dim], Identity()))
+                if self.fast_dim == 0:
+                    kf_D = SingleKronTermKernel((self.Sigma[self.fast_dim], Identity()))
                 else:
-                    kf_D = SingleKronTermKernel((Identity(), self.Sigma[self.cel_dim]))
+                    kf_D = SingleKronTermKernel((Identity(), self.Sigma[self.fast_dim]))
 
-            # print("kf_A", kf_quasi2D, "kf_D_CAB", kf_D, "dim_split", 1-self.cel_dim, "split_loc", stored_values["non_cel_rank"], "cel_dim",self.cel_dim)
-            self.kf_tilde = Block2x2Kernel(kf_A = kf_quasi2D, kf_D_CAB = kf_D, dim_split = 1-self.cel_dim, split_loc = stored_values["non_cel_rank"])
+            # print("kf_A", kf_quasi2D, "kf_D_CAB", kf_D, "dim_split", 1-self.fast_dim, "split_loc", stored_values["non_cel_rank"], "fast_dim",self.fast_dim)
+            self.kf_tilde = Block2x2Kernel(kf_A = kf_quasi2D, kf_D_CAB = kf_D, dim_split = 1-self.fast_dim, split_loc = stored_values["non_cel_rank"])
         else:
             self.kf_tilde = kf_quasi2D
         
-        self.kf_tilde, stored_values["kf_tilde_stored"] = self.kf_tilde.decompose(*X)
+        self.kf_tilde, stored_values["kf_tilde_stored"] = self.kf_tilde.decompose(X)
         stored_values["logdet"] += stored_values["kf_tilde_stored"]["logdet"]
 
         self.logdet = stored_values["logdet"]
@@ -159,7 +168,7 @@ class MultiTermKernel(CovType):
     
     def transform_fn(self, R, transpose = 0):
         
-        if self.cel_dim == 0:
+        if self.fast_dim == 0:
             R_prime = R.T
         else:
             R_prime = R.copy()
@@ -174,7 +183,7 @@ class MultiTermKernel(CovType):
                 R_prime = self.householder_transform(R_prime, transpose = 1)
             R_prime = self.Sigma_transf.matrix_sqrt(R_prime, transpose = 0)
 
-        if self.cel_dim == 0:
+        if self.fast_dim == 0:
             R_prime = R_prime.T
             
         return R_prime
@@ -182,7 +191,7 @@ class MultiTermKernel(CovType):
 
     def inv_transform_fn(self, R, transpose = 0):
         
-        if self.cel_dim == 0:
+        if self.fast_dim == 0:
             R_prime = R.T
         else:
             R_prime = R.copy()
@@ -196,7 +205,7 @@ class MultiTermKernel(CovType):
             if self.reduce_dim:
                 R_prime = self.householder_transform(R_prime, transpose = 0)
 
-        if self.cel_dim == 0:
+        if self.fast_dim == 0:
             R_prime = R_prime.T
             
         return R_prime

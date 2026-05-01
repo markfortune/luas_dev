@@ -76,29 +76,27 @@ class LuasLasrachKernel(CovType):
         self,
         Sigma,
         K,
-        bb_dim: int = 0,
+        fast_dim: int | None = None,
         use_stored_values: Optional[bool] = False,
     ):
-        
+        assert fast_dim is not None # Must specify the fast_dim
         self.Sigma = Sigma
         self.K = K
-        self.dim = len(Sigma)
-        self.bb_dim = bb_dim
+        self.fast_dim = fast_dim
+        self.K_list = (K,)
            
         # Have different decomposition functions depending on whether previous stored values
         # are to be used to avoid recalculating eigendecompositions
         if use_stored_values:
-            self.decompose = self.eigendecomp_use_stored_values
-        else:
-            self.decompose = self.eigendecomp_no_stored_values
+            raise Exception("Use of precalculated stored values not yet implemented")
     
     def evaluate(self, X1, X2, full = True, row_idx = None, col_idx = None, **kwargs):
 
-        dim = len(X)
+        dim = len(X1)
 
         if row_idx is None and col_idx is None:
-            row_idx = (None,) * self.dim
-            col_idx = (None,) * self.dim
+            row_idx = (None,) * dim
+            col_idx = (None,) * dim
         else:
             assert full or (row_idx is not None and col_idx is not None)
 
@@ -115,31 +113,28 @@ class LuasLasrachKernel(CovType):
         return Sigma
     
 
-    def eigendecomp_no_stored_values(
+    def decompose(
         self,
-        *X: Tuple,
+        X: Tuple,
         stored_values: Optional[PyTree] = None,
     ) -> PyTree:
 
+        total_size = calc_total_size(X)
+        self.dim = len(X)
         stored_values = {} if stored_values is None else stored_values
 
-        if stored_values:
-            R_shape = stored_values["R_shape"]
-            total_size = jnp.prod(jnp.array(R_shape))
-        else:
-            total_size = calc_total_size(X)
-        
-        gp_dim = len(X)
-
+        # Initialise before loop
         self.sigma_decomp_mats = ()
         self.eigen_decomp_mats = ()
+        non_fast_dim_size = 1
         all_lam = jnp.ones(1)
-        non_bb_dim_size = 1
+        all_lam_shape = ()
         stored_values["logdet"] = 0.
 
-        for d in range(gp_dim):
-            if d != self.bb_dim:
+        for d in range(self.dim):
+            if d != self.fast_dim:
                 Sigma_d_new, stored_values_d = self.Sigma[d].decompose(X[d])
+                stored_values["logdet"] += (total_size/X[d].shape[-1])*stored_values_d["logdet"]
 
                 if isinstance(self.K[d], Outer):
                     K_d, _ = self.K[d].decompose(X[d])
@@ -148,7 +143,7 @@ class LuasLasrachKernel(CovType):
                 
                 K_d_new = Sigma_d_new.inv_sqrt_transform(K_d)
                 
-                if gp_dim > 2:
+                if self.dim > 2:
                     Sigma_d_new.matrix_sqrt = vmap_for_tensors(Sigma_d_new.matrix_sqrt)
                     Sigma_d_new.matrix_inv_sqrt = vmap_for_tensors(Sigma_d_new.matrix_inv_sqrt)
                     K_d_new.matrix_sqrt = vmap_for_tensors(K_d_new.matrix_sqrt)
@@ -161,41 +156,38 @@ class LuasLasrachKernel(CovType):
                 stored_values[f"rank_{d}"] = K_d_new.rank(X[d])
                 stored_values[f"lam_{d}"] = stored_values[f"lam_{d}"][-stored_values[f"rank_{d}"]:]
                 
-                all_lam = jnp.kron(all_lam, stored_values[f"lam_{d}"])
+                all_lam = jnp.kron(all_lam.reshape(all_lam_shape + (1,)), stored_values[f"lam_{d}"])
+                all_lam_shape = all_lam.shape
                 
                 self.sigma_decomp_mats += (Sigma_d_new,)
                 self.eigen_decomp_mats += (stored_values[f"Q_{d}"],)
-                stored_values["logdet"] += (total_size/X[d].shape[-1])*stored_values_d["logdet"]
 
                 # Keep track of size of combined non-blackbox length to check if low-rank kernels can be exploited
-                non_bb_dim_size *= X[d].shape[-1]
+                non_fast_dim_size *= X[d].shape[-1]
             else:
                 self.sigma_decomp_mats += (Identity(),)
                 self.eigen_decomp_mats += (None,)
 
-        kf_dense_blocks = BlockKernel((Identity(), self.Sigma[self.bb_dim]), (Diagonal(diag = all_lam), self.K[self.bb_dim]),
-                                      non_block_dim_size = all_lam.size, block_dim=1)
+        all_lam = cyclic_transpose(all_lam, -(self.dim-1-self.fast_dim)).ravel()
+
+        kf_dense_blocks = BlockKernel((Identity(), self.Sigma[self.fast_dim]),
+                                      (Diagonal(diag = all_lam), self.K[self.fast_dim]),
+                                      non_block_dim_size = non_fast_dim_size, block_dim=1)
+        X_block = (jnp.zeros(non_fast_dim_size), X[self.fast_dim]) # all_lam is not used but is an array of the expected length
 
         # Optimised for low-rank kernels where a 2x2 block matrix is formed
         # A block is dense covariance matrix blocks
         # D block is I \otimes Sigma_bb
         # B and C blocks are zero and ignored
-        if all_lam.size < non_bb_dim_size:
-            # if isinstance(self.Sigma[self.bb_dim], (Identity, ScaledIdentity, Diagonal)):
-            #         null_space_rank = non_bb_dim_size - all_lam.shape
-            #         bb_dim_diag = self.Sigma[self.bb_dim].diag + self.Sigma[self.bb_dim].wn_diag
-            #         rest_cel_diag = jnp.outer(jnp.ones(null_space_rank), bb_dim_diag)
-                    
-            #         kf_D = WhiteNoiseKernel(diag = rest_cel_diag)
-            # else:
-            #     kf_D = BlockKernel((Identity(), self.Sigma[self.bb_dim]), non_block_dim_size = null_space_rank)
-
-            kf_D = SingleKronTermKernel(Identity(), self.Sigma[self.bb_dim])
-            self.kf_tilde = Block2x2Kernel(kf_A = kf_D, kf_D_CAB = kf_dense_blocks, dim_split = 0, split_loc = -all_lam.size)
+        if all_lam.size < non_fast_dim_size:
+            kf_A = SingleKronTermKernel(Identity(), self.Sigma[self.fast_dim],
+                                        inv_dims=self.Sigma[self.fast_dim].use_inv)
+            self.kf_tilde = Block2x2Kernel(kf_A = kf_A, kf_D_CAB = kf_dense_blocks,
+                                           dim_split = 0, split_loc = -all_lam.size)
         else:
             self.kf_tilde = kf_dense_blocks
 
-        self.kf_tilde, stored_values_kf_tilde = self.kf_tilde.decompose(*X, full = True)
+        self.kf_tilde, stored_values_kf_tilde = self.kf_tilde.decompose(X_block)
         stored_values["logdet"] += stored_values_kf_tilde["logdet"]
 
         self.logdet = stored_values["logdet"]
@@ -209,13 +201,13 @@ class LuasLasrachKernel(CovType):
 
         if transpose:
             for d in range(self.dim):
-                if d != self.bb_dim:
+                if d != self.fast_dim:
                     R_prime = self.sigma_decomp_mats[d].matrix_sqrt(R_prime, transpose = 1)
                     R_prime = self.eigen_decomp_mats[d].T @ R_prime
                 R_prime = cyclic_transpose(R_prime, 1)
         else:
             for d in range(self.dim):
-                if d != self.bb_dim:
+                if d != self.fast_dim:
                     R_prime = self.eigen_decomp_mats[d] @ R_prime
                     R_prime = self.sigma_decomp_mats[d].matrix_sqrt(R_prime, transpose = 0)
                 R_prime = cyclic_transpose(R_prime, 1)
@@ -230,13 +222,13 @@ class LuasLasrachKernel(CovType):
 
         if transpose:
             for d in range(self.dim):
-                if d != self.bb_dim:
+                if d != self.fast_dim:
                     R_prime = self.eigen_decomp_mats[d] @ R_prime
                     R_prime = self.sigma_decomp_mats[d].matrix_inv_sqrt(R_prime, transpose = 1)
                 R_prime = cyclic_transpose(R_prime, 1)
         else:
             for d in range(self.dim):
-                if d != self.bb_dim:
+                if d != self.fast_dim:
                     R_prime = self.sigma_decomp_mats[d].matrix_inv_sqrt(R_prime, transpose = 0)
                     R_prime = self.eigen_decomp_mats[d].T @ R_prime
                 R_prime = cyclic_transpose(R_prime, 1)
@@ -245,15 +237,15 @@ class LuasLasrachKernel(CovType):
         return R_prime
     
 
-    def _calc_in_flat_bb_dim(self, fn, R, **kwargs):
+    def _calc_in_flat_fast_dim(self, fn, R, **kwargs):
         
-        R_rot = cyclic_transpose(R, 1-self.bb_dim)
+        R_rot = cyclic_transpose(R, -(self.dim-self.fast_dim-1))
         R_rot_shape = R_rot.shape
-        R_flat = R_rot.reshape(-1, R_rot_shape[self.bb_dim])
+        R_flat = R_rot.reshape(-1, R_rot_shape[-1])
 
         R_prime_flat = fn(R_flat, **kwargs)
         R_rot_prime = R_prime_flat.reshape(R_rot_shape)
-        R_prime = cyclic_transpose(R_rot_prime, 1-self.bb_dim)
+        R_prime = cyclic_transpose(R_rot_prime, (self.dim-self.fast_dim-1))
 
         return R_prime
 
@@ -266,9 +258,9 @@ class LuasLasrachKernel(CovType):
 
         if transpose:
             R_prime = self.transform_fn(R, transpose = 1)
-            R_prime = self._calc_in_flat_bb_dim(self.kf_tilde.matrix_sqrt, R_prime, transpose = 1)
+            R_prime = self._calc_in_flat_fast_dim(self.kf_tilde.matrix_sqrt, R_prime, transpose = 1)
         else:
-            R_prime = self._calc_in_flat_bb_dim(self.kf_tilde.matrix_sqrt, R, transpose = 0)
+            R_prime = self._calc_in_flat_fast_dim(self.kf_tilde.matrix_sqrt, R, transpose = 0)
             R_prime = self.transform_fn(R_prime, transpose = 0)
         
         return R_prime
@@ -281,11 +273,11 @@ class LuasLasrachKernel(CovType):
     ) -> JAXArray:
 
         if transpose:
-            R_prime = self._calc_in_flat_bb_dim(self.kf_tilde.matrix_inv_sqrt, R, transpose = 1)
+            R_prime = self._calc_in_flat_fast_dim(self.kf_tilde.matrix_inv_sqrt, R, transpose = 1)
             R_prime = self.inv_transform_fn(R_prime, transpose = 1)
         else:
             R_prime = self.inv_transform_fn(R, transpose = 0)
-            R_prime = self._calc_in_flat_bb_dim(self.kf_tilde.matrix_inv_sqrt, R_prime, transpose = 0)
+            R_prime = self._calc_in_flat_fast_dim(self.kf_tilde.matrix_inv_sqrt, R_prime, transpose = 0)
         
         return R_prime
 
@@ -312,7 +304,7 @@ class LuasLasrachKernel(CovType):
 
         def D_transform_fn(D_tensor):
             D_tensor_tilde = cyclic_transpose(D_tensor, 2)
-            for d in range(gp_dim):
+            for d in range(self.dim):
                 if d != vec_sim:
                     D_tensor_tilde = self.sigma_decomp_mats[vec_dim].matrix_inv_sqrt(D_tensor_tilde)
                     D_tensor_tilde = self.eigen_decomp_mats[vec_dim].T @ D_tensor_tilde
