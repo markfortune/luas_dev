@@ -296,7 +296,7 @@ class ConstantBlocks(Quasisep):
 
 
 @tinygp.helpers.dataclass
-class MaternNuHalf(Quasisep):
+class MaternHalfInt(Quasisep):
     double_nu: int = eqx.field(static=True)
     scale: JAXArray | float
     sigma: JAXArray | float = eqx.field(default_factory=lambda: jnp.ones(()))

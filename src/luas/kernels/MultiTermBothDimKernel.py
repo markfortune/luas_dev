@@ -8,7 +8,7 @@ import tinygp
 from luas import WhiteNoiseKernel, SingleKronTermKernel
 from luas.kernels.covtype import Outer, Exp, GeneralQuasisep, CovType, Identity, ScaledIdentity, Diagonal
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar, is_scalar
-from luas.kronecker_fns import kron_prod, logdetK_calc, r_K_inv_r, K_inv_vec, logdetK_calc_hessianable, tensor_mult
+from luas.kronecker_fns import kron_prod, tensor_mult
 from luas.kernels.tinygp_ext import ScaledKernel, LowRankProduct
 from luas.kernels.BlockKernel import Block2x2Kernel
 from luas.kernels.MixingMatQuasisep import MixingMatQuasisep
@@ -79,8 +79,8 @@ class MultiTermBothDimKernel(CovType):
 
         self.K_transf_list = ()
         for K_i in self.K_list:
-            K0 = self.Sigma_transf[0].inv_sqrt_transform(K_i[0])
-            K1 = self.Sigma_transf[1].inv_sqrt_transform(K_i[1])
+            K0 = self.Sigma_transf[0].inv_sqrt_transform(K_i[0], X[0])
+            K1 = self.Sigma_transf[1].inv_sqrt_transform(K_i[1], X[1])
             self.K_transf_list += ((K0, K1),)
 
             if isinstance(K0, Outer) and not isinstance(K1, Outer):

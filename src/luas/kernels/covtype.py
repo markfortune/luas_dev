@@ -13,6 +13,8 @@ from luas.luas_types import Kernel, PyTree, JAXArray, Scalar, CovType, is_scalar
 from luas.kronecker_fns import vmap_for_tensors
 import luas.kernels.tinygp_ext
 from luas.kernels.tinygp_ext import ScaledKernel, HandleIdx
+from luas.kernels.householder import HouseholderTransform
+from luas.stable_gradients import stable_eigh
 
 
 class CovType():
@@ -35,9 +37,15 @@ class CovType():
     def scale(self, c):
         raise Exception("Not implemented")
     
-    def eigendecomp(self, x, wn = True, **kwargs):
-        K = self.evaluate(x, x, full = True, wn = wn, **kwargs)
-        return jnp.linalg.eigh(K)
+    def eigendecomp(self, x, wn = True, full = True, idx = None, **kwargs):
+
+        if not full:
+            K = self.evaluate(x, x, wn = wn, full = False,
+                              row_idx = idx, col_idx = idx, **kwargs)
+        else:
+            K = self.evaluate(x, x, wn = wn, full = True, **kwargs)
+        return stable_eigh(K)
+    
     
     def inverse(self, R):
         R_prime = self.matrix_inv_sqrt(R, transpose=0)
@@ -61,36 +69,59 @@ class CovType():
     def logL(self, R, **kwargs):
         return - 0.5 * self.dot_solve(R) - 0.5 * self.logdet_calc() - 0.5 * R.size * jnp.log(2*jnp.pi)
     
-    def inv_sqrt_transform(self, K):
+    # elif isinstance(K, Outer):
+    #     K_tilde = Outer(alpha = K.alpha_init/jnp.sqrt(self.D))
+    
+    # elif isinstance(K, (GeneralQuasisep, GeneralQuasisepPlusNoise)):
+    #     new_kf = ScaledKernel(kernel = K.tinygp_kf, amplitudes = 1/jnp.sqrt(self.D))
+    #     new_diag = K.diag/self.D
+    #     new_wn_diag = K.wn_diag/self.D
+
+    #     # Yet to implement for the case of a general noise model added
+    #     assert K.noise_model is None
+
+    #     K_tilde = GeneralQuasisepPlusNoise(new_kf, diag = new_diag, wn_diag = new_wn_diag, use_block = K.use_block)
+
+
+    def inv_sqrt_transform(self, K, x, **K_kwargs):
         
         if isinstance(K, Outer):
+            K, _ = K.decompose(x, **K_kwargs)
             alpha_tilde = self.matrix_inv_sqrt(K.alpha, transpose=0)
             K_tilde = Outer(alpha = alpha_tilde)
 
-        elif isinstance(K, (General, GeneralQuasisep, GeneralQuasisepPlusNoise, Identity, ScaledIdentity, Diagonal, OuterPlusScaledIdentity)):
+        elif isinstance(K, (General, GeneralQuasisep, GeneralQuasisepPlusNoise, Identity,
+                            ScaledIdentity, Diagonal, OuterPlusScaledIdentity)):
             # Define a new General covtype for K where it's kernel function transforms it
-            def kf_transf(hp, x1, x2, **kwargs):
-                K_eval = K.evaluate(x1, x2, **kwargs)
-                K_prime = self.matrix_inv_sqrt(K_eval, transpose=0)
-                K_tilde = self.matrix_inv_sqrt(K_prime.T, transpose=0)
-                
-                return K_tilde
+            K_eval = K.evaluate(x, x, **K_kwargs)
+            K_prime = self.matrix_inv_sqrt(K_eval, transpose=0)
+            K_tilde_eval = self.matrix_inv_sqrt(K_prime.T, transpose=0)
+
+            def kf_transf(hp, x1, x2, full = True, row_idx = None, col_idx = None, **kwargs):
+                if full:
+                    return K_tilde_eval
+                else:                   
+                    return K_tilde_eval[jnp.ix_(row_idx, col_idx)]
 
             K_tilde = General(kf_transf)
 
         else:
             try:
-                K_tilde = K.transform_with_inv_sqrt(self.matrix_inv_sqrt)
+                K_tilde = K.transform_with_inv_sqrt(self.matrix_inv_sqrt, x, **K_kwargs)
             except:
                 raise Exception(f"Don't know how to transform this matrix type {type(K)} to K_tilde = L^-1 K L^-T")
         
         return K_tilde
 
 
-    def general_transf(self, mat):
-        def kf_transf(hp, x1, x2, **kwargs):
-                K_eval = mat @ self.evaluate(x1, x2, **kwargs) @ mat.T
+    def general_transf(self, mat, x, **K_kwargs):
+        K_eval = mat @ self.evaluate(x, x, **K_kwargs) @ mat.T
+        def kf_transf(hp, x1, x2, full = True, row_idx = None, col_idx = None, **kwargs):
+            if full:
                 return K_eval
+            else:
+                return K_eval[jnp.ix_(row_idx, col_idx)]
+            
         return General(kf_transf)
 
 
@@ -156,6 +187,7 @@ class General(CovType):
     def scale(self, c):
         return General(kf = lambda hp, x1, x2, **kwargs: c*self.evaluate(x1, x2, **kwargs))
     
+    
     def householder_transform(self, x, u):
         w_i = self.matmul(x, x, u, full = True)
         u_dot_w = jnp.dot(u, w_i)
@@ -174,7 +206,7 @@ class General(CovType):
                 raise Exception("AHHHH")
             
             K += 4 * u_dot_w * jnp.outer(u_row, u_col)
-            K += 2 * (jnp.outer(u_row, w_i_col) + jnp.outer(w_i_row, u_col))
+            K -= 2 * (jnp.outer(u_row, w_i_col) + jnp.outer(w_i_row, u_col))
             return K
         
         return General(new_kf)
@@ -242,7 +274,7 @@ class Identity(CovType):
     def dot_solve(self, R):
         return jnp.square(R).sum()
         
-    def inv_sqrt_transform(self, K, **kwargs):
+    def inv_sqrt_transform(self, K, x, **kwargs):
         return K
     
     def householder_transform(self, x, u):
@@ -339,7 +371,7 @@ class ScaledIdentity(CovType):
         
         return const_diag*jnp.ones(x.shape[-1]), jnp.eye(x.shape[-1])
 
-    def inv_sqrt_transform(self, K):
+    def inv_sqrt_transform(self, K, x, **K_kwargs):
 
         K_tilde = K.scale(1/self.D)
 
@@ -447,7 +479,7 @@ class Diagonal(CovType):
         # Not very memory efficient building a full identity matrix...
         return D, jnp.eye(x.shape[-1])
     
-    def inv_sqrt_transform(self, K):
+    def inv_sqrt_transform(self, K, x, **K_kwargs):
 
         if isinstance(K, (ScaledIdentity, Diagonal)):
             K_tilde = Diagonal(diag = K.diag/self.D, wn_diag = K.wn_diag/self.D)
@@ -467,19 +499,22 @@ class Diagonal(CovType):
             assert K.noise_model is None
 
             K_tilde = GeneralQuasisepPlusNoise(new_kf, diag = new_diag, wn_diag = new_wn_diag, use_block = K.use_block)
-        
 
         elif isinstance(K, General):
+            D_inv_sqrt = 1/jnp.sqrt(self.D)
+            K_eval = jnp.outer(D_inv_sqrt, D_inv_sqrt) * K.evaluate(x, x, **K_kwargs)
             # Define a new General covtype for K where it's kernel function transforms it
-            def kf_transf(hp, x1, x2, **kwargs):
-                D_inv_sqrt = 1/jnp.sqrt(self.D)
-                return jnp.outer(D_inv_sqrt, D_inv_sqrt) * K.evaluate(x1, x2, **kwargs)
+            def kf_transf(hp, x1, x2, full = True, row_idx = None, col_idx = None, **kwargs):
+                if full:
+                    return K_eval
+                else:
+                    return K_eval[jnp.ix_(row_idx, col_idx)]
 
             K_tilde = General(kf_transf)
 
         else:
             try:
-                K_tilde = K.transform_with_inv_sqrt(self.matrix_inv_sqrt)
+                K_tilde = K.transform_with_inv_sqrt(self.matrix_inv_sqrt, x)
             except:
                 raise Exception(f"Don't know how to transform this matrix type {type(K)} to K_tilde = L^-1 K L^-T")
             
@@ -1016,7 +1051,11 @@ class Outer(CovType):
         # Matrix is decomposed by definition
         # Except need to handle ConstantKernel where self.alpha_init is a float
 
-        self.alpha = self.alpha_init * jnp.ones(x.shape[-1])
+        if is_scalar(self.alpha_init):
+            self.alpha = self.alpha_init * jnp.ones(x.shape[-1])
+        else:
+            self.alpha = self.alpha_init
+
         return self, {"logdet":-jnp.inf}
     
     def matrix_sqrt(self, R, **kwargs):
@@ -1032,7 +1071,7 @@ class Outer(CovType):
 
         return Exception("Outer product matrix is not invertible!")
     
-    def inv_sqrt_transform(self, K):
+    def inv_sqrt_transform(self, K, x, **kwargs):
 
         raise Exception("Outer product matrix is not invertible!")
 

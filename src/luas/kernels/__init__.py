@@ -1,5 +1,6 @@
 from luas.kernels.base import (
     Custom,
+    Fixed,
     Noise,
     KroneckerDelta,
     Exp,
@@ -7,7 +8,7 @@ from luas.kernels.base import (
     PoweredExp,
     Matern32,
     Matern52,
-    MaternNuHalf,
+    MaternHalfInt,
     RationalQuadratic,
     ExpSineSquared,
     Cosine,

@@ -64,10 +64,8 @@ class LuasLasrachPlusPeriodicKernel(CovType):
         self.Sigma_slow, stored_values_slow = self.Sigma[1-self.fast_dim].decompose(X[1-self.fast_dim])
         stored_values["logdet"] = (total_size/X[1-self.fast_dim].shape[-1])*stored_values_slow["logdet"]
 
-        K_slow = self.Sigma_slow.inv_sqrt_transform(self.K[1-self.fast_dim])
-
-        self.Outer_peri, _ = self.Outer_peri.decompose(X[1-self.fast_dim])
-        self.Outer_peri = self.Sigma_slow.inv_sqrt_transform(self.Outer_peri)
+        K_slow = self.Sigma_slow.inv_sqrt_transform(self.K[1-self.fast_dim], X[1-self.fast_dim])
+        self.Outer_peri = self.Sigma_slow.inv_sqrt_transform(self.Outer_peri, X[self.fast_dim])
 
         self.lam_K_slow, self.Q_K_slow = K_slow.eigendecomp(X[1-self.fast_dim])
         alpha_new = self.Q_K_slow.T @ self.Outer_peri.alpha_init

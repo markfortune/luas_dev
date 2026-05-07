@@ -11,7 +11,7 @@ from functools import partial
 
 from luas.kernels.covtype import CovType, Outer, Identity, ScaledIdentity, Diagonal
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar
-from luas.kronecker_fns import kron_prod, logdetK_calc, r_K_inv_r, K_inv_vec, logdetK_calc_hessianable, calc_total_size, cyclic_transpose, vmap_for_tensors, tensor_mult
+from luas.kronecker_fns import kron_prod, calc_total_size, cyclic_transpose, vmap_for_tensors, tensor_mult
 from luas.jax_convenience_fns import array_to_pytree_2D, get_corr_mat
 from luas.kernels.WhiteNoiseKernel import WhiteNoiseKernel
 from luas.kernels.SingleKronTermKernel import SingleKronTermKernel
@@ -141,7 +141,7 @@ class LuasLasrachKernel(CovType):
                 else:
                     K_d = self.K[d]
                 
-                K_d_new = Sigma_d_new.inv_sqrt_transform(K_d)
+                K_d_new = Sigma_d_new.inv_sqrt_transform(K_d, X[d])
                 
                 if self.dim > 2:
                     Sigma_d_new.matrix_sqrt = vmap_for_tensors(Sigma_d_new.matrix_sqrt)
@@ -182,7 +182,7 @@ class LuasLasrachKernel(CovType):
         if all_lam.size < non_fast_dim_size:
             kf_A = SingleKronTermKernel(Identity(), self.Sigma[self.fast_dim],
                                         inv_dims=self.Sigma[self.fast_dim].use_inv)
-            self.kf_tilde = Block2x2Kernel(kf_A = kf_A, kf_D_CAB = kf_dense_blocks,
+            self.kf_tilde = Block2x2Kernel(kf_A = kf_A, kf_D_CAB = kf_dense_blocks, D_full = True,
                                            dim_split = 0, split_loc = -all_lam.size)
         else:
             self.kf_tilde = kf_dense_blocks
@@ -351,57 +351,6 @@ class LuasLasrachKernel(CovType):
     
         return Sigma_d, logdetSigma_d
     
-    def logL_hessianable(
-        self,
-        hp: PyTree,
-        x_l: JAXArray,
-        x_t: JAXArray,
-        R: JAXArray,
-        stored_values: PyTree,
-    ) -> Tuple[Scalar, PyTree]:
-        """Computes the log likelihood using the method originally presented in Rakitsch et al. (2013)
-        and also outlined in Fortune at al. (2024).
-        
-        Note:
-            The hessian of this log likelihood function can be calculated using ``jax.hessian`` and
-            should be more numerically stable for this than ``LuasKernel.logL``.
-            However, this function is slower for calculating the gradients of the log likelihood so
-            ``LuasKernel.logL`` is preferred unless the hessian is needed. Also returns stored values
-            from the matrix decomposition.
-        
-        Args:
-            hp (Pytree): Hyperparameters needed to build the covariance matrices
-                ``Kl``, ``Kt``, ``Sl``, ``St``. Will be unaffected if additional mean function
-                parameters are also included.
-            x_l (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
-                for the observed locations. May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l``
-                different wavelength/vertical regression variables.
-            x_t (JAXArray): Array containing time/horizontal dimension regression variable(s) for the
-                observed locations. May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different
-                time/horizontal regression variables.
-            R (JAXArray): Residuals to be fit calculated from the observed data by subtracting the deterministic
-                mean function. Must have the same shape as the observed data (N_l, N_t).
-            stored_values (PyTree): Stored values from the decomposition of the covariance matrices. For
-                :class:`LuasKernel` this consists of values computed using the eigendecomposition
-                of each matrix and also the log determinant of ``K``.
-                
-        Returns:
-            (Scalar, PyTree): A tuple where the first element is the value of the log likelihood.
-            The second element is a PyTree which contains stored values from the decomposition of the
-            covariance matrix.
-        
-        """
-        
-        # Calculate the decomposition of K
-        stored_values = self.decomp_fn(hp, x_l, x_t, stored_values = stored_values)
-        
-        # Use functions with custom derivatives to accurately calculate the log
-        # likelihood, its gradient and hessian
-        rKr = r_K_inv_r(R, stored_values)
-        logdetK = logdetK_calc_hessianable(stored_values)
-        logL =  -0.5 * rKr - 0.5 * logdetK  - 0.5 * R.size * jnp.log(2*jnp.pi)
-
-        return  logL, stored_values
     
     def predict(
         self,

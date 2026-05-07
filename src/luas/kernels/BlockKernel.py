@@ -20,11 +20,15 @@ class BlockKernel(CovType):
         self.block_dim = block_dim
         self.non_block_dim_size = non_block_dim_size
 
-    def evaluate(self, X1, X2, full = True, **kwargs):
+    def evaluate(self, X1, X2, full = True, row_idx = (None, None), col_idx = (None, None), **kwargs):
         assert full == True
 
         for i in range(self.non_block_dim_size):
-            Sigma_eval = self.block_kernels[0].evaluate(X1[self.block_dim], X2[self.block_dim], full = full, **kwargs)
+            Sigma_eval = self.block_kernels[0].evaluate(X1[self.block_dim], X2[self.block_dim],
+                                                        full = full,
+                                                        row_idx = row_idx[self.block_dim],
+                                                        col_idx = col_idx[self.block_dim],
+                                                        **kwargs)
 
             if self.block_dim == 1:
                 K_eval = jnp.kron(jnp.diag(self.lam_arr[:, 0]), Sigma_eval)
@@ -32,7 +36,10 @@ class BlockKernel(CovType):
                 K_eval = jnp.kron(Sigma_eval, jnp.diag(self.lam_arr[:, 0]))
                                 
             for i in range(1, len(self.block_kernels)):
-                K_i_eval = self.block_kernels[i].evaluate(X1[self.block_dim], X2[self.block_dim], full = full, **kwargs)
+                K_i_eval = self.block_kernels[i].evaluate(X1[self.block_dim], X2[self.block_dim],
+                                                          row_idx = row_idx[self.block_dim],
+                                                          col_idx = col_idx[self.block_dim],
+                                                          full = full, **kwargs)
 
                 if self.block_dim == 1:
                     K_eval += jnp.kron(jnp.diag(self.lam_arr[:, i]), K_i_eval)
@@ -42,7 +49,7 @@ class BlockKernel(CovType):
         return K_eval
             
     
-    def decompose(self, X, **kwargs):
+    def decompose(self, X, full = True, idx = (None, None), **kwargs):
 
         self.block_kernels = (self.Sigma[self.block_dim],)
 
@@ -62,7 +69,7 @@ class BlockKernel(CovType):
             for i in range(1, len(self.block_kernels)):
                 kf_block += lam_arr[i] * self.block_kernels[i]
 
-            kf_block, stored_values = kf_block.decompose(X[self.block_dim], **kwargs)
+            kf_block, stored_values = kf_block.decompose(X[self.block_dim], idx = idx[self.block_dim])
             return kf_block.matrix_inv_sqrt(r, transpose = transpose), stored_values["logdet"]
         
         def matrix_sqrt_calc(r, lam_arr, transpose):
@@ -71,7 +78,7 @@ class BlockKernel(CovType):
             for i in range(1, len(self.block_kernels)):
                 kf_block += lam_arr[i] * self.block_kernels[i]
 
-            kf_block, stored_values = kf_block.decompose(X[self.block_dim], **kwargs)
+            kf_block, stored_values = kf_block.decompose(X[self.block_dim], idx = idx[self.block_dim])
             return kf_block.matrix_sqrt(r, transpose = transpose), stored_values["logdet"]
         
         def logL_calc(r, lam_arr):
@@ -80,11 +87,13 @@ class BlockKernel(CovType):
             for i in range(1, len(self.block_kernels)):
                 kf_block += lam_arr[i] * self.block_kernels[i]
 
-            kf_block, _ = kf_block.decompose(X[self.block_dim], **kwargs)
+            kf_block, _ = kf_block.decompose(X[self.block_dim], idx = idx[self.block_dim])
             return kf_block.logL(r)
 
-        self.matrix_inv_sqrt_calc_vmap = jax.vmap(matrix_inv_sqrt_calc, in_axes = (1-self.block_dim, 0, None), out_axes = (1-self.block_dim, 0))
-        self.matrix_sqrt_calc_vmap = jax.vmap(matrix_sqrt_calc, in_axes = (1-self.block_dim, 0, None), out_axes = (1-self.block_dim, 0))
+        self.matrix_inv_sqrt_calc_vmap = jax.vmap(matrix_inv_sqrt_calc, in_axes = (1-self.block_dim, 0, None),
+                                                  out_axes = (1-self.block_dim, 0))
+        self.matrix_sqrt_calc_vmap = jax.vmap(matrix_sqrt_calc, in_axes = (1-self.block_dim, 0, None),
+                                              out_axes = (1-self.block_dim, 0))
 
         self.logL_vmap = jax.vmap(logL_calc, in_axes = (1-self.block_dim, 0))
         
@@ -125,7 +134,7 @@ class BlockKernel(CovType):
     
 
 class Block2x2Kernel(CovType):
-    def __init__(self, kf_A, kf_B = None, kf_D_CAB = None, kf_D = None,
+    def __init__(self, kf_A, kf_B = None, kf_D_CAB = None, kf_D = None, A_full = True, D_full = True,
                  dim_split = 0, split_loc = None, split_idx = False, kf_B_eval = None):
         self.kf_A = kf_A
         self.kf_B_matmul = kf_B
@@ -136,6 +145,8 @@ class Block2x2Kernel(CovType):
         self.dim_split = dim_split
         self.split_loc = split_loc
         self.split_idx = split_idx
+        self.A_full = A_full
+        self.D_full = D_full
 
         if self.kf_D is None and self.kf_B_matmul is None:
             self.kf_D = self.kf_D_CAB
@@ -159,11 +170,12 @@ class Block2x2Kernel(CovType):
 
         C_A_inv_B = B_mat.T @ jnp.linalg.inv(A_mat) @ B_mat
         if self.kf_D is not None:
-            D_mat = self.kf_D.evaluate(x1_D, x2_D)
+            D_mat = self.kf_D.evaluate(x1_D, x2_D, full = self.D_full)
         else:
-            D_mat = self.kf_D_CAB.evaluate(x1_D, x2_D) + C_A_inv_B
+            D_mat = self.kf_D_CAB.evaluate(x1_D, x2_D, full = self.D_full) + C_A_inv_B
 
-        calc_C_A_inv_B = self.kf_D.evaluate(x1_D, x2_D) - self.kf_D_CAB.evaluate(x1_D, x2_D)
+        calc_C_A_inv_B = self.kf_D.evaluate(x1_D, x2_D, full = self.D_full)
+        calc_C_A_inv_B -= self.kf_D_CAB.evaluate(x1_D, x2_D, full = self.D_full)
         print("C_A_inv_B:", calc_C_A_inv_B, C_A_inv_B, (calc_C_A_inv_B - C_A_inv_B).std())
         self.dense_C_A_inv_B = C_A_inv_B
 
@@ -209,14 +221,14 @@ class Block2x2Kernel(CovType):
         return X_A, X_D, idx_A, idx_D
 
 
-    def decompose(self, X, idx = None, **kwargs):
+    def decompose(self, X, idx = None, full = True, **kwargs):
 
         X_A, X_D, idx_A, idx_D = self.x_split(X, idx = idx)
 
-        self.kf_A, stored_values_A = self.kf_A.decompose(X_A, idx = idx_A, **kwargs)
+        self.kf_A, stored_values_A = self.kf_A.decompose(X_A, idx = idx_A, full = self.A_full, **kwargs)
 
         if self.kf_D_CAB is not None:
-            self.kf_D_CAB, stored_values_D = self.kf_D_CAB.decompose(X_D, idx = idx_D)
+            self.kf_D_CAB, stored_values_D = self.kf_D_CAB.decompose(X_D, idx = idx_D, full = self.D_full)
         else:
             raise Exception("Not Implemented")
 

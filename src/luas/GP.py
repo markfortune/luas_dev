@@ -175,9 +175,9 @@ class GP(object):
         R = Y - self.mf(p, self.x)
         self.kf = self.build_kf(p, self.x)
         
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {"R_shape":self.data_shape})
+        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})
         
-        logL_val = self.kf.logL(R)
+        logL_val = self.kf.logL(R, stored_values = stored_values)
         
         return logL_val
 
@@ -203,7 +203,7 @@ class GP(object):
         
         self.kf = self.build_kf(p, self.x)
         
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {"R_shape":self.data_shape})
+        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})
         K_inv_R = self.kf.inverse(R, **kwargs)
         
         return K_inv_R
@@ -260,7 +260,7 @@ class GP(object):
         
         self.kf = self.build_kf(p, self.x)
         
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {"R_shape":self.data_shape})
+        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})
         L_R = self.kf.matrix_sqrt(R, transpose = transpose)
         
         return L_R
@@ -287,7 +287,7 @@ class GP(object):
         
         self.kf = self.build_kf(p, self.x)
         
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {"R_shape":self.data_shape})
+        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})
         L_inv_R = self.kf.matrix_inv_sqrt(R, transpose = transpose)
         
         return L_inv_R
@@ -650,8 +650,7 @@ class GP(object):
         gp_mean_pred = M_pred + Ks_Kinv_R_term[predicted_ind]
 
         if sample:
-            K_pred_draw = self.sample_conditional(p_obs, x_obs, p_total, x_total, observed_ind,
-                                      stored_values = stored_values_K)
+            K_pred_draw = self.sample_conditional(p_obs, x_obs, p_total, x_total, observed_ind)
             K_pred_draw = gp_mean_pred + K_pred_draw[predicted_ind]
     
             if not return_predicted_loc:

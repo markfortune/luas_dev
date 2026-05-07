@@ -8,6 +8,7 @@ import jax.scipy.linalg as JLA
 from jax.flatten_util import ravel_pytree
 
 import luas.kernels.covtype as covtype
+from luas.kernels.covtype import CovType, Outer
 from luas.kronecker_fns import calc_data_shape
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar
 from luas.kernels import (
@@ -17,20 +18,25 @@ from luas.kernels import (
     LuasLasrachKernel,
     MultiTermKernel,
     MultiTermBothDimKernel,
+    LuasPlusMultiTermKernel,
+    # LuasPlusMultiTermBothDimKernel,
     GeneralKernel,
 )
 from luas.kernels.lowrank import LowRank
 
-cov_types_1D = [covtype.General, covtype.GeneralQuasisep, covtype.Diagonal, covtype.Exp,
+cov_types_1D = (covtype.General, covtype.GeneralQuasisep, covtype.Diagonal, covtype.Exp,
                 LowRank,
-                covtype.Identity, covtype.OuterPlusScaledIdentity, covtype.Outer, covtype.OuterPlusScaledIdentity]
+                covtype.Identity, covtype.OuterPlusScaledIdentity, covtype.Outer, covtype.OuterPlusScaledIdentity)
 
-cov_type_cel_compat = [covtype.GeneralQuasisepPlusNoise, covtype.GeneralQuasisep, covtype.Exp,
-                       covtype.Diagonal, covtype.ScaledIdentity, covtype.Identity, covtype.Outer, covtype.OuterPlusScaledIdentity]
-cov_type_cel = [covtype.GeneralQuasisepPlusNoise, covtype.GeneralQuasisep, covtype.Exp]
+cov_type_cel_compat = (covtype.GeneralQuasisepPlusNoise, covtype.GeneralQuasisep, covtype.Exp,
+                       covtype.Diagonal, covtype.ScaledIdentity, covtype.Identity, covtype.Outer, covtype.OuterPlusScaledIdentity)
+cov_type_cel = (covtype.GeneralQuasisepPlusNoise, covtype.GeneralQuasisep, covtype.Exp)
 
 cov_types_2D = []
 Sigma2D = []
+
+
+
 
 def kernel_selector(
         p,
@@ -87,7 +93,7 @@ def kernel_selector(
                 build_kf = kf
             else:
                 assert isinstance(cov_form, tuple) # kf must return a kernel object or tuple(s)
-                use_kernel, new_kernel_kwargs = find_best_optimisation(data_shape, cov_form,
+                use_kernel, new_kernel_kwargs = find_best_optimisation(X, cov_form,
                                                                        verbose = verbose, **kernel_select_kwargs)
                 new_kernel_kwargs.update(kernel_kwargs)
                 build_kf = lambda p, X: use_kernel(*kf(p, X), **new_kernel_kwargs)
@@ -95,7 +101,60 @@ def kernel_selector(
     return build_kf
 
 
-def find_best_optimisation(data_shape, cov_form, verbose = True, max_gen_cholesky_blocks = 10,):
+
+def read_K_list(K_list, X):
+
+    # Initialise for loop reading K_list
+    dense_kron = None
+    alpha_list = [] # np.zeros((X[self.fast_dim].shape[-1], self.N_alpha))
+    beta_list = []
+
+    low_rank_kernels_dim0 = []
+    low_rank_kernels_dim1 = []
+    for K_i in K_list:
+        K_0 = K_i[0]
+        K_1 = K_i[1]
+
+        # rank_0 = K_0.rank(X[0])
+        # rank_1 = K_1.rank(X[1])
+
+        if isinstance(K_0, Outer) and isinstance(K_1, CovType):
+            K_0, _ = K_0.decompose(X[0])
+            alpha_list.append(K_0.alpha)
+            low_rank_kernels_dim1.append(K_1)
+
+        elif isinstance(K_0, CovType) and isinstance(K_1, Outer):
+            K_1, _ = K_1.decompose(X[1])
+            beta_list.append(K_1.alpha)
+            low_rank_kernels_dim0.append(K_0)
+
+        elif isinstance(K_0, CovType) and isinstance(K_1, CovType) and dense_kron is None:
+            dense_kron = [K_0, K_1]
+
+        elif isinstance(dense_kron, tuple):
+            raise Exception("Can only have one dense kronecker term")
+        
+        else:
+            raise Exception("All kernel terms must be valid CovType objects")
+        
+    if alpha_list:
+        alpha_mat = jnp.stack(alpha_list, axis = 1)
+        alpha_terms = (alpha_mat, low_rank_kernels_dim1)
+    else:
+        alpha_terms = None
+
+    if beta_list:
+        beta_mat = jnp.stack(beta_list, axis = 1)
+        beta_terms = (beta_mat, low_rank_kernels_dim0)
+    else:
+        beta_terms = None
+
+    return dense_kron, alpha_terms, beta_terms
+
+
+
+def find_best_optimisation(X, cov_form, verbose = True, max_gen_cholesky_blocks = 10,):
+    data_shape = calc_data_shape(X)
     dim = len(data_shape)
     print_str = ""
 
@@ -114,9 +173,9 @@ def find_best_optimisation(data_shape, cov_form, verbose = True, max_gen_cholesk
     for arg in args:
         assert len(arg) == dim
 
-    nonkron_Sigma = (type(Sigma[0]) in Sigma2D)
-    if not nonkron_Sigma:
-        assert len(Sigma) == dim
+    # nonkron_Sigma = (type(Sigma[0]) in Sigma2D)
+    # if not nonkron_Sigma:
+    #     assert len(Sigma) == dim
 
     if dim == 1:
         raise Exception("""One regressor specified but kernel function doesn't return a kernel.
@@ -125,6 +184,23 @@ For >1D data make sure as many regressors are specified as kernel dimensions
 i.e. X should be a tuple the same length as the terms kf returns.""")
     
     elif dim == 2:
+        dense_kron, alpha_terms, beta_terms = read_K_list(cov_form[1:], X)
+
+        if dense_kron is None:
+            if alpha_terms is not None and beta_terms is None:
+                return MultiTermKernel, {"fast_dim":1}
+            elif alpha_terms is None and beta_terms is not None:
+                return MultiTermKernel, {"fast_dim":0}
+            elif alpha_terms is not None and beta_terms is not None:
+                return MultiTermBothDimKernel, {}
+        else:
+            if alpha_terms is not None and beta_terms is None:
+                return RakitschPlusVecsKernel, {"fast_dim":1}
+            elif alpha_terms is None and beta_terms is not None:
+                return RakitschPlusVecsKernel, {"fast_dim":0}
+            elif alpha_terms is not None and beta_terms is not None:
+                return MultiTermBothDimKernel, {}
+
         if data_shape[0] > data_shape[1]:
             longest_dim = 0
         else:

@@ -4,7 +4,7 @@ from jax import vmap
 import numpy as np
 from typing import Callable
 import tinygp
-from tinygp.kernels import quasisep
+import tinygp.kernels.quasisep
 import equinox as eqx
 
 from luas.luas_types import JAXArray, Scalar, PyTree, is_scalar
@@ -27,12 +27,6 @@ __all__ = [
 
 from luas.kernels.diagonal import KroneckerDelta, Noise
 
-def Banded(diag: JAXArray, off_diags: JAXArray, use_block: bool = True) -> covtype.CovType:
-    
-    symm_qsm = tinygp.noise.Banded(diag, off_diags).to_qsm()
-
-    # Don't use HandleIdx here as need the location in matrix for non-stationary kernels
-    return covtype.GeneralQuasisepPlusNoise(None, noise_model = symm_qsm, use_block = use_block)
 
 
 def CustomTinygp(kf_tinygp: Callable, params = None) -> JAXArray:
@@ -60,7 +54,6 @@ def CustomTinygp(kf_tinygp: Callable, params = None) -> JAXArray:
     return covtype.GeneralQuasisepPlusNoise(HandleIdx(kf_tinygp), params = params)
 
 
-
 def Constant(const: JAXArray) -> JAXArray:
     r"""Matern 3/2 kernel function, used with ``luas.kernels.evaluate_kernel``
     to build covariance matrices.
@@ -83,7 +76,7 @@ def Constant(const: JAXArray) -> JAXArray:
     return covtype.Outer(alpha = jnp.sqrt(const))
 
 
-def Linear(alpha: JAXArray, use_block: bool = True, const: None = None) -> JAXArray:
+def Linear(alpha: JAXArray, sigma: Scalar = 1., use_block: bool = True, const: None = None) -> JAXArray:
     r"""Matern 3/2 kernel function, used with ``luas.kernels.evaluate_kernel``
     to build covariance matrices.
     
@@ -103,11 +96,18 @@ def Linear(alpha: JAXArray, use_block: bool = True, const: None = None) -> JAXAr
     assert alpha.ndim == 1
 
     if const is not None:
-        tinygp_kf = luas.kernels.tinygp_ext.Linear(alpha = alpha, const = const)
+        tinygp_kf = luas.kernels.tinygp_ext.Linear(alpha = sigma * alpha, const = const)
         return covtype.GeneralQuasisepPlusNoise(tinygp_kf, use_block = use_block)
     else:
         return covtype.Outer(alpha)
 
+
+def Banded(diag: JAXArray, off_diags: JAXArray, use_block: bool = True) -> covtype.CovType:
+    
+    symm_qsm = tinygp.noise.Banded(diag, off_diags).to_qsm()
+
+    # Don't use HandleIdx here as need the location in matrix for non-stationary kernels
+    return covtype.GeneralQuasisepPlusNoise(None, noise_model = symm_qsm, use_block = use_block)
 
 
 def ConstantBlocks(endpoints: JAXArray, sigma: Scalar = 1., use_block: bool = True) -> JAXArray:
@@ -153,7 +153,7 @@ def Exp(scale: Scalar, sigma: Scalar = 1., fast_eigen = False) -> JAXArray:
     return covtype.Exp(HandleIdx(exp_kernel), scale, sigma = sigma, fast_eigen = fast_eigen)
 
 
-def Matern32(scale: Scalar) -> JAXArray:
+def Matern32(scale: Scalar, sigma: Scalar = 1.) -> JAXArray:
     r"""Matern 3/2 kernel function, used with ``luas.kernels.evaluate_kernel``
     to build covariance matrices.
     
@@ -171,10 +171,10 @@ def Matern32(scale: Scalar) -> JAXArray:
         
     """
     
-    return covtype.GeneralQuasisep(HandleIdx(quasisep.Matern32(scale = scale)))
+    return covtype.GeneralQuasisep(HandleIdx(tinygp.kernels.quasisep.Matern32(scale = scale, sigma = sigma)))
     
 
-def Matern52(scale: Scalar) -> JAXArray:
+def Matern52(scale: Scalar, sigma: Scalar = 1.) -> JAXArray:
     r"""Matern 5/2 kernel function, used with ``luas.kernels.evaluate_kernel``
     to build covariance matrices.
     
@@ -192,10 +192,10 @@ def Matern52(scale: Scalar) -> JAXArray:
         
     """
     
-    return covtype.GeneralQuasisep(HandleIdx(quasisep.Matern52(scale = scale)))
+    return covtype.GeneralQuasisep(HandleIdx(tinygp.kernels.quasisep.Matern52(scale = scale, sigma = sigma)))
 
 
-def Matern(scale: Scalar, double_nu: int, sigma = 1.) -> JAXArray:
+def MaternHalfInt(scale: Scalar, double_nu: int, sigma = 1.) -> JAXArray:
     r"""Matern half-integer kernel function
     
     .. math::
@@ -211,7 +211,7 @@ def Matern(scale: Scalar, double_nu: int, sigma = 1.) -> JAXArray:
         Scalar: Covariance between two input vectors
         
     """
-    tinygp_kf = luas.kernels.tinygp_ext.MaternNuHalf(scale = scale, double_nu = double_nu, sigma = sigma)
+    tinygp_kf = luas.kernels.tinygp_ext.MaternHalfInt(scale = scale, double_nu = double_nu, sigma = sigma)
     return covtype.GeneralQuasisep(HandleIdx(tinygp_kf))
 
 
@@ -233,10 +233,10 @@ def SHO(omega: Scalar, quality: Scalar, sigma = 1.) -> JAXArray:
         
     """
     
-    return covtype.GeneralQuasisep(HandleIdx(quasisep.SHO(omega = omega, quality = quality, sigma = sigma)))
+    return covtype.GeneralQuasisep(HandleIdx(tinygp.kernels.quasisep.SHO(omega = omega, quality = quality, sigma = sigma)))
 
 
-def Cosine(P: Scalar) -> JAXArray:
+def Cosine(scale: Scalar, sigma: Scalar = 1.) -> JAXArray:
     r"""Cosine kernel, used with ``luas.kernels.evaluate_kernel``
     to build covariance matrices which have periodic covariance.
     
@@ -247,17 +247,45 @@ def Cosine(P: Scalar) -> JAXArray:
     Args:
         x (JAXArray): Input vector 1
         y (JAXArray): Input vector 2
-        P (Scalar): Period
+        scale (Scalar): Period
         
     Returns:
         JAXArray: Covariance between two input vectors
         
     """
 
-    return covtype.GeneralQuasisep(HandleIdx(quasisep.Cosine(P)))
+    return covtype.PeriodicQuasisep(HandleIdx(tinygp.kernels.quasisep.Cosine(scale = scale, sigma = sigma)))
 
 
-def SquaredExpApprox(scale: Scalar, sigma: Scalar = 1.0, order: int = 6, use_block = True) -> JAXArray:
+
+def ExpSineSquaredApprox(
+    period: JAXArray | float,
+    gamma: JAXArray | float,
+    sigma: Scalar = 1.,
+    order: int = 5,
+    use_block: bool = True,
+):
+    # Note defaults to an order of 5 which can be inaccurate
+    kf_tinygp = luas.kernels.tinygp_ext.ExpSineSquaredApprox(period=period, gamma=gamma,
+                                                             sigma=sigma, order=order,
+                                                             use_block = use_block)
+    return covtype.PeriodicQuasisep(HandleIdx(kf_tinygp))
+
+
+def QuasiperiodicApprox(
+    period: JAXArray | float,
+    gamma: JAXArray | float,
+    decay_kernel: covtype.CovType,
+    sigma: Scalar = 1.,
+    order: int = 5,
+    use_block: bool = True,
+):
+    kf_tinygp = luas.kernels.tinygp_ext.QuasiperiodicApprox(period=period, gamma=gamma, decay_kernel = decay_kernel.tinygp_kf,
+                                                            sigma=sigma, order=order)
+    return covtype.GeneralQuasisep(HandleIdx(kf_tinygp), use_block = use_block)
+
+
+def SquaredExpApprox(scale: Scalar, sigma: Scalar = 1., order: int = 6, use_block = True) -> JAXArray:
     """Taylor-spectrum squared-exponential approximation as a quasisep kernel.
 
     This returns a ``covtype.GeneralQuasisep`` wrapper so it plugs straight into
@@ -267,97 +295,12 @@ def SquaredExpApprox(scale: Scalar, sigma: Scalar = 1.0, order: int = 6, use_blo
                                                          use_block = use_block)
     return covtype.GeneralQuasisep(HandleIdx(kf_tinygp))
 
-def SquaredExpApprox2(scale: Scalar, sigma: Scalar = 1.0, order: int = 6, use_block = True) -> JAXArray:
-    """Taylor-spectrum squared-exponential approximation as a quasisep kernel.
+# def SquaredExpApprox2(scale: Scalar, sigma: Scalar = 1.0, order: int = 6, use_block = True) -> JAXArray:
+#     """Taylor-spectrum squared-exponential approximation as a quasisep kernel.
 
-    This returns a ``covtype.GeneralQuasisep`` wrapper so it plugs straight into
-    existing ``luas`` covariance composition patterns.
-    """
-    kf_tinygp = luas.kernels.tinygp_ext.SquaredExpApprox2(scale=scale, sigma=sigma, order=order,
-                                                         use_block = use_block)
-    return covtype.GeneralQuasisep(HandleIdx(kf_tinygp))
-
-
-def ExpSineSquaredApprox(
-    period: JAXArray | float,
-    gamma: JAXArray | float,
-    sigma: JAXArray | float = 1.,
-    order: int = 5,
-    use_block: bool = True,
-):
-    # Note defaults to an order of 5 which can be inaccurate
-    kf_tinygp = luas.kernels.tinygp_ext.ExpSineSquaredApprox(period=period, gamma=gamma,
-                                                             sigma=sigma, order=order,
-                                                             use_block = use_block)
-    return covtype.GeneralQuasisep(HandleIdx(kf_tinygp))
-
-
-def QuasiperiodicApprox(
-    period: JAXArray | float,
-    gamma: JAXArray | float,
-    decay_kernel: covtype.CovType,
-    sigma: JAXArray | float = 1.,
-    order: int = 5,
-    use_block: bool = True,
-):
-    kf_tinygp = luas.kernels.tinygp_ext.QuasiperiodicApprox(period=period, gamma=gamma, decay_kernel = decay_kernel.tinygp_kf,
-                                                            sigma=sigma, order=order)
-    return covtype.GeneralQuasisep(HandleIdx(kf_tinygp), use_block = use_block)
-
-
-
-# def QuasiperiodicApprox(
-#     period: JAXArray | float,
-#     gamma: JAXArray | float,
-#     scale: JAXArray | float,
-#     sigma: JAXArray | float = eqx.field(default_factory=lambda: jnp.ones(())),
-#     order: int | None = None,
-# ):
+#     This returns a ``covtype.GeneralQuasisep`` wrapper so it plugs straight into
+#     existing ``luas`` covariance composition patterns.
 #     """
-#     tinygp currently breaks when multiplying together kernel functions with Block transition matrices,
-#     formed from adding kernels together. This is a problem for the Quasiperiodic kernel implementation
-#     using quasiseparable matrices, and hence this kernel object gets around it by multiplying an exponential
-#     kernel by each kernel term added together, rather than multiplying the exponential times the sum of kernels
-    
-#     Credit: smolgp (Rubenzahl et al. 2026), original derivation from Solin & Särkkä (2014)
-#     """
-#     periodic_scale = jnp.sqrt(2/gamma)
-#     decay_scale = scale
-#     # Auto-select order (J) using Fig 2c of
-#     # Solin & Särkkä (2014) as a guide
-#     if order is None:
-#         order = order_fn(periodic_scale)
-
-#         if periodic_scale < 1/6:
-#             warnings.warn(
-#                 "ExpSineSquared kernel with scale < 0.25 (gamma > 16) may require a high order approximation; "
-#                 "it may be worthwhile to change units to a more compatible scale (recommended) "
-#                 "or specify the 'order' parameter explicitly."
-#             )
-
-#     q0 = Ij(0, periodic_scale) / jnp.exp(1/periodic_scale**2)
-#     kernel = sigma**2 * q0 * tinygp.kernels.quasisep.Exp(scale = decay_scale)
-    
-#     for j in range(1, order):
-#         coeff = jax.lax.cond(j == 0, lambda _: 1.0, lambda _: 2.0, j)
-#         q_j2 = 2 * Ij(j, periodic_scale) / jnp.exp(1/periodic_scale**2)
-#         kernel += sigma**2 * q_j2 * tinygp.kernels.quasisep.Cosine(period/j) * tinygp.kernels.quasisep.Exp(scale = decay_scale)
-    
-#     return covtype.GeneralQuasisep(kernel)
-
-
-# def order_fn(scale):
-
-#     max_order = jax.lax.cond(scale < 1/6, lambda _: 16, lambda _: (jnp.floor(4. * scale**-0.8)).astype("int"), scale)
-#     order = jax.lax.cond(scale > 1., lambda _: 4, lambda _: max_order, scale)
-#     return order
-    
-# def Ij(j, scale, terms=50) -> JAXArray:
-#     """
-#     The modified Bessel function of the first kind, order j, at scale.
-#     Approximated via a truncated Taylor series expansion.
-#     """
-#     i = jnp.arange(terms)
-#     log_terms = -gammaln(i + 1) - gammaln(i + j + 1) - (j + 2 * i) * jnp.log(2*scale**2)
-#     return jnp.sum(jnp.exp(log_terms))
-
+#     kf_tinygp = luas.kernels.tinygp_ext.SquaredExpApprox2(scale=scale, sigma=sigma, order=order,
+#                                                          use_block = use_block)
+#     return covtype.GeneralQuasisep(HandleIdx(kf_tinygp))
