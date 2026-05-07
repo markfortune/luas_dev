@@ -21,6 +21,8 @@ class CovType():
     K_list = []
     params = None
     use_inv = False
+    diag = 0.
+    wn_diag = 0.
 
     def evaluate(self, x1, x2, **kwargs):
         raise Exception("Not implemented")

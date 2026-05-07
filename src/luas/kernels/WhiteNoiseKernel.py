@@ -16,10 +16,6 @@ from luas.jax_convenience_fns import array_to_pytree_2D
 
 __all__ = ["WhiteNoiseKernel"]
 
-# Ensure we are using double precision floats as JAX uses single precision by default
-jax.config.update("jax_enable_x64", True)
-
-    
 
 class WhiteNoiseKernel(CovType):
     """Kernel object which solves for the log likelihood for any general kernel function ``K``.

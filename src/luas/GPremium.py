@@ -30,8 +30,8 @@ from jax import random
 
 from .jax_convenience_fns import order_list, order_dict, pytree_to_array_2D, array_to_pytree_2D, varying_params_wrapper
 
-# Ensure we are using double precision floats as JAX uses single precision by default
-jax.config.update("jax_enable_x64", True)
+# # Ensure we are using double precision floats as JAX uses single precision by default
+# jax.config.update("jax_enable_x64", True)
 
 az.rcParams["plot.max_subplots"] = 100
 

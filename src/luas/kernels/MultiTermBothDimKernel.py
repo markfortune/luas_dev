@@ -12,6 +12,7 @@ from luas.kronecker_fns import kron_prod, tensor_mult
 from luas.kernels.tinygp_ext import ScaledKernel, LowRankProduct
 from luas.kernels.BlockKernel import Block2x2Kernel
 from luas.kernels.MixingMatQuasisep import MixingMatQuasisep
+from luas.kernels.MixingMatGeneral import MixingMatGeneral
 from luas.kernels.householder import orthonormal_nullspace_gen
 from tinygp.solvers.quasisep.core import DiagQSM, StrictLowerTriQSM, SymmQSM
 
@@ -20,10 +21,6 @@ __all__ = [
     "logL_block",
     "LuasLasrachKernel",
 ]
-
-# Ensure we are using double precision floats as JAX uses single precision by default
-jax.config.update("jax_enable_x64", True)
-
     
 class MultiTermBothDimKernel(CovType):
     
@@ -34,6 +31,7 @@ class MultiTermBothDimKernel(CovType):
         fast_dim = 1,
         never_reduce_dim = False,
         use_stored_values: Optional[bool] = True,
+        use_quasi = True,
     ):
         
         self.Sigma = Sigma[0], Sigma[1]
@@ -41,6 +39,7 @@ class MultiTermBothDimKernel(CovType):
         self.fast_dim = fast_dim
         self.never_reduce_dim = never_reduce_dim
         self.N_alpha = len(K_list)
+        self.use_quasi = use_quasi
 
         self.logL_hessianable = self.logL
         self.decompose = self.decomp_no_stored_values
@@ -60,6 +59,11 @@ class MultiTermBothDimKernel(CovType):
         X: Tuple[JAXArray],
         stored_values: Optional[PyTree] = {},
     ) -> PyTree:
+
+        if self.use_quasi:
+            MixingMatTerm = MixingMatQuasisep
+        else:
+            MixingMatTerm = MixingMatGeneral
 
         self.N_l = X[0].shape[-1]
         self.N_t = X[1].shape[-1]
@@ -108,6 +112,9 @@ class MultiTermBothDimKernel(CovType):
                 stored_values["B"] = stored_values["B"].at[:, col_j].set(K1_outer.alpha)
                 stored_values["B_kernel_order"].append(K_i[0])
                 col_j += 1
+
+        # stored_values["A"] = self.Sigma_transf[0].matrix_inv_sqrt(stored_values["A"])
+        # stored_values["B"] = self.Sigma_transf[1].matrix_inv_sqrt(stored_values["B"])
         
 
         reduce_dim = self.N_alpha < X[0].shape[-1] and self.N_beta < X[1].shape[-1]
@@ -116,8 +123,8 @@ class MultiTermBothDimKernel(CovType):
         stored_values["J_A"], stored_values["U_A"], self.householder_transform_A = orthonormal_nullspace_gen(stored_values["A"])
         stored_values["J_B"], stored_values["U_B"], self.householder_transform_B = orthonormal_nullspace_gen(stored_values["B"])
 
-        kf_A = MixingMatQuasisep(stored_values["J_A"], stored_values["A_kernel_order"], diag = 1., fast_dim = 1)
-        kf_B = MixingMatQuasisep(stored_values["J_B"], stored_values["B_kernel_order"], diag = 1., fast_dim = 0)
+        kf_A = MixingMatTerm(stored_values["J_A"], stored_values["A_kernel_order"], diag = 1., fast_dim = 1)
+        kf_B = MixingMatTerm(stored_values["J_B"], stored_values["B_kernel_order"], diag = 1., fast_dim = 0)
 
         for i in range(self.N_alpha):
             kf_B = kf_B.householder_transform(X, stored_values["U_A"][:, i])
@@ -135,12 +142,12 @@ class MultiTermBothDimKernel(CovType):
 
         # if quasisep
         banded_term = as_banded(top_corner_eval, zero_pad_to_len = self.N_alpha * X[1].shape[-1])
-        kf_A = MixingMatQuasisep(kf_A.mixing_mat, kf_A.kernel_list,
+        kf_A = MixingMatTerm(kf_A.mixing_mat, kf_A.kernel_list,
                                  fast_dim = 1, noise_model = banded_term, diag = 1.)
 
         non_zero_B_ind = (jnp.arange(self.N_alpha, X[0].shape[-1]), jnp.arange(self.N_beta))
         X_at_non_zero_B = (X[0][non_zero_B_ind[0]], X[1][non_zero_B_ind[1]])
-        self.B_rows = kf_B.evaluate(X_top_corner, X_at_non_zero_B,
+        self.B_rows = kf_B.evaluate(X_top_corner, X_at_non_zero_B, full = False,
                                     row_idx = top_corner_ind, col_idx = non_zero_B_ind,
                                     flip_kron = False, calc_diag = False)
 
@@ -158,16 +165,21 @@ class MultiTermBothDimKernel(CovType):
         K_A_inv_alphabeta = jnp.einsum('iat,jat->ij', L_A_inv_loc, L_A_inv_loc)
 
         K_A_inv_B = K_A_inv_alphabeta @ self.B_rows
-        C_A_inv_B = LowRankProduct(self.B_rows.T, K_A_inv_B.T).to_qsm()
-        
-        kf_D_corr = MixingMatQuasisep(kf_B.mixing_mat, kf_B.kernel_list,
-                                      fast_dim = 0, diag = 1., noise_model = -C_A_inv_B)
 
-        self.kf_D = MixingMatQuasisep(kf_B.mixing_mat, kf_B.kernel_list,
-                                      fast_dim = 0, diag = 1.)
+        C_A_inv_B = LowRankProduct(self.B_rows.T, K_A_inv_B.T).to_qsm()
+
+        if not self.use_quasi:
+            C_A_inv_B = C_A_inv_B.to_dense().reshape((self.N_beta, self.N_l - self.N_alpha, self.N_beta, self.N_l - self.N_alpha), order = "F").reshape((self.N_beta * (self.N_l - self.N_alpha), self.N_beta * (self.N_l - self.N_alpha)), order = "C")
+
+        
+        kf_D_corr = MixingMatTerm(kf_B.mixing_mat, kf_B.kernel_list, 
+                                  fast_dim = 0, diag = 1., noise_model = -C_A_inv_B)
+
+        # self.kf_D = MixingMatTerm(kf_B.mixing_mat, kf_B.kernel_list,
+        #                               fast_dim = 0, diag = 1.)
 
         kf_D_wn = WhiteNoiseKernel(diag = 1.)
-        K_D_CAB = Block2x2Kernel(kf_A = kf_D_corr, kf_D_CAB = kf_D_wn,
+        K_D_CAB = Block2x2Kernel(kf_A = kf_D_corr, kf_D_CAB = kf_D_wn, A_full = False,
                                  dim_split = 1, split_loc = self.N_beta, split_idx = True)
 
         self.kf_tilde = Block2x2Kernel(kf_A = kf_A, kf_B = self.K_B_matmul, kf_D_CAB = K_D_CAB,

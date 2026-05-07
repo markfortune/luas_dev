@@ -17,10 +17,6 @@ from luas.jax_convenience_fns import array_to_pytree_2D
 
 __all__ = ["GeneralKernel"]
 
-# Ensure we are using double precision floats as JAX uses single precision by default
-jax.config.update("jax_enable_x64", True)
-
-
 class GeneralKernel(CovType):
     r"""Kernel object which solves for the log likelihood for any general kernel function ``K``.
     Can also generate noise from ``K`` and can be used to compute the GP predictive mean and 

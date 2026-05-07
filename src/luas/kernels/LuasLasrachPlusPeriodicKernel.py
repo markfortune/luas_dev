@@ -15,9 +15,6 @@ __all__ = [
     "LuasLasrachPlusPeriodicKernel",
 ]
 
-# Ensure we are using double precision floats as JAX uses single precision by default
-jax.config.update("jax_enable_x64", True)
-
 class LuasLasrachPlusPeriodicKernel(CovType):
     def __init__(
         self,

@@ -395,9 +395,6 @@ class SquaredExpApprox(Quasisep):
     
     def stationary_covariance(self):
 
-        powers = jnp.arange(int(self.order), dtype=jnp.result_type(self.scale))
-        scale_diag = self.scale**powers
-
         P_inf_ref = self._P_inf
 
         return self.T.T @ P_inf_ref @ self.T

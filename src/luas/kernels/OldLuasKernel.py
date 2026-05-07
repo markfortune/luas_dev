@@ -19,10 +19,6 @@ __all__ = [
     "LuasKernel",
 ]
 
-# Ensure we are using double precision floats as JAX uses single precision by default
-jax.config.update("jax_enable_x64", True)
-
-
 def diag_eigendecomp(K: JAXArray) -> Tuple[JAXArray, JAXArray]:
     r"""Calculates the eigenvalues and eigenvectors of a matrix ``K`` assuming it is diagonal.
     Can be significantly faster than ``jax.numpy.linalg.eigh`` if a matrix is known in advance to be diagonal.

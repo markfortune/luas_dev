@@ -19,9 +19,6 @@ __all__ = [
     "LuasPlusMultiTermBothDimKernel",
 ]
 
-# Ensure we are using double precision floats as JAX uses single precision by default
-jax.config.update("jax_enable_x64", True)
-
 class LuasPlusMultiTermBothDimKernel(CovType):
     
     def __init__(
@@ -84,10 +81,13 @@ class LuasPlusMultiTermBothDimKernel(CovType):
             for j in range(self.N_beta):
                 alpha_kernel_list[i] = alpha_kernel_list[i].householder_transform(X[1], stored_values["U_B"][:, j])
 
+
         K_transf0_eval = self.K_transf[0].evaluate(X[0], X[0], full = True)
         self.K_transf0_A = K_transf0_eval[:-self.N_alpha, :-self.N_alpha]
         self.K_transf0_B = K_transf0_eval[:-self.N_alpha, -self.N_alpha:]
         self.K_transf0_D = K_transf0_eval[-self.N_alpha:, -self.N_alpha:]
+        
+        self.lam_K_transf0_A, self.Q_K_transf0_A = jnp.linalg.eigh(self.K_transf0_A)
 
         self.K_beta_A = jnp.zeros((self.N_beta, self.N_l - self.N_alpha, self.N_l - self.N_alpha))
         self.K_beta_B = jnp.zeros((self.N_beta, self.N_l - self.N_alpha, self.N_alpha))
@@ -111,7 +111,6 @@ class LuasPlusMultiTermBothDimKernel(CovType):
 
         ######### Build A Block #########
 
-        self.lam_K_transf0_A, self.Q_K_transf0_A = jnp.linalg.eigh(self.K_transf0_A)
 
         def K_A_transform_fn(R, transpose = 0):
             if transpose:

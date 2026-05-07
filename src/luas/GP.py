@@ -26,9 +26,6 @@ from luas.jax_convenience_fns import (
 
 __all__ = ["GP"]
 
-# Ensure we are using double precision floats as JAX uses single precision by default
-jax.config.update("jax_enable_x64", True)
-
 
 class GP(object):
     """Gaussian process class specialised to make the analysis of 2D data sets simple and efficient.

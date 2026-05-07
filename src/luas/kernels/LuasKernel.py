@@ -18,11 +18,6 @@ __all__ = [
     "LuasKernelNew",
 ]
 
-# Ensure we are using double precision floats as JAX uses single precision by default
-jax.config.update("jax_enable_x64", True)
-
-
-
 class LuasKernel(CovType):
     r"""Kernel class which solves for the log likelihood for any covariance matrix which
     is the sum of two kronecker products of the covariance matrix in each of two dimensions

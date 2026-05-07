@@ -13,14 +13,11 @@ from luas.kronecker_fns import tensor_mult
 from luas.kernels.tinygp_ext import ScaledKernel
 from luas.kernels.BlockKernel import Block2x2Kernel
 from luas.kernels.MixingMatQuasisep import MixingMatQuasisep
+from luas.kernels.MixingMatGeneral import MixingMatGeneral
 
 __all__ = [
     "MultiTermKernel",
 ]
-
-# Ensure we are using double precision floats as JAX uses single precision by default
-jax.config.update("jax_enable_x64", True)
-
 
 class MultiTermKernel(CovType):
     def __init__(
@@ -30,6 +27,7 @@ class MultiTermKernel(CovType):
         fast_dim = None,
         never_reduce_dim = False,
         use_stored_values: Optional[bool] = True,
+        use_quasi = True,
     ):
         assert fast_dim is not None # Must specify the fast dimension
         self.Sigma = Sigma[0], Sigma[1]
@@ -37,6 +35,7 @@ class MultiTermKernel(CovType):
         self.fast_dim = fast_dim
         self.never_reduce_dim = never_reduce_dim
         self.N_alpha = len(K_list)
+        self.use_quasi = use_quasi
 
         self.logL_hessianable = self.logL
         self.decompose = self.decomp_no_stored_values
@@ -122,26 +121,35 @@ class MultiTermKernel(CovType):
             stored_values["J"], U, self.householder_transform = orthonormal_nullspace_gen(stored_values["J"])
         
         # Handle Sigma mat in the fast_dim, likely just diagonal
-        if isinstance(self.Sigma[self.fast_dim], (GeneralQuasisep, GeneralQuasisepPlusNoise)):
+        if not isinstance(self.Sigma[self.fast_dim], (Identity, ScaledIdentity, Diagonal)):
             add_basis = jnp.eye(stored_values["non_cel_rank"])
             stored_values["J"] = jnp.concatenate([stored_values["J"], add_basis], axis = 1)
 
             for j in range(stored_values["non_cel_rank"]):
                 stored_values["cel_kernel_order"].append(self.Sigma[self.fast_dim])
 
-            assert self.Sigma[self.fast_dim].noise_model is None # Not implemented
+            if hasattr(self.Sigma[self.fast_dim], "noise_model") and self.Sigma[self.fast_dim].noise_model is not None:
+                assert self.use_quasi == False # Not implemented otherwise
+            
+            if self.use_quasi:
+                cel_diag = (self.Sigma[self.fast_dim].diag + self.Sigma[self.fast_dim].wn_diag)*jnp.ones(cel_vec.shape[-1])
+            else:
+                cel_diag = 0.*jnp.ones(cel_vec.shape[-1])
+            
         else:
-            assert isinstance(self.Sigma[self.fast_dim], (Identity, ScaledIdentity, Diagonal))
-
-        cel_diag = (self.Sigma[self.fast_dim].diag + self.Sigma[self.fast_dim].wn_diag)*jnp.ones(cel_vec.shape[-1])
+            cel_diag = (self.Sigma[self.fast_dim].diag + self.Sigma[self.fast_dim].wn_diag)*jnp.ones(cel_vec.shape[-1])
 
         if self.reduce_dim:
             total_cel_diag = jnp.kron(cel_diag, jnp.ones(stored_values["non_cel_rank"]))
         else:
             total_cel_diag = jnp.kron(cel_diag, jnp.ones(non_cel_vec.shape[-1]))
         
-        kf_quasi2D = MixingMatQuasisep(mixing_mat = stored_values["J"], kernel_list = stored_values["cel_kernel_order"],
-                                        diag = total_cel_diag, fast_dim = self.fast_dim)
+        if self.use_quasi:
+            kf_quasi2D = MixingMatQuasisep(mixing_mat = stored_values["J"], kernel_list = stored_values["cel_kernel_order"],
+                                            diag = total_cel_diag, fast_dim = self.fast_dim)
+        else:
+            kf_quasi2D = MixingMatGeneral(mixing_mat = stored_values["J"], kernel_list = stored_values["cel_kernel_order"],
+                                            diag = total_cel_diag, fast_dim = self.fast_dim)
 
         if self.reduce_dim:
             if isinstance(self.Sigma[self.fast_dim], (Identity, ScaledIdentity, Diagonal)):
@@ -158,9 +166,8 @@ class MultiTermKernel(CovType):
                 else:
                     kf_D = SingleKronTermKernel(Identity(), self.Sigma[self.fast_dim])
 
-            # print("kf_A", kf_quasi2D, "kf_D_CAB", kf_D, "dim_split", 1-self.fast_dim, "split_loc", stored_values["non_cel_rank"], "fast_dim",self.fast_dim)
             self.kf_tilde = Block2x2Kernel(kf_A = kf_quasi2D, kf_D_CAB = kf_D,
-                                           dim_split = 1-self.fast_dim, D_full = True,
+                                           dim_split = 1-self.fast_dim, A_full = True, D_full = True,
                                            split_loc = stored_values["non_cel_rank"])
         else:
             self.kf_tilde = kf_quasi2D
