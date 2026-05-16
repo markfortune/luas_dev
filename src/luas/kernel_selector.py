@@ -11,7 +11,7 @@ import luas.kernels.covtype as covtype
 from luas.kernels.covtype import CovType, Outer
 from luas.kronecker_fns import calc_data_shape
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar
-from luas.kernels import (
+from luas import (
     WhiteNoiseKernel,
     SingleKronTermKernel,
     LuasKernel,
@@ -19,23 +19,17 @@ from luas.kernels import (
     MultiTermKernel,
     MultiTermBothDimKernel,
     LuasPlusMultiTermKernel,
-    # LuasPlusMultiTermBothDimKernel,
+    LuasPlusMultiTermBothDimKernel,
     GeneralKernel,
 )
 from luas.kernels.lowrank import LowRank
 
-cov_types_1D = (covtype.General, covtype.GeneralQuasisep, covtype.Diagonal, covtype.Exp,
-                LowRank,
-                covtype.Identity, covtype.OuterPlusScaledIdentity, covtype.Outer, covtype.OuterPlusScaledIdentity)
 
-cov_type_cel_compat = (covtype.GeneralQuasisepPlusNoise, covtype.GeneralQuasisep, covtype.Exp,
-                       covtype.Diagonal, covtype.ScaledIdentity, covtype.Identity, covtype.Outer, covtype.OuterPlusScaledIdentity)
-cov_type_cel = (covtype.GeneralQuasisepPlusNoise, covtype.GeneralQuasisep, covtype.Exp)
-
-cov_types_2D = []
-Sigma2D = []
-
-
+quasisep_compatible_list = (covtype.GeneralQuasisepPlusNoise, covtype.GeneralQuasisep,
+                            covtype.Diagonal, covtype.ScaledIdentity, covtype.Identity,
+                            covtype.Outer, covtype.OuterPlusScaledIdentity)
+quasisep_cov_list =  (covtype.GeneralQuasisepPlusNoise, covtype.GeneralQuasisep)
+diag_cov_list = (covtype.Diagonal, covtype.ScaledIdentity, covtype.Identity)
 
 
 def kernel_selector(
@@ -102,7 +96,7 @@ def kernel_selector(
 
 
 
-def read_K_list(K_list, X):
+def read_K_list_2D(K_list, X):
 
     # Initialise for loop reading K_list
     dense_kron = None
@@ -153,13 +147,13 @@ def read_K_list(K_list, X):
 
 
 
-def find_best_optimisation(X, cov_form, verbose = True, max_gen_cholesky_blocks = 10,):
+def find_best_optimisation(X, cov_form, verbose = True, **kwargs):
     data_shape = calc_data_shape(X)
     dim = len(data_shape)
     print_str = ""
 
     is_singlekronterm = True
-    for d in dim:
+    for d in range(dim):
         if not isinstance(cov_form[d], covtype.CovType):
             is_singlekronterm = False
 
@@ -173,10 +167,6 @@ def find_best_optimisation(X, cov_form, verbose = True, max_gen_cholesky_blocks 
     for arg in args:
         assert len(arg) == dim
 
-    # nonkron_Sigma = (type(Sigma[0]) in Sigma2D)
-    # if not nonkron_Sigma:
-    #     assert len(Sigma) == dim
-
     if dim == 1:
         raise Exception("""One regressor specified but kernel function doesn't return a kernel.
 For 1D data make sure the kernel function kf returns a Kernel object rather than a tuple.
@@ -184,160 +174,130 @@ For >1D data make sure as many regressors are specified as kernel dimensions
 i.e. X should be a tuple the same length as the terms kf returns.""")
     
     elif dim == 2:
-        dense_kron, alpha_terms, beta_terms = read_K_list(cov_form[1:], X)
+        dense_kron, alpha_terms, beta_terms = read_K_list_2D(cov_form[1:], X)
 
-        if dense_kron is None:
-            if alpha_terms is not None and beta_terms is None:
-                return MultiTermKernel, {"fast_dim":1}
-            elif alpha_terms is None and beta_terms is not None:
-                return MultiTermKernel, {"fast_dim":0}
-            elif alpha_terms is not None and beta_terms is not None:
-                return MultiTermBothDimKernel, {}
-        else:
-            if alpha_terms is not None and beta_terms is None:
-                return RakitschPlusVecsKernel, {"fast_dim":1}
-            elif alpha_terms is None and beta_terms is not None:
-                return RakitschPlusVecsKernel, {"fast_dim":0}
-            elif alpha_terms is not None and beta_terms is not None:
-                return MultiTermBothDimKernel, {}
+
+        N_alpha = 0 if alpha_terms is None else len(alpha_terms)
+        N_beta = 0 if beta_terms is None else len(beta_terms)
 
         if data_shape[0] > data_shape[1]:
             longest_dim = 0
         else:
             longest_dim = 1
-    
-        num_terms = 1 + len(args)
 
         # Check whether there is a valid "Celerite dimension", will do nothing if args is None
-        longest_dim_celerite_compat = True
-        shortest_dim_celerite_compat = True
+        dim0_quasi_compat = True
+        dim1_quasi_compat = True
+
         for arg in args:
-            longest_dim_celerite_compat = (type(arg[longest_dim]) in cov_type_cel_compat) and longest_dim_celerite_compat
-            shortest_dim_celerite_compat = (type(arg[1 - longest_dim]) in cov_type_cel_compat) and shortest_dim_celerite_compat
+            dim0_quasi_compat = isinstance(arg[0], quasisep_compatible_list) and dim0_quasi_compat
+            dim1_quasi_compat = isinstance(arg[1], quasisep_compatible_list) and dim1_quasi_compat
 
-        if longest_dim_celerite_compat:
-            cel_dim = longest_dim
-        elif shortest_dim_celerite_compat:
-            cel_dim = 1 - longest_dim
+        valid_quasi_dim = (dim0_quasi_compat, dim1_quasi_compat)
+
+        if valid_quasi_dim[longest_dim]:
+            longest_fast_dim = longest_dim 
+        elif valid_quasi_dim[1-longest_dim]:
+            longest_fast_dim = 1-longest_dim
         else:
-            cel_dim = None
+            longest_fast_dim = None
+
+        # Determine whether Sigma is a kronecker product of diagonal matrices
+        kron_diagonal = isinstance(Sigma[0], diag_cov_list) and isinstance(Sigma[1], diag_cov_list)
         
-        if nonkron_Sigma:
-            # Optimisations where Sigma is not a Kronecker product
-            
-            if num_terms == 1:
-                if type(Sigma[0]) == covtype.Diagonal2D:
-                    print_str += "White noise, could maybe include with 1D GP case\n"
-                elif type(Sigma[0]) == covtype.Block2D:
-                    print_str += "sum of 1D GPs\n"
-                elif type(Sigma[0]) == covtype.Celerite2D:
-                    print_str += "Sortable 2D celerite opt\n"
-                elif type(Sigma[0]) == covtype.General2D:
-                    print_str += "Do general Cholesky"
-                else:
-                    print_str += "Shouldn't be able to see this!\n"
-                    
-            if num_terms > 1:
-                if cel_dim is not None:
-                    if type(Sigma[0]) == covtype.Diagonal2D:
-                        print_str += "Gordon optimisation\n"
-                    elif type(Sigma[0]) == covtype.Block2D:
-                        print_str += "Eigendecomp Blocks to be general diagonal, then Gordon opt\n"
-                    elif type(Sigma[0]) in [covtype.Celerite2D, covtype.General2D]:
-                        print_str += "Error, can't combine Celerite2D or General2D with other terms\n"
-                    else:
-                        print_str += "Shouldn't be able to see this!"
-                else:
-                    print_str += "Need one of the dimensions to be Celerite compatible if Sigma is not a Kronecker product!\n"
-                
-        else:
-
-            longest_dim_contains_cel = (type(Sigma[longest_dim]) in cov_type_cel)
-            for arg in args:
-                longest_dim_contains_cel = longest_dim_contains_cel or (type(arg[longest_dim]) in cov_type_cel)
-                        
-            if longest_dim_contains_cel and longest_dim_celerite_compat and type(Sigma[longest_dim]) in cov_type_cel_compat:
-                fully_cel_dim = longest_dim
-            elif shortest_dim_celerite_compat and type(Sigma[longest_dim-1]) in cov_type_cel_compat:
-                fully_cel_dim = 1 - longest_dim
-            else:
-                fully_cel_dim = None
-
-            
-            # Determine whether Sigma is a kronecker product of diagonal matrices
-            kron_diagonal = (type(Sigma[0]) == covtype.Diagonal) and (type(Sigma[1]) == covtype.Diagonal)
-
-            # Optimisations where Sigma is a kronecker product
-            if num_terms == 1:
-                if type(Sigma[0]) in cov_types_1D and type(Sigma[1]) in cov_types_1D:
-                    print_str += "Cholesky both\n"
-            
-            elif num_terms == 2:
-                if kron_diagonal and (type(args[0][0]) == covtype.Exp) and (type(args[0][1]) == covtype.Diag_and_Outer):
-                        print_str += "Do opt 5, cel_dim = 0\n"
-                    
-                elif kron_diagonal and (type(args[0][0]) == covtype.Diag_and_Outer) and (type(args[0][1]) == covtype.Exp):
-                        print_str += "Do opt 5, cel_dim = 1\n"
-                        
-                elif fully_cel_dim == longest_dim:
-                    print_str += "Using LuasLasrach with Celerite decomposing longest dimension\n"
-                    kernel = LuasLasrachKernel
-                    kernel_kwargs = {"cel_dim":fully_cel_dim}
-
-                elif fully_cel_dim == 1 - longest_dim:
-                    print_str += """Using Celerite on shorter dimension. This will still give the correct answer but in some cases LuasKernel may be faster, 
-    particularly when the shorter dimension is significantly shorter than the longer dimension and for complex Celerite kernels.
-    Consider setting use_kernel = LuasKernel to check if this is faster for your dataset size.\n"""
-                    kernel = LuasLasrachKernel
-                    kernel_kwargs = {"cel_dim":fully_cel_dim}
-            
-                elif data_shape[1-longest_dim] < max_gen_cholesky_blocks or type(args[0][1-longest_dim]) == covtype.Outer:
-                    print_str += "Using LuasLasrach with general cholesky decomposition on the longest dimension\n"
-                    if not type(args[0][1-longest_dim]) == covtype.Outer:
-                        print_str += """Using LuasKernel may be faster here it depends on dataset size/kernel choice.
-    You can trying switching to it by setting use_kernel = LuasKernel\n"""
-                    kernel = LuasLasrachKernel
-                    kernel_kwargs = {"cel_dim":longest_dim}
-
-                elif fully_cel_dim is None and (type(Sigma[0]) in cov_types_1D) and (type(Sigma[1]) in cov_types_1D) \
-                        and (type(args[0][0]) in cov_types_1D) and (type(args[0][1]) in cov_types_1D):
-                    print_str += "Do rakitsch\n"
-                    print_str += "There is a periodic scenario here used in PSR_celery which might work here\n"
-                    kernel = LuasKernel
-                    kernel_kwargs = {}
-
-                else:
-                    print_str += "Make sure all terms are valid luas.cov_types!\n"
-
-            elif num_terms > 2:
-                if fully_cel_dim is not None:
-                    rank_noncel_dim = 0
-                    
-                    for arg in args:
-                        # rank_noncel_dim += arg[1-cel_dim].rank(X[1-cel_dim])
-                        rank_noncel_dim += arg[1-cel_dim].rank
-                        
-                    if rank_noncel_dim < data_shape[1-cel_dim]:
-                        print_str += "Do reduced Gordon opt\n"
-                        kernel = MultiTermKernel
-                        kernel_kwargs = {"cel_dim":longest_dim}
-                    else:
-                        print_str += "Do Gordon opt, also a periodic possibility I'm ignoring here!\n"
-                        kernel = MultiTermKernel
-                else:
-                    print_str += "Can only optimise >2 terms if one of the dimensions is Celerite compatible!\n"
-                    print_str += "Try use_kernel = GeneralKernel if you would like to run without a GP optimisation, this could be very computationally expensive though!"
-            
-            else:
-                # num_terms somehow negative
-                print_str += "Definitely shouldn't be possible to see this!\n"
+        # valid_kernel_list, valid_kernel_kwarg_list = valid_kernels(dense_kron, len(alpha_terms), len(beta_terms),
+        #                                                            kron_diagonal = kron_diagonal, **kwargs)
+        use_kernel, kernel_kwargs = fastest_opt_2D(dense_kron, N_alpha, N_beta, data_shape,
+                                                   kron_diagonal = kron_diagonal, valid_quasi_dim = valid_quasi_dim,
+                                                    longest_fast_dim = longest_fast_dim, **kwargs)
     else:
         # >2D GP
         # Could also do luaslasrach but often slower for >2D
-        print_str += "For >2D currently defaults to LuasKernel but LuasLasrachKernel may be worth checking too!\n"
+        print_str += "For >2D with two Kronecker terms we currently default to LuasKernel, but LuasLasrachKernel may be worth checking too!\n"
         return LuasKernel, {}
 
     if verbose:
         print(print_str)
     
-    return kernel, kernel_kwargs
+    return use_kernel, kernel_kwargs
+
+
+
+def fastest_opt_2D(dense_kron, N_alpha, N_beta, data_shape,
+                   valid_quasi_dim = (False, False), kron_diagonal = False,
+                   longest_fast_dim = None, max_gen_cholesky_blocks = 10):
+    if data_shape[0] > data_shape[1]:
+        longest_dim = 0
+    else:
+        longest_dim = 1
+
+    kernel_kwargs = {}
+    if dense_kron:
+        if N_alpha > 0 and N_beta > 0:
+            use_kernel = LuasPlusMultiTermBothDimKernel
+        
+        elif N_alpha == 0 and N_beta == 0:
+            if longest_fast_dim is None:
+                if data_shape[1-longest_dim] < max_gen_cholesky_blocks:
+                    use_kernel = LuasLasrachKernel
+                    kernel_kwargs = {"fast_dim":longest_dim}
+                else:
+                    use_kernel = LuasKernel
+
+            elif longest_fast_dim == longest_dim:
+                use_kernel = LuasLasrachKernel
+                kernel_kwargs = {"fast_dim":longest_dim}
+            else:
+                use_kernel = LuasKernel
+
+        else:
+            use_kernel = LuasPlusMultiTermKernel
+            kernel_kwargs = {"fast_dim":N_beta > 0, "eigen_both":longest_fast_dim != longest_dim}
+    else:
+        if N_alpha > 0 and N_beta > 0:
+            use_kernel = MultiTermBothDimKernel
+
+            fast_dim = N_alpha > 0
+            if kron_diagonal and valid_quasi_dim[0] and valid_quasi_dim[1]:
+                kernel_kwargs = {"use_quasi":True}
+            else:
+                kernel_kwargs = {"use_quasi":False}
+
+        elif N_alpha == 0 and N_beta == 0:
+            use_kernel = SingleKronTermKernel
+
+        else:
+            use_kernel = MultiTermKernel
+
+            fast_dim = N_alpha > 0
+            if valid_quasi_dim[fast_dim]:
+                kernel_kwargs = {"fast_dim":fast_dim, "use_quasi":True}
+            else:
+                kernel_kwargs = {"fast_dim":fast_dim, "use_quasi":False}
+
+    return use_kernel, kernel_kwargs
+
+
+
+def valid_kernels(dense_kron, N_alpha, N_beta, longest_fast_dim = None):
+    kernel_kwarg_list = [{}]
+    if dense_kron:
+        if N_alpha > 0 and N_beta > 0:
+            use_kernels = [LuasPlusMultiTermBothDimKernel]
+        elif N_alpha == 0 and N_beta == 0:
+            use_kernels = [LuasLasrachKernel, LuasLasrachKernel, LuasKernel] # OldLuasKernel
+            kernel_kwarg_list = [{"fast_dim":0}, {"fast_dim":1}, {}] # choice, also luas kernel
+        else:
+            use_kernels = [LuasPlusMultiTermKernel, LuasPlusMultiTermKernel]
+            kernel_kwarg_list = [{"fast_dim":N_beta > 0, "eigen_both":False}, {"fast_dim":N_beta > 0, "eigen_both":True}]
+    else:
+        if N_alpha > 0 and N_beta > 0:
+            use_kernels = [MultiTermBothDimKernel]
+            kernel_kwarg_list = [{"use_quasi":False}] # {"use_quasi":True}, 
+        elif N_alpha == 0 and N_beta == 0:
+            use_kernels = [SingleKronTermKernel]
+        else:
+            use_kernels = [MultiTermKernel, MultiTermKernel]
+            kernel_kwarg_list = [{"fast_dim":N_alpha > 0, "use_quasi":True}, {"fast_dim":N_alpha > 0, "use_quasi":False}]
+
+    return use_kernels, kernel_kwarg_list

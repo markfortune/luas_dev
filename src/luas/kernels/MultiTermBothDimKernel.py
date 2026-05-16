@@ -32,6 +32,7 @@ class MultiTermBothDimKernel(CovType):
         never_reduce_dim = False,
         use_stored_values: Optional[bool] = True,
         use_quasi = True,
+        **kwargs,
     ):
         
         self.Sigma = Sigma[0], Sigma[1]

@@ -71,19 +71,16 @@ class CovType():
     def logL(self, R, **kwargs):
         return - 0.5 * self.dot_solve(R) - 0.5 * self.logdet_calc() - 0.5 * R.size * jnp.log(2*jnp.pi)
     
-    # elif isinstance(K, Outer):
-    #     K_tilde = Outer(alpha = K.alpha_init/jnp.sqrt(self.D))
+    def logL_numerically_stable(self, R, **kwargs):
+        # More numerically stable version of the log-likelihood
+        # Answer is off by a constant from true log-likelihood but this is unimportant for MCMC
+        # Keeping the log-likelihood value small improves precision in difference between two log likelihoods
+        # Data and covariance matrix need to be scaled so that log determinant is close to zero
+        L_inv_R = self.matrix_inv_sqrt(R, transpose = 0)
+        squared_res = jnp.square(L_inv_R)
+        dot_solve_val = (squared_res - 1.).sum()
     
-    # elif isinstance(K, (GeneralQuasisep, GeneralQuasisepPlusNoise)):
-    #     new_kf = ScaledKernel(kernel = K.tinygp_kf, amplitudes = 1/jnp.sqrt(self.D))
-    #     new_diag = K.diag/self.D
-    #     new_wn_diag = K.wn_diag/self.D
-
-    #     # Yet to implement for the case of a general noise model added
-    #     assert K.noise_model is None
-
-    #     K_tilde = GeneralQuasisepPlusNoise(new_kf, diag = new_diag, wn_diag = new_wn_diag, use_block = K.use_block)
-
+        return - 0.5 * dot_solve_val - 0.5 * self.logdet_calc()
 
     def inv_sqrt_transform(self, K, x, **K_kwargs):
         

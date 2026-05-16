@@ -294,6 +294,26 @@ class ConstantBlocks(Quasisep):
             same_cal = jax.lax.cond(jnp.all((X2 - self.endpoints) * (X1 - self.endpoints) >= 0.), lambda _: 1., lambda _: 0., 1.)
             return same_cal * jnp.ones((1, 1))
 
+@tinygp.helpers.dataclass
+class CubicSpline(Quasisep):
+    lambda: float
+    sigma: float = 1.
+    
+    def design_matrix(self) -> JAXArray:
+        return jnp.array([[0., 1.], [0., 0.]])
+        
+    def stationary_covariance(self) -> JAXArray:
+        return jnp.array([[self.sigma**2, 0.], [0., 0.]])
+        
+    def observation_model(self, X: JAXArray) -> JAXArray:
+        del X
+        return jnp.array([1., 0.])
+      
+    def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
+        dx = X2 - X1
+        return jax.scipy.linalg.expm(self.design_matrix() * dx)
+        # return jnp.array([[1., dx], [0., 1.]])
+
 
 @tinygp.helpers.dataclass
 class MaternHalfInt(Quasisep):

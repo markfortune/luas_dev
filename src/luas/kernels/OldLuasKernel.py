@@ -155,6 +155,7 @@ class OldLuasKernel(Kernel):
         Sigma,
         K,
         use_stored_values: Optional[bool] = True,
+        **kwargs,
     ):
         
         self.Kl = lambda x1, x2, full = True, **kwargs: K[0].evaluate(x1, x2, full = full, **kwargs)

@@ -28,6 +28,7 @@ class MultiTermKernel(CovType):
         never_reduce_dim = False,
         use_stored_values: Optional[bool] = True,
         use_quasi = True,
+        **kwargs,
     ):
         assert fast_dim is not None # Must specify the fast dimension
         self.Sigma = Sigma[0], Sigma[1]

@@ -18,7 +18,6 @@ __all__ = [
     "LuasPlusMultiTermBothDimKernel",
 ]
 
-
 class LuasPlusMultiTermBothDimKernelOld(CovType):
     
     def __init__(
@@ -26,6 +25,7 @@ class LuasPlusMultiTermBothDimKernelOld(CovType):
         Sigma,
         *K_list,
         use_stored_values: Optional[bool] = True,
+        **kwargs,
     ):
         
         self.Sigma = Sigma[0], Sigma[1]

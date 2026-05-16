@@ -7,7 +7,7 @@ import tinygp
 
 class MixingMatQuasisep(CovType):
     def __init__(self, mixing_mat, kernel_list, noise_model = None,
-                 diag = 0., wn_diag = 0., params = None, fast_dim = 1, use_block = True):
+                 diag = 0., wn_diag = 0., params = None, fast_dim = 1, use_block = True, **kwargs):
         self.mixing_mat = mixing_mat # shape [N_l, N_alpha]
         self.kernel_list = kernel_list # N_alpha list of tinygp kernel functions
         self.diag = diag

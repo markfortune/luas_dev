@@ -24,6 +24,7 @@ class SingleKronTermKernel(CovType):
         use_stored_values: Optional[bool] = False,
         data_shape: Optional[Tuple] = None,
         inv_dims: bool = False,
+        **kwargs,
     ):
 
         self.Sigma = Sigma

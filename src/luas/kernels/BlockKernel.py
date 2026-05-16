@@ -13,12 +13,23 @@ class BlockKernel(CovType):
         block_dim = 1,
         non_block_dim_size = None,
         use_stored_values: Optional[bool] = True,
+        use_pmap = False,
     ):
         
         self.Sigma = Sigma
         self.K_list = K_list
         self.block_dim = block_dim
         self.non_block_dim_size = non_block_dim_size
+        
+        if use_pmap:
+            print("pmap size", self.non_block_dim_size)
+            self.parallel_kwargs = {"devices":jax.devices()[:self.non_block_dim_size], "static_broadcasted_argnums":(2,)}
+            self.parallel_method = jax.pmap
+        else:
+            self.parallel_kwargs = {}
+            self.parallel_method = jax.vmap
+
+
 
     def evaluate(self, X1, X2, full = True, row_idx = (None, None), col_idx = (None, None), **kwargs):
         assert full == True
@@ -90,12 +101,13 @@ class BlockKernel(CovType):
             kf_block, _ = kf_block.decompose(X[self.block_dim], idx = idx[self.block_dim])
             return kf_block.logL(r)
 
-        self.matrix_inv_sqrt_calc_vmap = jax.vmap(matrix_inv_sqrt_calc, in_axes = (1-self.block_dim, 0, None),
-                                                  out_axes = (1-self.block_dim, 0))
-        self.matrix_sqrt_calc_vmap = jax.vmap(matrix_sqrt_calc, in_axes = (1-self.block_dim, 0, None),
-                                              out_axes = (1-self.block_dim, 0))
 
-        self.logL_vmap = jax.vmap(logL_calc, in_axes = (1-self.block_dim, 0))
+        self.matrix_inv_sqrt_calc_vmap = self.parallel_method(matrix_inv_sqrt_calc, in_axes = (1-self.block_dim, 0, None),
+                                                  out_axes = (1-self.block_dim, 0), **self.parallel_kwargs)
+        self.matrix_sqrt_calc_vmap = self.parallel_method(matrix_sqrt_calc, in_axes = (1-self.block_dim, 0, None),
+                                              out_axes = (1-self.block_dim, 0), **self.parallel_kwargs)
+
+        self.logL_vmap = self.parallel_method(logL_calc, in_axes = (1-self.block_dim, 0), **self.parallel_kwargs)
         
         # Really need to improve
         R_zero = jnp.zeros((self.non_block_dim_size, X[self.block_dim].shape[-1]))

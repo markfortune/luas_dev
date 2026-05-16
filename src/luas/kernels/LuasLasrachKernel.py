@@ -73,12 +73,15 @@ class LuasLasrachKernel(CovType):
         K,
         fast_dim: int | None = None,
         use_stored_values: Optional[bool] = False,
+        use_pmap = False,
+        **kwargs,
     ):
         assert fast_dim is not None # Must specify the fast_dim
         self.Sigma = Sigma
         self.K = K
         self.fast_dim = fast_dim
         self.K_list = (K,)
+        self.use_pmap = use_pmap
            
         # Have different decomposition functions depending on whether previous stored values
         # are to be used to avoid recalculating eigendecompositions
@@ -167,7 +170,7 @@ class LuasLasrachKernel(CovType):
 
         kf_dense_blocks = BlockKernel((Identity(), self.Sigma[self.fast_dim]),
                                       (Diagonal(diag = all_lam), self.K[self.fast_dim]),
-                                      non_block_dim_size = non_fast_dim_size, block_dim=1)
+                                      non_block_dim_size = non_fast_dim_size, block_dim=1, use_pmap = self.use_pmap)
         X_block = (jnp.zeros(non_fast_dim_size), X[self.fast_dim]) # all_lam is not used but is an array of the expected length
 
         # Optimised for low-rank kernels where a 2x2 block matrix is formed

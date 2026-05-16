@@ -24,6 +24,7 @@ class LuasLasrachPlusPeriodicKernel(CovType):
         period = None,
         fast_dim: int | None = None,
         use_stored_values: Optional[bool] = False,
+        **kwargs,
     ):
         assert fast_dim is not None # Must specify the fast_dim
         self.Sigma = Sigma

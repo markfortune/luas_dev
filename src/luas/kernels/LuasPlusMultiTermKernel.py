@@ -9,11 +9,61 @@ from luas.kernels.householder import orthonormal_nullspace_gen
 from luas.kernels.BlockKernel import Block2x2Kernel, BlockKernel
 from luas.kernels.GeneralKernel import GeneralKernel
 from luas.kernels.LuasKernel import LuasKernel
-from luas.kernel_selector import read_K_list
 
 __all__ = [
     "LuasPlusMultiTermKernel",
 ]
+
+
+
+def read_K_list(K_list, X):
+
+    # Initialise for loop reading K_list
+    dense_kron = None
+    alpha_list = [] # np.zeros((X[self.fast_dim].shape[-1], self.N_alpha))
+    beta_list = []
+
+    low_rank_kernels_dim0 = []
+    low_rank_kernels_dim1 = []
+    for K_i in K_list:
+        K_0 = K_i[0]
+        K_1 = K_i[1]
+
+        # rank_0 = K_0.rank(X[0])
+        # rank_1 = K_1.rank(X[1])
+
+        if isinstance(K_0, Outer) and isinstance(K_1, CovType):
+            K_0, _ = K_0.decompose(X[0])
+            alpha_list.append(K_0.alpha)
+            low_rank_kernels_dim1.append(K_1)
+
+        elif isinstance(K_0, CovType) and isinstance(K_1, Outer):
+            K_1, _ = K_1.decompose(X[1])
+            beta_list.append(K_1.alpha)
+            low_rank_kernels_dim0.append(K_0)
+
+        elif isinstance(K_0, CovType) and isinstance(K_1, CovType) and dense_kron is None:
+            dense_kron = [K_0, K_1]
+
+        elif isinstance(dense_kron, tuple):
+            raise Exception("Can only have one dense kronecker term")
+        
+        else:
+            raise Exception("All kernel terms must be valid CovType objects")
+        
+    if alpha_list:
+        alpha_mat = jnp.stack(alpha_list, axis = 1)
+        alpha_terms = (alpha_mat, low_rank_kernels_dim1)
+    else:
+        alpha_terms = None
+
+    if beta_list:
+        beta_mat = jnp.stack(beta_list, axis = 1)
+        beta_terms = (beta_mat, low_rank_kernels_dim0)
+    else:
+        beta_terms = None
+
+    return dense_kron, alpha_terms, beta_terms
 
 class LuasPlusMultiTermKernel(CovType):
     
@@ -28,6 +78,8 @@ class LuasPlusMultiTermKernel(CovType):
         transform_fn = None,
         inv_transform_fn = None,
         eigen_both = False,
+        use_pmap = False,
+        **kwargs,
     ):
         
         self.Sigma = Sigma[0], Sigma[1]
@@ -35,6 +87,7 @@ class LuasPlusMultiTermKernel(CovType):
         self.fast_dim = fast_dim
         self.eigen_both = eigen_both
         self.transform = transform
+        self.use_pmap = use_pmap
 
         if transform_fn is not None:
             self.transform_fn = transform_fn
@@ -183,7 +236,7 @@ class LuasPlusMultiTermKernel(CovType):
             # Use for LuasPlusMultiTermBothDimKernel
             self.lam_fast_A, self.Q_fast_A = kf_A_stored_values["lam_0"], kf_A_stored_values["Q_0"]
         else:
-            kf_A = BlockKernel(*K_A_kernel, non_block_dim_size = self.N_slow, block_dim=0)
+            kf_A = BlockKernel(*K_A_kernel, non_block_dim_size = self.N_slow, block_dim=0, use_pmap = self.use_pmap)
             
             kf_A, kf_A_stored_values = kf_A.decompose((X[self.fast_dim][:-self.N_alpha], X[1-self.fast_dim]),
                                                             full = False, 

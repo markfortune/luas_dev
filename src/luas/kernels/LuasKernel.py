@@ -69,6 +69,7 @@ class LuasKernel(CovType):
         Sigma,
         K,
         use_stored_values: Optional[bool] = False,
+        **kwargs,
     ):
         
         self.Sigma = Sigma
