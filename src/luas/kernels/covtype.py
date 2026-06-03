@@ -9,7 +9,7 @@ import jax.scipy.linalg as JLA
 
 import tinygp
 from tinygp.solvers.quasisep.core import SymmQSM, StrictLowerTriQSM, DiagQSM
-from luas.luas_types import Kernel, PyTree, JAXArray, Scalar, CovType, is_scalar
+from luas.luas_types import Kernel, PyTree, JAXArray, Scalar, is_scalar
 from luas.kronecker_fns import vmap_for_tensors
 import luas.kernels.tinygp_ext
 from luas.kernels.tinygp_ext import ScaledKernel, HandleIdx
@@ -64,12 +64,15 @@ class CovType():
             L_inv_R = self.matrix_inv_sqrt(R, transpose = 0)
             return jnp.square(L_inv_R).sum()
     
-    def logdet_calc(self):
-        # Defining a function makes it easier to define custom derivatives to avoid numerical stability issues
-        return self.logdet
+    # def logdet_calc(self):
+    #     # Defining a function makes it easier to define custom derivatives to avoid numerical stability issues
+    #     return self.logdet
 
     def logL(self, R, **kwargs):
-        return - 0.5 * self.dot_solve(R) - 0.5 * self.logdet_calc() - 0.5 * R.size * jnp.log(2*jnp.pi)
+        return - 0.5 * self.dot_solve(R) - 0.5 * self.logdet - 0.5 * R.size * jnp.log(2*jnp.pi)
+    
+    def logL_hessianable(self, R, **kwargs):
+        return - 0.5 * self.dot_solve(R) - 0.5 * self.logdet - 0.5 * R.size * jnp.log(2*jnp.pi)
     
     def logL_numerically_stable(self, R, **kwargs):
         # More numerically stable version of the log-likelihood

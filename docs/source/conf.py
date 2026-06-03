@@ -5,7 +5,8 @@
 
 import os
 import sys
-sys.path.insert(0, os.path.abspath('../../src/luas'))
+# Add package root so imports like ``import luas`` resolve correctly.
+sys.path.insert(0, os.path.abspath('../../src'))
 
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
@@ -18,6 +19,17 @@ release = '0.0.1'
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
+autodoc_mock_imports = [
+    'numpy',
+    'jax',
+    'jax.numpy',
+    'jax.scipy',
+    'tinygp',
+    'equinox',
+    'numpyro',
+    'pymc',
+]
+
 extensions = [
     "sphinx.ext.autodoc",
     "sphinx.ext.autosummary",
@@ -28,8 +40,16 @@ extensions = [
     "IPython.sphinxext.ipython_console_highlighting",
 ]
 myst_enable_extensions = ["dollarmath", "colon_fence"]
+autosummary_generate = False
 templates_path = ['_templates']
-exclude_patterns = []
+exclude_patterns = [
+    # Legacy API pages/stubs that reference removed or relocated symbols.
+    'GeneralKernel.rst',
+    'LuasLasrachKernelND.rst',
+    'summary/luas.GeneralKernel*.rst',
+    'summary/luas.LuasLasrachKernelND*.rst',
+    'summary/luas.GP.GP*.rst',
+]
 
 
 

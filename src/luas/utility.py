@@ -1,13 +1,12 @@
 import numpy as np
 import jax.numpy as jnp
 import jax
-from luas.exoplanet.transit_fns import transit_light_curve_vmap, ld_from_kipping
+from luas.exoplanet.transit_fns import ld_from_kipping
 from .luas_types import Kernel, PyTree, JAXArray, Scalar
 from typing import Optional, Callable, Tuple, Any
 import jax
 import jax.numpy as jnp
 from typing import Tuple
-from luas.exoplanet import transit_2D, transit_light_curve
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import astropy.units as u
@@ -114,7 +113,7 @@ eclipse_light_curve_vmap = jax.vmap(eclipse_light_curve,
                                    ) 
 
 
-def eclipse_2D(p: PyTree, x_l: JAXArray, x_t: JAXArray) -> JAXArray:
+def eclipse_2D(p: PyTree, X: tuple) -> JAXArray:
     r"""Uses ``jax.vmap`` on the ``transit_light_curve`` function to generate a 2D ``JAXArray`` of
     transit light curves for multiple wavelengths simultaneously.
     
@@ -166,7 +165,7 @@ def eclipse_2D(p: PyTree, x_l: JAXArray, x_t: JAXArray) -> JAXArray:
     
     # Use the vmap of transit_light_curve to calculate a 2D array of shape (M, N) of flux values
     # For M wavelengths and N time points.
-    return eclipse_light_curve_vmap(mfp, x_t)
+    return eclipse_light_curve_vmap(mfp, X[1])
 
 
 
@@ -416,46 +415,6 @@ def harmonica_2D(p, x_l, x_t):
 
 
 
-def transit_2D_c_interp(p: PyTree, x_l: JAXArray, x_t: JAXArray, x_l_interp = None) -> JAXArray:
-    """Uses vmap of transit_light_curve function to generate a 2D JAXArray of transit light curves for multiple wavelengths simultaneously.
-    Input limb darkening parameters are assumed to follow the Kipping (2013) parameterisation and are converted to standard limb darkening coefficients.
-    Also assumed that the transit depth d = rho^2 is being input which is then converted to radius ratio values
-    
-    Args:
-        par (PyTree): The transit parameters stored in a PyTree/dictionary with values for:
-            T0: Central transit time
-            P: Period
-            a: Semi-major axis to stellar radius ratio (a/Rs)
-            d: Transit depth (Rp/Rs)^2
-            b: Impact parameter
-            u1: First quadratic limb-darkening parameter in Kipping (2013) parameterisation
-            u2: Second quadratic limb-darkening parameter in Kipping (2013) parameterisation
-            Foot: Baseline flux out-of-transit
-            Tgrad: Linear trend in baseline flux
-        x_t (JAXArray): Array of times to calculate the light curve at.
-            
-    Returns:
-        JAXArray: Array of flux values for each time input.
-        
-    """
-    
-    # vmap requires that we only input the parameters which have been explicitly defined how they vectorise
-    transit_params = ["T0", "P", "a", "b", "Foot", "Tgrad"]
-    mfp = {k:p[k] for k in transit_params}
-    
-    # Calculate the radius ratio rho from the transit depth d
-    mfp["rho"] = jnp.sqrt(p["d"])
-    
-    u1 = jnp.interp(x_l, x_l_interp, p["u1"])
-    u2 = jnp.interp(x_l, x_l_interp, p["u2"])
-    
-    # Calculate limb darkening coefficients from the Kipping (2013) parameterisation.
-    mfp["c1"], mfp["c2"] = ld_from_kipping(u1, u2)
-    
-    # Use the vmap of transit_light_curve to calculate a 2D array of shape (M, N) of flux values
-    # For M wavelengths and N time points.
-    return transit_light_curve_vmap(mfp, x_t)
-
 
 def bin_data(x_l, x_t, Y, l_bin, t_bin):
     N_l = Y.shape[0]
@@ -553,42 +512,6 @@ def build_kronecker_K(
         return K_kron
     
 
-def transit_2D_multivar(p: PyTree, x_l: JAXArray, x_t: JAXArray) -> JAXArray:
-    """Uses vmap of transit_light_curve function to generate a 2D JAXArray of transit light curves for multiple wavelengths simultaneously.
-    Input limb darkening parameters are assumed to follow the Kipping (2013) parameterisation and are converted to standard limb darkening coefficients.
-    Also assumed that the transit depth d = rho^2 is being input which is then converted to radius ratio values
-    
-    Args:
-        par (PyTree): The transit parameters stored in a PyTree/dictionary with values for:
-            T0: Central transit time
-            P: Period
-            a: Semi-major axis to stellar radius ratio (a/Rs)
-            d: Transit depth (Rp/Rs)^2
-            b: Impact parameter
-            u1: First quadratic limb-darkening parameter in Kipping (2013) parameterisation
-            u2: Second quadratic limb-darkening parameter in Kipping (2013) parameterisation
-            Foot: Baseline flux out-of-transit
-            Tgrad: Linear trend in baseline flux
-        x_t (JAXArray): Array of times to calculate the light curve at.
-            
-    Returns:
-        JAXArray: Array of flux values for each time input.
-        
-    """
-    
-    # vmap requires that we only input the parameters which have been explicitly defined how they vectorise
-    transit_params = ["T0", "P", "a", "b", "Foot", "Tgrad"]
-    mfp = {k:p[k] for k in transit_params}
-    
-    # Calculate the radius ratio rho from the transit depth d
-    mfp["rho"] = jnp.sqrt(p["d"])
-    
-    # Calculate limb darkening coefficients from the Kipping (2013) parameterisation.
-    mfp["c1"], mfp["c2"] = ld_from_kipping(p["u1"], p["u2"])
-    
-    # Use the vmap of transit_light_curve to calculate a 2D array of shape (M, N) of flux values
-    # For M wavelengths and N time points.
-    return transit_light_curve_vmap(mfp, x_t[0, :])
 
     
 # This code may be faster for full covariance calc for LuasKernel but need to reorder matrix more efficiently 
@@ -755,39 +678,3 @@ import jax
 print(jax.devices())
 """
 
-
-
-transit_light_curve_vmap_T0 = jax.vmap(transit_light_curve,
-                                    in_axes=({
-                                        # Parameters to be shared between all wavelengths
-                                        "T0":0, "P":None, "a":None, "b":None, 
-                                        
-                                        # Parameters to be separate for each wavelength
-                                        "rho":0, "u1":0, "u2":0, "Foot":0, "Tgrad":0}, 
-                                        
-                                        # Array of timestamps to be the same for each wavelength
-                                        None, 
-                                        ), 
-                                    # Will output extra flux values for each light curve as additional rows
-                                    out_axes = 0 
-                                   ) 
-
-
-
-def transit_2D_T0(p: PyTree, x_l: JAXArray, x_t: JAXArray) -> JAXArray:
-    
-    # vmap requires that we only input the parameters which have been explicitly defined how they vectorise
-    transit_params = ["T0", "P", "a", "b", "Foot", "Tgrad"]
-    mfp = {k:p[k] for k in transit_params}
-    
-    # Calculate the radius ratio rho from the transit depth d
-    mfp["rho"] = jnp.sqrt(p["d"])
-    
-    mfp["T0"] += -(mfp["rho"] - mfp["rho"].mean())*p["r1"]
-    
-    # Calculate limb darkening coefficients from the Kipping (2013) parameterisation.
-    mfp["u1"], mfp["u2"] = ld_from_kipping(p["q1"], p["q2"])
-    
-    # Use the vmap of transit_light_curve to calculate a 2D array of shape (M, N) of flux values
-    # For M wavelengths and N time points.
-    return transit_light_curve_vmap_T0(mfp, x_t)

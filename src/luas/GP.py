@@ -13,7 +13,6 @@ from luas.kernel_selector import kernel_selector
 from luas.kernels.covtype import CovType, General
 from luas.luas_types import Scalar, PyTree, JAXArray, Kernel
 from luas.kronecker_fns import calc_data_shape
-from luas import WhiteNoiseKernel, SingleKronTermKernel, GeneralKernel
 from luas.jax_convenience_fns import (
     array_to_pytree_2D,
     pytree_to_array_2D,
@@ -22,6 +21,8 @@ from luas.jax_convenience_fns import (
     transf_from_unbounded_params,
     transf_to_unbounded_params,
     varying_params_wrapper,
+    get_corr_mat,
+    check_params_in_bounds,
 )
 
 __all__ = ["GP"]
@@ -83,16 +84,21 @@ class GP(object):
         **kernel_kwargs,
     ):
         self.x = X
-        self.dim = len(X)
+
+        if isinstance(X, tuple):
+            self.dim = len(X)
+        else:
+            self.dim = 1
         self.data_shape = calc_data_shape(self.x)
         
         # Specify kernel function and include any args or kwargs needed
-        if kf is not None:
-            if isinstance(kf_args, tuple) and isinstance(kf_kwargs, dict):
-                self.kf = lambda p, X, **kwargs: kf(p, X, *kf_args, **kf_kwargs, **kwargs)
-            else:
-                raise Exception("""kf_args must be a Tuple and kf_kwargs must be a dict.
-                                   For a single argument use kf_args = (arg1,)""")
+        if isinstance(kf, CovType) or kf is None:
+            self.kf = kf
+        elif isinstance(kf_args, tuple) and isinstance(kf_kwargs, dict):
+            self.kf = lambda p, X, **kwargs: kf(p, X, *kf_args, **kf_kwargs, **kwargs)
+        else:
+            raise Exception("""kf_args must be a Tuple and kf_kwargs must be a dict.
+                                For a single argument use kf_args = (arg1,)""")
 
         # Specify mean function and include any args or kwargs needed
         if mf is None:
@@ -111,11 +117,11 @@ class GP(object):
         # Specify logprior function and include any args or kwargs needed
         if logPrior is None:
             # Log Prior function returns zero by default
-            self.logPrior = lambda p: 0.
+            self.logPrior = lambda p, X: 0.
         else:
             # Custom logPrior function which must take only a single argument p
             if isinstance(logPrior_args, tuple) and isinstance(logPrior_kwargs, dict):
-                self.logPrior = lambda p: logPrior(p, *logPrior_args, **logPrior_kwargs)
+                self.logPrior = lambda p, X: logPrior(p, X, *logPrior_args, **logPrior_kwargs)
             else:
                 raise Exception("""logPrior_args must be a Tuple and logPrior_kwargs must be a dict.
                                    For a single argument use logPrior_args = (arg1,)""")
@@ -132,6 +138,8 @@ class GP(object):
             # Note that NumPyro will perform JIT compilation anyway but PyMC will not
             self.logL = jax.jit(self.logL)
             self.logP = jax.jit(self.logP)
+            self.logL_stored = jax.jit(self.logL_stored)
+            self.logP_stored = jax.jit(self.logP_stored)
             self.logL_hessianable = jax.jit(self.logL_hessianable)
             self.logP_hessianable = jax.jit(self.logP_hessianable)
     
@@ -139,7 +147,7 @@ class GP(object):
     def sample(self, p, add_mf = True, **kwargs):
 
         self.kf = self.build_kf(p, self.x)
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {"R_shape":self.data_shape})
+        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})
 
         z = np.random.normal(size = self.data_shape)
         R = self.kf.matrix_sqrt(z, **kwargs)
@@ -177,6 +185,93 @@ class GP(object):
         logL_val = self.kf.logL(R, stored_values = stored_values)
         
         return logL_val
+    
+
+    def pymc_model(
+        self,
+        p: PyTree,
+        Y: JAXArray,
+        param_bounds: PyTree = {},
+        vars: Optional[list] = None,
+        fixed_vars: Optional[list] = None,
+        bound_tol = 1e-9,
+    ):
+        # Lazy import to avoid PyMC being a dependency unless needed
+        from luas.pymc_ext import build_pymc_model
+
+        # This function returns a PyTree p_vary which has only the (key, value) pairs of
+        # parameters being varied
+        # make_p is also returned which is a function with returns the parameters in p_vary
+        # with all fixed parameters added back in
+        p_vary, make_p = varying_params_wrapper(p, vars = vars, fixed_vars = fixed_vars)
+        p_fixed = {k:v for (k, v) in p.items() if k not in p_vary.keys()}
+        
+        ordered_param_list = order_list(list(p_vary.keys()))
+
+        p_vary = check_params_in_bounds(p_vary, param_bounds)
+
+        print(f"Varying parameters: {ordered_param_list}\nFixed parameters: {list(p_fixed.keys())}")
+
+        # build a PyMC model for optimisation and inference
+        model, var_dict = build_pymc_model(self, p_vary, Y, ordered_param_list, p_fixed = p_fixed, param_bounds = param_bounds)
+        
+        return model, var_dict, p_vary
+
+
+
+    def optimise(self, p_init, Y, param_bounds = {}, vars = [], fixed_vars = [], maxeval = 5000, include_transformed = False):
+        import pymc as pm
+
+        pymc_model, var_dict, p_pymc = self.pymc_model(p_init, Y, param_bounds = param_bounds, fixed_vars = fixed_vars)
+
+        # Use PyMC's maximum posteriori optimisation function
+        map_estimate = pm.find_MAP(
+            model = pymc_model,               # PyMC model to optimise
+            include_transformed = include_transformed, # If this is true it will also output the PyMC transformed values of bounded parameters
+            start = p_pymc,              # Starting point of optimisations
+            maxeval = maxeval,             # Maximum steps to run (normally will converge before this)
+        )
+
+        # Create a new dictionary of optimised values which includes our fixed parameters
+        p_opt = deepcopy(p_init)
+        p_opt.update(map_estimate)
+
+        return p_opt
+    
+
+    def transform_fn(
+        self,
+        p: PyTree,
+        Y: JAXArray,
+        inverse = True,
+        transpose = 0,
+    ) -> Scalar:
+        """Computes the log likelihood without returning any stored values from the
+        decomposition of the covariance matrix.
+        
+        Args:
+            p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
+                in addition to any mean function parameters which may be needed to calculate the mean function.
+            Y (JAXArray): Observed data to fit, must be of shape ``(N_l, N_t)``.
+        
+        Returns:
+            Scalar: The value of the log likelihood.
+            
+        """
+        
+        # Calculate the residuals after subtraction of the deterministic mean function
+        R = Y - self.mf(p, self.x)
+        self.kf = self.build_kf(p, self.x)
+        
+        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})
+        
+        if inverse:
+            logL_val = self.kf.inv_transform_fn(R, transpose = transpose)
+        else:
+            logL_val = self.kf.transform_fn(R, transpose = transpose)
+        
+        return logL_val
+
 
 
     def apply_inverse(
@@ -345,9 +440,10 @@ class GP(object):
         R = Y - self.mf(p,  self.x)
         
         self.kf = self.build_kf(p, self.x)
-        logL, stored_values = self.kf.logL(p, self.x, R, stored_values)
+        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})  
+        logL_val = self.kf.logL(R, stored_values = stored_values)
     
-        return logL, stored_values
+        return logL_val, stored_values
 
     
     def logP(
@@ -368,14 +464,19 @@ class GP(object):
             Scalar: The value of the log posterior.
             
         """
-        
-        logL = self.logL(p, Y)
-        logPrior = self.logPrior(p)
-        logP = logPrior + logL
+
+        R = Y - self.mf(p,  self.x)
+
+        self.kf = self.build_kf(p, self.x)
+        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})  
+        logL_val = self.kf.logL(R, stored_values = stored_values)
+
+        logPrior = self.logPrior(p, self.x)
+        logP = logPrior + logL_val
         
         return logP
 
-    
+
     def logP_stored(
         self,
         p: PyTree,
@@ -411,11 +512,12 @@ class GP(object):
         
         R = Y - self.mf(p,  self.x)
         
-        self.kf = self.build_kf(p, self.x)        
-        logL, stored_values = self.kf.logL(p,  self.x, R, stored_values)
-        
-        logPrior = self.logPrior(p)
-        logP = logPrior + logL
+        self.kf = self.build_kf(p, self.x)
+        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})  
+        logL_val = self.kf.logL(R, stored_values = stored_values)
+
+        logPrior = self.logPrior(p, self.x)
+        logP = logPrior + logL_val
         
         return logP, stored_values
 
@@ -552,7 +654,7 @@ class GP(object):
     
     
     
-    def predict_new(self, p, x_l, x_t, Y,
+    def predict_new(self, p, X_obs, Y,
                 p_pred = None,
                 x_l_pred = None, x_t_pred = None,
                 interp_params_dim1 = [], interp_params_dim2 = [],
@@ -567,13 +669,12 @@ class GP(object):
         if p_pred is None:
             p_pred = deepcopy(p_obs)
     
-        N_l = x_l.shape[-1]
-        N_t = x_t.shape[-1]
+        N_l = X_obs[0].shape[-1]
+        N_t = X_obs[1].shape[-1]
 
-        x_obs = (x_l, x_t)
     
         # Calculate mean function at observed locations
-        M_obs = self.mf(p_obs, x_obs)
+        M_obs = self.mf(p_obs, X_obs)
         
         pred_loc_equals_obs = False
         if x_l_pred is None and x_t_pred is None:
@@ -581,19 +682,19 @@ class GP(object):
             pred_loc_equals_obs = True
             
             if fast_dim is None:
-                x_l_pred = x_l.copy()
+                x_l_pred = X_obs[0].copy()
             elif fast_dim == 0:
-                x_l_pred = x_l.copy()
+                x_l_pred = X_obs[0].copy()
             elif fast_dim == 1:
-                x_t_pred = x_t.copy()
+                x_t_pred = X_obs[1].copy()
             else:
                 raise Exception("fast_dim keyword argument must be None, 0 or 1")
     
         # Stack observed and predicted locations together for each dimension
         # Works out location of predicted and observed locations within array
         # Will sort the total stacked regression variables if requested, necessary for celerite dimensions
-        x_l_total, x_l_pred, obs_points_l, pred_points_l, sort_fn_l = stack_obs_and_pred_points(x_l, x_l_pred, sort = sort_l)
-        x_t_total, x_t_pred, obs_points_t, pred_points_t, sort_fn_t = stack_obs_and_pred_points(x_t, x_t_pred, sort = sort_t)
+        x_l_total, x_l_pred, obs_points_l, pred_points_l, sort_fn_l = stack_obs_and_pred_points(X_obs[0], x_l_pred, sort = sort_l)
+        x_t_total, x_t_pred, obs_points_t, pred_points_t, sort_fn_t = stack_obs_and_pred_points(X_obs[1], x_t_pred, sort = sort_t)
 
         x_total = (x_l_total, x_t_total)
         x_pred = (x_l_pred, x_t_pred)
@@ -612,10 +713,10 @@ class GP(object):
             predicted_ind = jnp.ix_(jnp.arange(N_l_total), jnp.arange(N_t_total))
             
         
-        p_pred = interp_params(p_obs, p_pred, x_l, x_l_pred,
+        p_pred = interp_params(p_obs, p_pred, X_obs[0], x_l_pred,
                                interp_param = interp_params_dim1,
                                interp_row = interp_row_l)
-        p_pred = interp_params(p_obs, p_pred, x_t, x_t_pred,
+        p_pred = interp_params(p_obs, p_pred, X_obs[1], x_t_pred,
                                interp_param = interp_params_dim2,
                                interp_row = interp_row_t)
     
@@ -634,8 +735,8 @@ class GP(object):
         # GP mean calculation
         R = Y - M_obs
 
-        self.kf = self.build_kf(p_obs, x_obs)
-        self.kf, stored_values = self.kf.decompose(x_obs)
+        self.kf = self.build_kf(p_obs, X_obs)
+        self.kf, stored_values = self.kf.decompose(X_obs)
         K_inv_R = self.kf.matrix_inv_sqrt(R)
         
         K_inv_R_to_mult = jnp.zeros((N_l_total, N_t_total))
@@ -647,14 +748,14 @@ class GP(object):
         gp_mean_pred = M_pred + Ks_Kinv_R_term[predicted_ind]
 
         if sample:
-            K_pred_draw = self.sample_conditional(p_obs, x_obs, p_total, x_total, observed_ind)
+            K_pred_draw = self.sample_conditional(p_obs, X_obs, p_total, x_total, observed_ind)
             K_pred_draw = gp_mean_pred + K_pred_draw[predicted_ind]
     
             if not return_predicted_loc:
                 K_pred_draw = K_pred_draw.at[observed_ind].set(0.)
 
         if return_K_pred_inv:
-            self.kf_total, stored_values_total = self.kf_total.decompose(x_obs)
+            self.kf_total, stored_values_total = self.kf_total.decompose(X_obs)
             
             def K_pred_inv_fn(R):
                 R_pred = R.at[observed_ind].set(0.)
@@ -973,9 +1074,10 @@ class GP(object):
         
         # Calculate log likelihood and stored values from decomposition
         self.kf = self.build_kf(p, self.x)
-        logL, stored_values = self.kf.logL_hessianable(p, self.x, R, {})
+        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})  
+        logL_val = self.kf.logL_hessianable(R, stored_values = stored_values)
         
-        return logL
+        return logL_val
 
     
     def logL_hessianable_stored(
@@ -1007,12 +1109,12 @@ class GP(object):
         
         # Subtract mean function from observed data
         R = Y - self.mf(p, self.x)
-        
-        # Calculate log likelihood and stored values from decomposition
+
         self.kf = self.build_kf(p, self.x)
-        logL, stored_values = self.kf.logL_hessianable(p, self.x, R, {})
+        self.kf, stored_values = self.kf.decompose(self.x, stored_values = stored_values)  
+        logL_val = self.kf.logL_hessianable(R, stored_values = stored_values)
     
-        return logL, stored_values
+        return logL_val, stored_values
     
     
     def logP_hessianable(
@@ -1037,12 +1139,13 @@ class GP(object):
             
         """
         
-        logPrior = self.logPrior(p)
+        logPrior = self.logPrior(p, self.x)
         R = Y - self.mf(p, self.x)
         
         self.kf = self.build_kf(p, self.x)
-        logL, stored_values = self.kf.logL_hessianable(p, self.x, R, {})
-        logP = logPrior + logL
+        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})  
+        logL_val = self.kf.logL_hessianable(R, stored_values = stored_values)
+        logP = logPrior + logL_val
         
         return logP
 
@@ -1082,10 +1185,11 @@ class GP(object):
         R = Y - self.mf(p, self.x)
 
         self.kf = self.build_kf(p, self.x)
-        logL, stored_values = self.kf.logL_hessianable(p, self.x, R, stored_values)
+        self.kf, stored_values = self.kf.decompose(self.x, stored_values = stored_values)  
+        logL_val = self.kf.logL_hessianable(R, stored_values = stored_values)
         
-        logPrior = self.logPrior(p)
-        logP = logPrior + logL
+        logPrior = self.logPrior(p, self.x)
+        logP = logPrior + logL_val
         
         return logP, stored_values
     
@@ -1096,7 +1200,7 @@ class GP(object):
         p: PyTree,
         Y: PyTree,
         regularise: Optional[bool] = True,
-        regularise_const: Optional[Scalar] = 100.,
+        regularise_const: Optional[Scalar] = 1e-10,
         vars: Optional[list] = None,
         fixed_vars: Optional[list] = None, 
         return_array: Optional[bool] = False,
@@ -1197,63 +1301,18 @@ class GP(object):
         # Help symmetrise matrix which can help mitigate numerical errors
         hessian_mat = (hessian_mat + hessian_mat.T)/2.
         
-        # Performs the actual Laplace approximation by inverting the negative hessian
-        cov_mat = jnp.linalg.inv(-hessian_mat)
-        
         if regularise:
-            # Test if the diagonals of the covariance matrix are positive
-            cov_diag = jnp.diag(cov_mat)
-            neg_ind = cov_diag < 0.
-            num_neg_diag_vals = neg_ind.sum()
-            
-            if num_neg_diag_vals == 0:
-                print("No regularisation needed to remove negative values along diagonal of covariance matrix.")
-            else:
-                # Subtract regularise_const from the diagonal hessian elements which correspond to negative
-                # values in the covariance matrix which will help to regularise for large enough regularise_const
-                regularise_vec = regularise_const*neg_ind
-                hessian_mat -= jnp.diag(regularise_vec)
+            hess_eigvals, eigvecs = jnp.linalg.eigh(hessian_mat)
+            eigvals = -1/hess_eigvals
 
-                # Calculate the new Laplace approximation with regularisation
-                cov_mat = jnp.linalg.inv(-hessian_mat)
-
-                # Help to describe which values were regularised
-                # Identifies which parameters the negative diagonal elements correspond to
-                p_arr, make_p_dict = ravel_pytree(p_vary)
-                regularised_values = make_p_dict(neg_ind)
-
-                # Only include values which needed to be regularised when printing
-                for par in p_vary.keys():
-                    if not jnp.any(regularised_values[par]):
-                        del regularised_values[par]
-
-                # Check if there are any remaining negative values along the diagonal of the covariance matrix
-                cov_diag = jnp.diag(cov_mat)
-                neg_ind = cov_diag < 0.
-                num_neg_diag_vals_remaining = neg_ind.sum()
-                
-                if num_neg_diag_vals_remaining > 0:
-                    # Identify which parameters are still resulting in negatives along the diagonal
-                    values_still_negative = make_p_dict(neg_ind)
-                    
-                    # Only include values which still need to be regularised when printing
-                    for par in p_vary.keys():
-                        if not jnp.any(values_still_negative[par]):
-                            del values_still_negative[par]
-                            
-                    print(f"Initial number of negative values on diagonal of covariance matrix = {num_neg_diag_vals}\n" \
-                          f"Corresponding to parameters: {regularised_values}.\n" \
-                          f"Remaining number of negative values = {num_neg_diag_vals_remaining}\n" \
-                          f"Corresponding to parameters: {values_still_negative}.\n"
-                          f"Try increasing regularise_const to ensure the covariance matrix is positive definite " \
-                          f"or double check that the input parameters are close to a best-fit location."
-                         )
-                else:
-                    print(f"Initial number of negative values on diagonal of covariance matrix = {num_neg_diag_vals}\n" \
-                          f"Corresponding to parameters: {regularised_values}.\n" \
-                          f"No remaining negative values."
-                         )
+            epsilon = jnp.max(jnp.abs(eigvals))*regularise_const
+            eigvals_clipped = jnp.maximum(eigvals, epsilon)
+            cov_mat = eigvecs @ jnp.diag(eigvals_clipped) @ eigvecs.T
+        else:
+            # Performs the actual Laplace approximation by inverting the negative hessian
+            cov_mat = jnp.linalg.inv(-hessian_mat)
         
+
         # Generate the list which gives the order of the parameters in the covariance matrix
         ordered_param_list = order_list(list(p_vary.keys()))
         
@@ -1326,6 +1385,9 @@ class GP(object):
         # make_p is also returned which is a function with returns the parameters in p_vary
         # with all fixed parameters added back in
         p_vary, make_p = varying_params_wrapper(p, vars = vars, fixed_vars = fixed_vars)
+
+        # Check that parameters to be varied are actually within the specified bounds
+        p_vary = check_params_in_bounds(p_vary, param_bounds)
         
         # Transform the parameters being varied to the transformed values which are sampled by
         # PyMC and NumPyro
@@ -1379,6 +1441,7 @@ class GP(object):
         wn: Optional[bool] = True,
         x_plot: Optional[JAXArray] = None,
         full: Optional[bool] = False,
+        axes_labels = None,
         return_fig = False,
     ) -> plt.Figure:
         r"""Visualise the covariance matrix/matrices generated by the input hyperparameters.
@@ -1427,6 +1490,9 @@ class GP(object):
             for d in range(self.dim):
                 if x_plot[d].ndim != 1:
                     x_plot[d] = x_plot[d][0]
+
+        if axes_labels is None:
+            axes_labels = [rf"$x_{d+1}$" for d in range(self.dim)]
         
         fig, ax = plt.subplots(N_kron_terms, self.dim, figsize = (5*self.dim, 5*N_kron_terms), squeeze=False)
 
@@ -1440,18 +1506,8 @@ class GP(object):
             for i in range(N_kron_terms-1):
                 K_list[-1].append(self.kf.K_list[i][d].evaluate(self.x[d], self.x[d], wn = wn, full = True))
 
-        # if full:
-        #     # Plot full covariance matrix K
-        #     # Warning: Can be very memory intensive as it builds an array with (N_l*N_t)**2 entries
-        #     K = 0
-        #     for i in range(N_kron_terms):
-        #         K += jnp.kron(Kl_list[i], Kt_list[i])
-            
-        #     if corr:
-        #         K = get_corr_mat(K)
-                
-        #     fig = plt.imshow(K)
-            
+        if full:
+            raise Exception("Plotting full covariance matrix not implemented")
         else:
             # Individually plot each of the 4 component covariance matrices
 
@@ -1467,8 +1523,8 @@ class GP(object):
                     else:
                         ax[i][d].set_title(rf"K$_d$$_{d+1}$[{i}]")
                         
-                    ax[i][d].set_ylabel(rf"$x_{d+1}$")
-                    ax[i][d].set_xlabel(rf"$x_{d+1}$")
+                    ax[i][d].set_ylabel(axes_labels[d])
+                    ax[i][d].set_xlabel(axes_labels[d])
                     
                     img1 = ax[i][d].pcolormesh(x_plot[d], x_plot[d], K_list[d][i])
                     ax[i][d].invert_yaxis()
@@ -1479,13 +1535,32 @@ class GP(object):
         if return_fig:
             return fig
 
+    def gp_mean_calc(
+            self,
+            p,
+            Y,
+            return_mf = False,
+    ):
+        # Perform GP regression at the observed data locations
+        M = self.mf(p, self.x)
+        
+        res = Y - M
+        K_inv_R = self.apply_inverse(p, res)
+        gp_mean = M + self.matmul(p, K_inv_R, wn = False, full = True)
+
+        if return_mf:
+            return gp_mean, M
+        else:
+            return gp_mean
     
+
     def plot(
         self,
         p: PyTree,
         Y: JAXArray,
         x_plot = None,
         return_fig = False,
+        return_fit = False,
         axes_labels = [r"$x_1$", r"$x_2$"],
         **kwargs,
     ) -> plt.Figure:
@@ -1517,23 +1592,22 @@ class GP(object):
         # If x_l or x_t contain multiple rows then pick the first row
         if x_plot is None:
             x_plot = ()
-            for x in self.x:
-                if x.ndim == 1:
-                    x_plot += (x.copy(),)
-                else:
-                    x_plot += (x[0, :],)
+            if self.dim == 1:
+                x_plot = (self.x,)
+            else:
+                for x in self.x:
+                    if x.ndim == 1:
+                        x_plot += (x.copy(),)
+                    else:
+                        x_plot += (x[0, :],)
     
         # Perform GP regression at the observed data locations
-        M = self.mf(p, self.x)
-        
-        res = Y - M
-        K_inv_R = self.apply_inverse(p, res)
-        gp_mean = M + self.matmul(p, K_inv_R, wn = False, full = True)
+        gp_mean, M = self.gp_mean_calc(p, Y, return_mf = True)
         
         fig = plt.figure(figsize = (20, 5))
 
         if self.dim == 1:
-            ax = fig.subplots(1, 4, sharey = False)
+            ax = fig.subplots(1, 4, sharey = True)
         else:
             ax = fig.subplots(1, 4, sharey = True)
         
@@ -1588,6 +1662,8 @@ class GP(object):
 
         if return_fig:
             return fig
+        elif return_fit:
+            return gp_mean, M
     
     
     

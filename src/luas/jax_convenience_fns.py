@@ -6,6 +6,7 @@ from tqdm import tqdm
 from copy import deepcopy
 from typing import Callable, Optional, Tuple, Union
 from .luas_types import PyTree, JAXArray
+import warnings
 
 __all__ = [
     "get_corr_mat",
@@ -44,6 +45,34 @@ def get_corr_mat(cov_mat: JAXArray, zero_diag: Optional[bool] = False) -> JAXArr
         corr_mat = corr_mat*(1 - jnp.eye(corr_mat.shape[0]))
         
     return corr_mat
+
+
+def check_params_in_bounds(p, param_bounds, bound_tol = 1e-9):
+    p_new = deepcopy(p)
+
+    # Check if values are all within bounds
+    for par in p.keys():
+        if par in param_bounds.keys():
+            ind_below = p[par] <= param_bounds[par][0]
+            ind_above = p[par] >= param_bounds[par][1]
+
+            # Check params are above lower bounds
+            if jnp.any(ind_below):
+                if jnp.all((p[par][ind_below] + bound_tol) > param_bounds[par][0][ind_below]):
+                    # Do small adjustment to correct numerical jitter errors
+                    warnings.warn(f"Input parameter {par} at indices {np.arange(p[par].size)[ind_below]} at lower prior bound and shifted inside by +{bound_tol}", UserWarning)
+                    p_new[par][ind_below] += bound_tol
+                else:
+                    raise ValueError(f"Parameter {par} is below param_bounds at indices {np.arange(p[par].size)[ind_below]}. Value: {p[par]}, Bounds: {param_bounds[par]}")
+            
+            # Check params are below upper bounds
+            if jnp.any(ind_above):
+                if jnp.all((p[par][ind_above] - bound_tol) < param_bounds[par][1][ind_above]):
+                    warnings.warn(f"Input parameter {par} at indices {np.arange(p[par].size)[ind_above]} at upper prior bound and shifted inside by -{bound_tol}", UserWarning)
+                    p_new[par][ind_above] -= bound_tol
+                else:
+                    raise ValueError(f"Parameter {par} is out of param_bounds at indices {np.arange(p[par].size)[ind_above]}. Value: {p[par]}, Bounds: {param_bounds[par]}")
+    return p_new
 
 
 def order_list(par_list: list) -> list:
@@ -232,6 +261,11 @@ def varying_params_wrapper(
         
     if vars is None and fixed_vars is not None:
         # If just fixed_vars specified
+
+        for par in fixed_vars:
+            # Check all specified fixed_vars are actually in p
+            assert par in p.keys()
+            
         p_vary = {par:to_array(p[par]) for par in p.keys() if par not in fixed_vars}
         
     elif vars is None and fixed_vars is None:

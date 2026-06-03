@@ -8,7 +8,7 @@ from luas.kronecker_fns import tensor_mult, vmap_for_tensors, cyclic_transpose
 from luas.kernels.householder import orthonormal_nullspace_gen
 from luas.kernels.BlockKernel import Block2x2Kernel, BlockKernel
 from luas.kernels.GeneralKernel import GeneralKernel
-from luas.kernels.LuasKernel import LuasKernel
+from luas.src.luas.kernels.LuasKernelND import LuasKernel
 from luas.kernels.MultiTermKernel import MultiTermKernel
 from luas.kernels.LuasPlusMultiTermKernel import LuasPlusMultiTermKernel
 from luas.kernel_selector import read_K_list

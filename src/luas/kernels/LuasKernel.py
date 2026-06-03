@@ -2,23 +2,109 @@ import numpy as np
 import matplotlib.pyplot as plt
 import jax.numpy as jnp
 import jax
-from jax import grad, value_and_grad, hessian, vmap, custom_jvp, jit, lax
-from jax.flatten_util import ravel_pytree
 from copy import deepcopy
 from tqdm import tqdm
 from typing import Callable, Tuple, Union, Any, Optional
 from functools import partial
 
-from luas.kernels.covtype import CovType, Outer
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar
-from luas.kronecker_fns import kron_prod, calc_total_size, cyclic_transpose, vmap_for_tensors, tensor_mult
-from luas.kernels.WhiteNoiseKernel import WhiteNoiseKernel
+from luas.kronecker_fns import kron_prod
+from luas.stable_gradients import logdetK_calc, r_K_inv_r, K_inv_vec, logdetK_calc_hessianable
+from luas.kernels.covtype import Identity, ScaledIdentity, Diagonal
 
 __all__ = [
-    "LuasKernelNew",
+    "diag_eigendecomp",
+    "decomp_S",
+    "decomp_K_tilde",
+    "LuasKernel",
 ]
 
-class LuasKernel(CovType):
+def diag_eigendecomp(K: JAXArray) -> Tuple[JAXArray, JAXArray]:
+    r"""Calculates the eigenvalues and eigenvectors of a matrix ``K`` assuming it is diagonal.
+    Can be significantly faster than ``jax.numpy.linalg.eigh`` if a matrix is known in advance to be diagonal.
+    
+    Args:
+        K (JAXArray): The matrix to decompose
+        
+    Returns:
+        (JAXArray, JAXArray): Returns a tuple of the eigenvalues and eigenvector matrix of ``K``.
+    
+    """
+    return jnp.diag(K), jnp.eye(K.shape[0])
+
+
+def decomp_S(
+    S: JAXArray,
+    eigen_fn: Optional[Callable] = jnp.linalg.eigh
+) -> Tuple[JAXArray, JAXArray]:
+    r"""Calculates the eigenvalues and matrix inverse square root of a matrix ``S``. Needs to be performed
+    on the ``Sl`` and ``St`` matrices for log likelihood calculations with the :class:`LuasKernel`.
+    
+    Args:
+        S: The matrix to decompose.
+        eigen_fn: The function to use to solve for the eigenvalues and eigenvectors of ``S``.
+        
+    Returns:
+        (JAXArray, JAXArray): Returns a tuple of the eigenvalues as well as the matrix inverse square root
+        of ``S``.
+    
+    """
+    
+    # Solve for eigenvalues and eigenvectors
+    lam_S, Q_S = eigen_fn(S)
+    
+    # Calculate the matrix inverse square root
+    S_inv_sqrt = Q_S @ jnp.diag(jnp.sqrt(jnp.reciprocal(lam_S)))
+
+    return lam_S, S_inv_sqrt
+
+
+def decomp_K_tilde(
+    K: JAXArray,
+    S_inv_sqrt: JAXArray,
+    eigen_fn: Optional[Callable] = jnp.linalg.eigh
+) -> Tuple[JAXArray, JAXArray]:
+    r"""Creates the transformed matrix ``K_tilde`` from ``K`` and the matrix inverse square root of ``S``. 
+    Then calculates the eigendecomposition of ``K_tilde``. Finally calculates the required ``W`` matrices.
+    Returns the eigenvalues of ``K_tilde`` and the calculated ``W`` matrix. Needs to be separately performed on the
+    ``Kl`` and ``Kt`` matrices for log likelihood calculations with the :class:`LuasKernel`.
+    
+    For ``K = Kl`` this function will solve for ``Kl_tilde`` using:
+    
+    .. math::
+    
+        \tilde{K}_l = (S_l^{-\frac{1}{2}})^T K_l S_l^{-\frac{1}{2}}
+    
+    Then eigendecompose ``Kl_tilde`` and calculate the required ``W_l`` matrix with:
+    
+    .. math::
+        W_l = S_l^{-\frac{1}{2}} Q_{\tilde{K}_l}
+    
+    and similarly for ``K = Kt``.
+    
+    Args:
+        S: The matrix to decompose.
+        eigen_fn: The function to use to solve for the eigenvalues and eigenvectors of ``S``.
+        
+    Returns:
+        (JAXArray, JAXArray): Returns a tuple of the eigenvalues and eigenvectors of the transformed matrix
+        ``K_tilde``.
+    
+    """
+    
+    # Solve K_tilde
+    K_tilde = S_inv_sqrt.T @ K @ S_inv_sqrt
+    
+    # Eigendecompose K_tilde
+    lam_K_tilde, Q_K_tilde = eigen_fn(K_tilde)
+    
+    # Calculate the required W matrix
+    W = S_inv_sqrt @ Q_K_tilde
+
+    return lam_K_tilde, W
+
+
+class LuasKernel(Kernel):
     r"""Kernel class which solves for the log likelihood for any covariance matrix which
     is the sum of two kronecker products of the covariance matrix in each of two dimensions
     i.e. the full covariance matrix K is given by:
@@ -68,138 +154,398 @@ class LuasKernel(CovType):
         self,
         Sigma,
         K,
-        use_stored_values: Optional[bool] = False,
+        use_stored_values: Optional[bool] = True,
         **kwargs,
     ):
         
+        self.Kl = lambda x1, x2, full = True, **kwargs: K[0].evaluate(x1, x2, full = full, **kwargs)
+        self.Kt = lambda x1, x2, full = True, **kwargs: K[1].evaluate(x1, x2, full = full, **kwargs)
+        self.Sl = lambda x1, x2, full = True, **kwargs: Sigma[0].evaluate(x1, x2, full = full, **kwargs)
+        self.St = lambda x1, x2, full = True, **kwargs: Sigma[1].evaluate(x1, x2, full = full, **kwargs)
+
         self.Sigma = Sigma
-        self.K = K
-        self.dim = len(Sigma)
-        
         self.K_list = [K]
-           
+
+        for i in range(2):
+            S_i = [self.Sl, self.St][i]
+            K_i = [self.Kl, self.Kt][i]
+            if isinstance(S_i, (Identity, ScaledIdentity, Diagonal)):
+                S_i.decomp = diag_eigendecomp
+
+                if isinstance(K_i, (Identity, ScaledIdentity, Diagonal)):
+                    K_i.decomp = diag_eigendecomp
+                else:
+                    K_i.decomp = jnp.linalg.eigh
+            else:
+                S_i.decomp = jnp.linalg.eigh
+                K_i.decomp = jnp.linalg.eigh
+
         # Have different decomposition functions depending on whether previous stored values
         # are to be used to avoid recalculating eigendecompositions
-        if use_stored_values == True:
-            raise Exception("Use of stored_values not yet implemented in this version of luas")
+        if use_stored_values:
+            self.decompose = self.eigendecomp_use_stored_values
         else:
             self.decompose = self.eigendecomp_no_stored_values
-    
-    def evaluate(self, X, **kwargs):
 
-        dim = len(X)
-        Sigma = self.Sigma[0].evaluate(X[0], X[0], **kwargs)
-        
-        for d in range(1, dim):
-            Sigma = jnp.kron(Sigma, self.Sigma[d].evaluate(X[d], X[d], **kwargs))
-        
-        K = self.K[0].evaluate(X[0], X[0], **kwargs)
-        for d in range(1, dim):
-            K = jnp.kron(K, self.K[d].evaluate(X[d], X[d], **kwargs))
-        
-        Sigma += K
-        
-        return Sigma
+        # Specify how each of the 4 matrices will be decomposed
+        self.Sl_decomp_fn = lambda Sl: decomp_S(Sl, eigen_fn = self.Sl.decomp)
+        self.St_decomp_fn = lambda St: decomp_S(St, eigen_fn = self.St.decomp)
+        self.Kl_tilde_decomp_fn = lambda Kl, Sl_inv_sqrt: decomp_K_tilde(Kl, Sl_inv_sqrt, eigen_fn = self.Kl.decomp)
+        self.Kt_tilde_decomp_fn = lambda Kt, St_inv_sqrt: decomp_K_tilde(Kt, St_inv_sqrt, eigen_fn = self.Kt.decomp)
+
     
     def eigendecomp_no_stored_values(
         self,
-        X: Tuple,
-        stored_values: Optional[PyTree] = None,
-        full = True,
-        idx = None,
-        **kwargs,
+        X: tuple,
+        stored_values: Optional[PyTree] = {},
     ) -> PyTree:
-
-        stored_values = {} if stored_values is None else stored_values
-
-        if stored_values:
-            R_shape = stored_values["R_shape"]
-            total_size = jnp.prod(jnp.array(R_shape))
-        else:
-            total_size = calc_total_size(X)
-
-        if idx is None:
-            idx = (None,)*self.dim
+        r"""Required calculations for the decomposition of the overall matrix ``K`` where the previously
+        stored decomposition of ``K`` cannot be used for the calculation of a new decomposition.
+        This avoids checking if any of the matrices have changed but may result in performing the
+        same eigendecomposition calculations multiple times.
         
-        gp_dim = len(X)
+        We can decompose the inverse of ``K`` into the matrices:
 
-        self.sigma_decomp_mats = ()
-        self.eigen_decomp_mats = ()
-        all_lam = jnp.ones(1)
-        all_lam_shape = ()
-        stored_values["logdet"] = 0.
-
-        for d in range(gp_dim):
-            Sigma_d_new, stored_values_d = self.Sigma[d].decompose(X[d], full = full, idx = idx[d])
-
-            if isinstance(self.K[d], Outer):
-                K_d, _ = self.K[d].decompose(X[d], full = full, idx = idx[d])
-            else:
-                K_d = self.K[d]
-            
-            K_d_new = Sigma_d_new.inv_sqrt_transform(K_d, X[d])
-            
-            if gp_dim > 2:
-                Sigma_d_new.matrix_sqrt = vmap_for_tensors(Sigma_d_new.matrix_sqrt)
-                Sigma_d_new.matrix_inv_sqrt = vmap_for_tensors(Sigma_d_new.matrix_inv_sqrt)
-                K_d_new.matrix_sqrt = vmap_for_tensors(K_d_new.matrix_sqrt)
-                K_d_new.matrix_inv_sqrt = vmap_for_tensors(K_d_new.matrix_inv_sqrt)
-            
-            stored_values[f"lam_{d}"], stored_values[f"Q_{d}"] = K_d_new.eigendecomp(X[d], full = full, idx = idx[d])
-            
-            all_lam = jnp.kron(all_lam.reshape(all_lam_shape + (1,)), stored_values[f"lam_{d}"])
-            all_lam_shape = all_lam.shape
-            
-            self.sigma_decomp_mats += (Sigma_d_new,)
-            self.eigen_decomp_mats += (stored_values[f"Q_{d}"],)
-            stored_values["logdet"] += (total_size/X[d].shape[-1])*stored_values_d["logdet"]
-
-        K_tilde_diag = all_lam + 1
+        .. math::
         
-        self.kf_tilde = WhiteNoiseKernel(diag = K_tilde_diag, wn_diag = 0.)
-        self.kf_tilde, stored_values["kf_tilde_stored"] = self.kf_tilde.decompose(X)
+            K^{-1} = [W_l \otimes W_t] D^{-1} [W_l^T \otimes W_t^T]
+        
+        Where this function will calculate ``W_l``, ``W_t`` and ``D_inv`` and stored them in the
+        ``stored_values`` PyTree for future log likelihood calculations.
+        
+        Note:
+            Values still need to be stored for any log likelihood calculations so this method does
+            not save memory over ``eigendecomp_use_stored_values``. It may however reduce runtimes
+            by avoiding checking if matrices have changed so it could be beneficial if all hyperparameters
+            are being varied simultaneously for each calculation.
+            
+        
+        Args:
+            hp (Pytree): Hyperparameters needed to build the covariance matrices
+                ``Kl``, ``Kt``, ``Sl``, ``St``. Will be unaffected if additional mean function
+                parameters are also included.
+            x_l (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
+                for the observed locations. May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l``
+                different wavelength/vertical regression variables.
+            x_t (JAXArray): Array containing time/horizontal dimension regression variable(s) for the
+                observed locations. May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different
+                time/horizontal regression variables.
+            stored_values (PyTree): This may contain stored values from the decomposition of ``K`` but
+                this method will not make use of it. This dictionary will simply be overwritten with
+                new stored values from the decomposition of ``K``.
+        
+        Returns:
+            PyTree: Stored values from the decomposition of the covariance matrices. For
+            :class:`LuasKernel` this consists of values computed using the eigendecomposition
+            of each matrix and also the log determinant of ``K``.
+        
+        """
 
-        stored_values["logdet"] += stored_values["kf_tilde_stored"]["logdet"]
-        self.logdet = stored_values["logdet"]
+        x_l, x_t = X[0], X[1]
+        
+        # Calculate each of the four component matrices and decompose them into the required matrices for log likelihood calculations
+        stored_values["Sl"] = self.Sl(x_l, x_l)
+        stored_values["lam_Sl"], stored_values["Sl_inv_sqrt"] = self.Sl_decomp_fn(stored_values["Sl"])
 
+        stored_values["St"] = self.St(x_t, x_t)
+        stored_values["lam_St"], stored_values["St_inv_sqrt"] = self.St_decomp_fn(stored_values["St"])
+
+        # See decomp_K_tilde for how W_l and the eigenvalues of Kl_tilde are calculated
+        stored_values["Kl"] = self.Kl(x_l, x_l)
+        stored_values["lam_Kl_tilde"], stored_values["W_l"] = self.Kl_tilde_decomp_fn(stored_values["Kl"], stored_values["Sl_inv_sqrt"])
+        
+        stored_values["Kt"] = self.Kt(x_t, x_t)
+        stored_values["lam_Kt_tilde"], stored_values["W_t"] = self.Kt_tilde_decomp_fn(stored_values["Kt"], stored_values["St_inv_sqrt"])
+
+        # D is needed for calculation the log determinant of K
+        D = jnp.outer(stored_values["lam_Kl_tilde"], stored_values["lam_Kt_tilde"]) + 1.
+        
+        # D^-1 is needed for calculating K^-1 r
+        stored_values["D_inv"] = jnp.reciprocal(D)
+
+        # Computes the log determinant of K
+        lam_S = jnp.outer(stored_values["lam_Sl"], stored_values["lam_St"])
+        stored_values["logdetK"] = jnp.log(jnp.multiply(D, lam_S)).sum()
+
+        self.stored_values = stored_values
+        
         return self, stored_values
 
-
-    def transform_fn(self, R, transpose = 0):
+    
+    def eigendecomp_use_stored_values(
+        self,
+        X: tuple,
+        stored_values: Optional[PyTree] = {},
+        rtol: Optional[Scalar] = 1e-12,
+        atol: Optional[Scalar] = 1e-12,
+    ) -> PyTree:
+        r"""Required calculations for the decomposition of the overall matrix ``K`` where the previously
+        stored decomposition of ``K`` may be used for the calculation of a new decomposition.
+        This checking if any of the matrices have changed and if they are similar within the given
+        tolerances a previously computed eigendecomposition can be used to avoid recalculating it.
+        This can provide significant runtime savings if some hyperparameters are being kept fixed
+        including if blocked Gibbs sampling is being used on groups of hyperparameters.
         
-        R_prime = cyclic_transpose(R, 2)
+        We can decompose the inverse of ``K`` into the matrices:
 
-        if transpose:
-            for d in range(self.dim):
-                R_prime = self.sigma_decomp_mats[d].matrix_sqrt(R_prime, transpose = 1)
-                R_prime = self.eigen_decomp_mats[d].T @ R_prime
-                R_prime = cyclic_transpose(R_prime, 1)
-        else:
-            for d in range(self.dim):
-                R_prime = self.eigen_decomp_mats[d] @ R_prime
-                R_prime = self.sigma_decomp_mats[d].matrix_sqrt(R_prime, transpose = 0)
-                R_prime = cyclic_transpose(R_prime, 1)
+        .. math::
+        
+            K^{-1} = [W_l \otimes W_t] D^{-1} [W_l^T \otimes W_t^T]
+        
+        Where this function will calculate ``W_l``, ``W_t`` and ``D_inv`` and stored them in the
+        stored_values PyTree for future log likelihood calculations.
+        
+        Args:
+            hp (Pytree): Hyperparameters needed to build the covariance matrices
+                ``Kl``, ``Kt``, ``Sl``, ``St``. Will be unaffected if additional mean function
+                parameters are also included.
+            x_l (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
+                for the observed locations. May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l``
+                different wavelength/vertical regression variables.
+            x_t (JAXArray): Array containing time/horizontal dimension regression variable(s) for the
+                observed locations. May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different
+                time/horizontal regression variables.
+            stored_values (PyTree): Stored values from the decomposition of the covariance matrices. For
+                :class:`LuasKernel` this consists of values computed using the eigendecomposition
+                of each matrix and also the log determinant of ``K``.
+            rtol (Scalar): The relative tolerance value any of the component covariance matrices
+                must be within in order for the matrix to be considered unchanged and stored values for
+                its decomposition to be used.
+            atol (Scalar): The absolute tolerance values any of the component covariance matrices
+                must be within in order for the matrix to be considered unchanged and stored values for
+                its decomposition to be used.
+        
+        Returns:
+            PyTree: Stored values from the decomposition of the covariance matrices. For
+            :class:`LuasKernel` this consists of values computed using the eigendecomposition
+            of each matrix and also the log determinant of ``K``.
+        
+        """
 
-        R_prime = cyclic_transpose(R_prime, -2)
+        stored_values = deepcopy(stored_values)
+        x_l, x_t = X[0], X[1]
+        
+        # Calculate each of the four component matrices
+        Sl = self.Sl(x_l, x_l)
+        St = self.St(x_t, x_t)
+        Kl = self.Kl(x_l, x_l)
+        Kt = self.Kt(x_t, x_t)
+        
+        if stored_values:
+            # Check if any of the 4 component matrices have changed from their values in stored_values
             
-        return R_prime
-
-
-    def inv_transform_fn(self, R, transpose = 0):
-        R_prime = cyclic_transpose(R, 2)
-
-        if transpose:
-            for d in range(self.dim):
-                R_prime = self.eigen_decomp_mats[d] @ R_prime
-                R_prime = self.sigma_decomp_mats[d].matrix_inv_sqrt(R_prime, transpose = 1)
-                R_prime = cyclic_transpose(R_prime, 1)
+            # Note JAX requires the two possible outputs of the conditional to be functions
+            # so we use functions which just return True or False
+            Sl_diff = jax.lax.cond(jnp.allclose(Sl, stored_values["Sl"], rtol = rtol, atol = atol),
+                                   lambda : False, lambda : True)
+            St_diff = jax.lax.cond(jnp.allclose(St, stored_values["St"], rtol = rtol, atol = atol),
+                                   lambda : False, lambda : True)
+            
+            # Note that if Sl is different than Kl_tilde is also almost certainly different
+            # so even if Kl hasn't changed we still need to recompute the decomposition of Kl_tilde and similarly for Kt
+            Kl_tilde_diff = jax.lax.cond(jnp.allclose(Kl, stored_values["Kl"], rtol = rtol, atol = atol),
+                                        lambda : Sl_diff, lambda : True)
+            Kt_tilde_diff = jax.lax.cond(jnp.allclose(Kt, stored_values["Kt"], rtol = rtol, atol = atol),
+                                        lambda : St_diff, lambda : True)
         else:
-            for d in range(self.dim):
-                R_prime = self.sigma_decomp_mats[d].matrix_inv_sqrt(R_prime, transpose = 0)
-                R_prime = self.eigen_decomp_mats[d].T @ R_prime
-                R_prime = cyclic_transpose(R_prime, 1)
+            Sl_diff = St_diff = Kl_tilde_diff = Kt_tilde_diff = True
+            
+            N_l = x_l.shape[-1]
+            N_t = x_t.shape[-1]
+            
+            # JAX requires that the two outputs of any conditional statements have the same shape
+            # so must define matrices of same shape as their actual values even though they will be overwritten
+            stored_values["lam_Sl"] = jnp.zeros(N_l)
+            stored_values["Sl_inv_sqrt"] = jnp.zeros((N_l, N_l))
+            stored_values["lam_St"] = jnp.zeros(N_t)
+            stored_values["St_inv_sqrt"] = jnp.zeros((N_t, N_t))
+            stored_values["lam_Kl_tilde"] = jnp.zeros(N_l)
+            stored_values["W_l"] = jnp.zeros((N_l, N_l))
+            stored_values["lam_Kt_tilde"] = jnp.zeros(N_t)
+            stored_values["W_t"] = jnp.zeros((N_t, N_t))
 
-        R_prime = cyclic_transpose(R_prime, -2)
+
+        # For each of the 4 component matrices conditionally decompose them if they have changed since the last calculation
+        stored_values["lam_Sl"], stored_values["Sl_inv_sqrt"] = jax.lax.cond(Sl_diff,
+                                                                           self.Sl_decomp_fn,
+                                                                           lambda *args: (stored_values["lam_Sl"],
+                                                                                          stored_values["Sl_inv_sqrt"]),
+                                                                           Sl)
+        
+        stored_values["lam_St"], stored_values["St_inv_sqrt"] = jax.lax.cond(St_diff,
+                                                                           self.St_decomp_fn,
+                                                                           lambda *args: (stored_values["lam_St"], 
+                                                                                          stored_values["St_inv_sqrt"]),
+                                                                           St)
+
+        stored_values["lam_Kl_tilde"], stored_values["W_l"] = jax.lax.cond(Kl_tilde_diff,
+                                                                         self.Kl_tilde_decomp_fn,
+                                                                         lambda *args: (stored_values["lam_Kl_tilde"],
+                                                                                        stored_values["W_l"]),
+                                                                         Kl, stored_values["Sl_inv_sqrt"])
+
+        stored_values["lam_Kt_tilde"], stored_values["W_t"] = jax.lax.cond(Kt_tilde_diff,
+                                                                         self.Kt_tilde_decomp_fn,
+                                                                         lambda *args: (stored_values["lam_Kt_tilde"],
+                                                                                        stored_values["W_t"]),
+                                                                         Kt, stored_values["St_inv_sqrt"])
+
+        # D is needed for calculation the log determinant of K
+        D = jnp.outer(stored_values["lam_Kl_tilde"], stored_values["lam_Kt_tilde"]) + 1.
+        
+        # D^-1 is needed for calculating K^-1 r
+        stored_values["D_inv"] = jnp.reciprocal(D)
+
+        # Computes the log determinant of K
+        lam_S = jnp.outer(stored_values["lam_Sl"], stored_values["lam_St"])
+        stored_values["logdetK"] = jnp.log(jnp.multiply(D, lam_S)).sum()
+
+        # Store in order to perform checks for the next call of this function
+        stored_values["Sl"] = Sl
+        stored_values["St"] = St
+        stored_values["Kl"] = Kl
+        stored_values["Kt"] = Kt
+
+        self.stored_values = stored_values
+
+        return self, stored_values
+    
+    
+    def logL(
+        self,
+        R: JAXArray,
+        stored_values = {},
+    ) -> Tuple[Scalar, PyTree]:
+        """Computes the log likelihood using the method originally presented in Rakitsch et al. (2013)
+        and also outlined in Fortune at al. (2024). Also returns stored values from the matrix decomposition.
+        
+        Note:
+            Calculating the hessian of this function with ``jax.hessian`` may not produce numerically stable
+            results. ``LuasKernel.logL_hessianable`` is recommended is values of the hessian are needed.
+            This method typically outperforms ``LuasKernel.logL_hessianable`` in runtime for gradient
+            calculations however.
+        
+        Args:
+            hp (Pytree): Hyperparameters needed to build the covariance matrices
+                ``Kl``, ``Kt``, ``Sl``, ``St``. Will be unaffected if additional mean function
+                parameters are also included.
+            x_l (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
+                for the observed locations. May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l``
+                different wavelength/vertical regression variables.
+            x_t (JAXArray): Array containing time/horizontal dimension regression variable(s) for the
+                observed locations. May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different
+                time/horizontal regression variables.
+            R (JAXArray): Residuals to be fit calculated from the observed data by subtracting the deterministic
+                mean function. Must have the same shape as the observed data (N_l, N_t).
+            stored_values (PyTree): Stored values from the decomposition of the covariance matrices. For
+                :class:`LuasKernel` this consists of values computed using the eigendecomposition
+                of each matrix and also the log determinant of ``K``.
+        
+        Returns:
+            (Scalar, PyTree): A tuple where the first element is the value of the log likelihood.
+            The second element is a PyTree which contains stored values from the decomposition of the
+            covariance matrix.
+            
+        """
+
+        # Calculate the decomposition of K
+        # stored_values = self.decomp_fn(hp, x_l, x_t, stored_values = stored_values)
+        
+        # Use functions with custom derivatives to accurately calculate the log
+        # likelihood and its gradient
+        rKr = r_K_inv_r(R, stored_values)
+        logdetK = logdetK_calc(stored_values)
+        logL = - 0.5 * logdetK - 0.5 * R.size * jnp.log(2*jnp.pi) -0.5 * rKr 
+
+        return  logL
+
+    
+    def logL_hessianable(
+        self,
+        R: JAXArray,
+        stored_values = {},
+    ) -> Tuple[Scalar, PyTree]:
+        """Computes the log likelihood using the method originally presented in Rakitsch et al. (2013)
+        and also outlined in Fortune at al. (2024).
+        
+        Note:
+            The hessian of this log likelihood function can be calculated using ``jax.hessian`` and
+            should be more numerically stable for this than ``LuasKernel.logL``.
+            However, this function is slower for calculating the gradients of the log likelihood so
+            ``LuasKernel.logL`` is preferred unless the hessian is needed. Also returns stored values
+            from the matrix decomposition.
+        
+        Args:
+            hp (Pytree): Hyperparameters needed to build the covariance matrices
+                ``Kl``, ``Kt``, ``Sl``, ``St``. Will be unaffected if additional mean function
+                parameters are also included.
+            x_l (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
+                for the observed locations. May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l``
+                different wavelength/vertical regression variables.
+            x_t (JAXArray): Array containing time/horizontal dimension regression variable(s) for the
+                observed locations. May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different
+                time/horizontal regression variables.
+            R (JAXArray): Residuals to be fit calculated from the observed data by subtracting the deterministic
+                mean function. Must have the same shape as the observed data (N_l, N_t).
+            stored_values (PyTree): Stored values from the decomposition of the covariance matrices. For
+                :class:`LuasKernel` this consists of values computed using the eigendecomposition
+                of each matrix and also the log determinant of ``K``.
+                
+        Returns:
+            (Scalar, PyTree): A tuple where the first element is the value of the log likelihood.
+            The second element is a PyTree which contains stored values from the decomposition of the
+            covariance matrix.
+        
+        """
+        
+        # Use functions with custom derivatives to accurately calculate the log
+        # likelihood, its gradient and hessian
+        rKr = r_K_inv_r(R, stored_values)
+        logdetK = logdetK_calc_hessianable(stored_values)
+        logL =  -0.5 * rKr - 0.5 * logdetK  - 0.5 * R.size * jnp.log(2*jnp.pi)
+
+        return  logL
+
+    def matrix_inv_sqrt(
+        self,
+        R: JAXArray,
+        transpose = 0,
+    ) -> JAXArray:
+        r"""Generate noise with the covariance matrix returned by this kernel using the input
+        hyperparameters ``hp``.
+        
+        Solves for the matrix square root of K and then multiplies this by a random normal vector.
+        Doing it this way has numerical stability advantages over generating noise separately for
+        each of the two kronecker products of K as they might not both be well-conditioned matrices.
+        
+        Args:
+            hp (Pytree): Hyperparameters needed to build the covariance matrices
+                ``Kl``, ``Kt``, ``Sl``, ``St``. Will be unaffected if additional mean function
+                parameters are also included.
+            x_l (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
+                for the observed locations. May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l``
+                different wavelength/vertical regression variables.
+            x_t (JAXArray): Array containing time/horizontal dimension regression variable(s) for the
+                observed locations. May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different
+                time/horizontal regression variables.
+            size (int, optional): The number of different draws of noise to generate. Defaults to 1.
+            wn (bool, optional): Whether to include white noise when generating noise. Must have
+                a `wn` keyword argument in all kernel functions ``Kl``, ``Kt``, ``Sl``, ``St``.
+                
+        Returns:
+            JAXArray: If ``size = 1`` will generate noise of shape ``(N_l, N_t)``, otherwise if ``size > 1`` then
+            generated noise will be of shape ``(N_l, N_t, size)``.
+        
+        """
+        D_inv_sqrt = jnp.sqrt(self.stored_values["D_inv"])
+        
+        if transpose:
+            R_prime = jnp.multiply(D_inv_sqrt, R)
+            R_prime = kron_prod(self.stored_values["W_l"], self.stored_values["W_t"], R_prime)
+        else:
+            R_prime = kron_prod(self.stored_values["W_l"].T, self.stored_values["W_t"].T, R)
+            R_prime = jnp.multiply(D_inv_sqrt, R_prime)
+
         return R_prime
 
 
@@ -208,102 +554,161 @@ class LuasKernel(CovType):
         R: JAXArray,
         transpose = 0,
     ) -> JAXArray:
+        r"""Generate noise with the covariance matrix returned by this kernel using the input
+        hyperparameters ``hp``.
+        
+        Solves for the matrix square root of K and then multiplies this by a random normal vector.
+        Doing it this way has numerical stability advantages over generating noise separately for
+        each of the two kronecker products of K as they might not both be well-conditioned matrices.
+        
+        Args:
+            hp (Pytree): Hyperparameters needed to build the covariance matrices
+                ``Kl``, ``Kt``, ``Sl``, ``St``. Will be unaffected if additional mean function
+                parameters are also included.
+            x_l (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
+                for the observed locations. May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l``
+                different wavelength/vertical regression variables.
+            x_t (JAXArray): Array containing time/horizontal dimension regression variable(s) for the
+                observed locations. May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different
+                time/horizontal regression variables.
+            size (int, optional): The number of different draws of noise to generate. Defaults to 1.
+            wn (bool, optional): Whether to include white noise when generating noise. Must have
+                a `wn` keyword argument in all kernel functions ``Kl``, ``Kt``, ``Sl``, ``St``.
+                
+        Returns:
+            JAXArray: If ``size = 1`` will generate noise of shape ``(N_l, N_t)``, otherwise if ``size > 1`` then
+            generated noise will be of shape ``(N_l, N_t, size)``.
+        
+        """
+
+        # Computes the sqrt of the diagonal matrix D
+        D_half = jnp.sqrt(jnp.outer(self.stored_values["lam_Kl_tilde"], self.stored_values["lam_Kt_tilde"]) + 1.)
 
         if transpose:
-            R_prime = self.transform_fn(R, transpose = 1)
-            R_prime = self.kf_tilde.matrix_sqrt(R_prime, transpose = 1)
+            R_prime = kron_prod(self.stored_values["Sl"], self.stored_values["St"], R)
+            R_prime = kron_prod(self.stored_values["W_l"].T, self.stored_values["W_t"].T, R_prime)
+            R_prime = jnp.multiply(D_half, R_prime)
         else:
-            R_prime = self.kf_tilde.matrix_sqrt(R, transpose = 0)
-            R_prime = self.transform_fn(R_prime, transpose = 0)
-        
+            R_prime = jnp.multiply(D_half, R)
+            R_prime = kron_prod(self.stored_values["W_l"], self.stored_values["W_t"], R_prime)
+            R_prime = kron_prod(self.stored_values["Sl"], self.stored_values["St"], R_prime)
+
         return R_prime
 
 
-    def matrix_inv_sqrt(
+    def evaluate(
+        self,
+        X1,
+        X2,
+        **kwargs,
+    ) -> JAXArray:
+        r"""Generates the full covariance matrix K formed from the sum of two kronecker products:
+        
+        .. math::
+
+            K = K_l \otimes K_t + S_l \otimes S_t
+        
+        Not needed for any calculations with the ``LuasKernel`` but useful for creating a :class:`GeneralKernel`
+        object with the same kernel function as a :class:`LuasKernel`.
+        
+        Args:
+            hp (Pytree): Hyperparameters needed to build the covariance matrices
+                ``Kl``, ``Kt``, ``Sl``, ``St``. Will be unaffected if additional mean function
+                parameters are also included.
+            x_l1 (JAXArray): The first array containing wavelength/vertical dimension regression variable(s)
+                for the observed locations. May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l``
+                different wavelength/vertical regression variables.
+            x_l2 (JAXArray): Second array containing wavelength/vertical dimension regression variable(s).
+            x_t1 (JAXArray): The first array containing time/horizontal dimension regression variable(s) for the
+                observed locations. May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different
+                time/horizontal regression variables.
+            x_t2 (JAXArray): Second array containing time/horizontal dimension regression variable(s).
+        
+        Returns:
+            JAXArray: The full covariance matrix K of shape ``(N_l*N_t, N_l*N_t)``.
+        
+        """
+        x_l1, x_t1 = X1[0], X1[1]
+        x_l2, x_t2 = X2[0], X2[1]
+
+        # Build 4 component matrices
+        Kl = self.Kl({}, x_l1, x_l2, **kwargs)
+        Kt = self.Kt({}, x_t1, x_t2, **kwargs)
+        Sl = self.Sl({}, x_l1, x_l2, **kwargs)
+        St = self.St({}, x_t1, x_t2, **kwargs)
+        
+        K = jnp.kron(Kl, Kt) + jnp.kron(Sl, St)
+        
+        return K
+    
+    
+    
+    def inverse(
         self,
         R: JAXArray,
-        transpose = 0,
     ) -> JAXArray:
-
-        if transpose:
-            R_prime = self.kf_tilde.matrix_inv_sqrt(R, transpose = 1)
-            R_prime = self.inv_transform_fn(R_prime, transpose = 1)
-        else:
-            R_prime = self.inv_transform_fn(R, transpose = 0)
-            R_prime = self.kf_tilde.matrix_inv_sqrt(R_prime, transpose = 0)
+        r"""Calculates the product of the inverse of the covariance matrix with a vector, represented by
+        a JAXArray of shape ``(N_l, N_t)``. Useful for testing for numerical stability.
         
-        return R_prime
-
-    def matmul(self, X1, X2, R, **kwargs):
-
-        K_R = tensor_mult(self.Sigma, X1, X2, R, **kwargs)
-        K_R += tensor_mult(self.K, X1, X2, R, **kwargs)
+        Args:
+            hp (Pytree): Hyperparameters needed to build the covariance matrices
+                ``Kl``, ``Kt``, ``Sl``, ``St``. Will be unaffected if additional mean function
+                parameters are also included.
+            x_l (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
+                for the observed locations. May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l``
+                different wavelength/vertical regression variables.
+            x_t (JAXArray): Array containing time/horizontal dimension regression variable(s) for the
+                observed locations. May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different
+                time/horizontal regression variables.
+            R (JAXArray): JAXArray of shape ``(N_l, N_t)`` representing the vector to multiply on the right by
+                the inverse of the covariance matrix ``K``.
+                
+        Returns:
+            JAXArray: The result of multiplying the inverse of the covariance matrix ``K`` by the vector ``R``.
         
-        return K_R
-
-    def fast_LA(self, D_tensor, b_mat, stored_values, vec_dim = 1):
+        """
         
-        assert self.dim == 2
-        
-        N_b, N_l, N_t = D_tensor.shape
-
-        assert b_mat.shape == (N_b, D_tensor.shape[vec_dim+1])
-
-        b_vecs_transf = self.sigma_decomp_mats[vec_dim].matrix_inv_sqrt(b_mat.T, transpose = 0)
-        b_vecs_transf = (self.eigen_decomp_mats[vec_dim].T @ b_vecs_transf).T
-
-        block_dot_solve_vmap = jax.vmap(jax.vmap(self.kf_tilde.block_dot_solve, in_axes = (0, None, None)), in_axes = (None, 0, None))
-        diag_tilde_tensor = self.kf_tilde.block_dot_solve(b_vecs_transf, b_vecs_transf, vec_dim)
-
-        def D_transform_fn(D_tensor):
-            D_tensor_tilde = cyclic_transpose(D_tensor, 2)
-            for d in range(gp_dim):
-                if d != vec_sim:
-                    D_tensor_tilde = self.sigma_decomp_mats[vec_dim].matrix_inv_sqrt(D_tensor_tilde)
-                    D_tensor_tilde = self.eigen_decomp_mats[vec_dim].T @ D_tensor_tilde
-                    D_tensor_tilde = cyclic_transpose(D_tensor_tilde, 1)
-            D_tensor_tilde = cyclic_transpose(D_tensor_tilde, -2)
-
-            return D_tensor_tilde
-
-        D_tensor_tilde = jax.vmap(D_transform_fn, in_axes = 0)(D_tensor)
-
-        T_tilde = jnp.tensordot(diag_tilde_tensor, D_tensor_tilde, axes = ([0], [0]))
-        TKT = jnp.tensordot(D_tensor_tilde.T, T_tilde, axes = ([0], [0]))
-        
-
-        # Calc celerite block inverse times each time vector
-        b_vecs = jnp.kron(b_mat, jnp.ones((N_l, 1, 1)))
-        L_inv_b = calc_Linv_mat_vmap(*stored_values["cel_decomp"], b_vecs)
-
-        # Multiply each pair of time vectors and sum over time dimension
-        # Computes diagonal entries of diagonal matrices D_ij
-        D_ij = L_inv_b[None, :, :, :] * L_inv_b[:, None, :, :]
-        D_ij = D_ij.sum(3)
-        
-        # JAX/NumPy treats tensor matrix multiplication as if it is a stack of matrices stored in last two dimensions
-        # Which works here as D_tensor is of shape (N_b, N_l, N_l)
-        W_l_D = stored_values["W_l"].T @ D_tensor
-        
-        # Dj_W_l_D shape will initially be (N_b, N_b, N_l, N_l)
-        Dj_W_l_D = D_ij[:, :, :, jnp.newaxis] * W_l_D[:, :, :]
-
-        # We then sum over axis 1, summing over j
-        Dj_W_l_D = Dj_W_l_D.sum(1)
-
-        # Must be careful to transpose W_l_D just along the two wavelength axes
-        # Broadcasting will result in N_b stacks of matrices multiplying together
-        TKT = jnp.transpose(W_l_D, (0, 2, 1)) @ Dj_W_l_D
-
-        # We then do our second sum over axis 0, summing over i
-        TKT = TKT.sum(0)
-
-        # Finally we invert T.T K^-1 T to get our covariance matrix
-        Sigma_d = jnp.linalg.inv(TKT)
-        logdetSigma_d = -jnp.linalg.slogdet(TKT)[1]
+        return K_inv_vec(R, self.stored_values)
     
-        return Sigma_d, logdetSigma_d
     
+    def matmul(
+        self,
+        X1,
+        X2,
+        R: JAXArray,
+        **kwargs,
+    ) -> JAXArray:
+        r"""Calculates the product of the covariance matrix with a vector, represented by a JAXArray of shape ``(N_l, N_t)`.
+        Useful for testing for numerical stability.
+        
+        Args:
+            hp (Pytree): Hyperparameters needed to build the covariance matrices
+                ``Kl``, ``Kt``, ``Sl``, ``St``. Will be unaffected if additional mean function
+                parameters are also included.
+            x_l (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
+                for the observed locations. May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l``
+                different wavelength/vertical regression variables.
+            x_t (JAXArray): Array containing time/horizontal dimension regression variable(s) for the
+                observed locations. May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different
+                time/horizontal regression variables.
+            R (JAXArray): JAXArray of shape ``(N_l, N_t)`` representing the vector to multiply on the right by
+                the covariance matrix ``K``.
+                
+        Returns:
+            JAXArray: The result of multiplying the covariance matrix ``K`` by the vector ``R``.
+        
+        """
+        x_l1, x_t1 = X1[0], X1[1]
+        x_l2, x_t2 = X2[0], X2[1]
+        hp = {}
+
+        Sl = self.Sl(x_l1, x_l2, **kwargs)
+        St = self.St(x_t1, x_t2, **kwargs)
+        Kl = self.Kl(x_l1, x_l2, **kwargs)
+        Kt = self.Kt(x_t1, x_t2, **kwargs)
+        
+        return kron_prod(Kl, Kt, R) + kron_prod(Sl, St, R)
+
 
     def predict(
         self,
@@ -381,19 +786,19 @@ class LuasKernel(CovType):
         stored_values = self.decomp_fn(hp, x_l, x_t)
         
         # Calculate the covariance between the observed and predicted points
-        Kl_s = self.Kl.evaluate(hp, x_l, x_l_pred, wn = False)
-        Kt_s = self.Kt.evaluate(hp, x_t, x_t_pred, wn = False)
-        Sl_s = self.Sl.evaluate(hp, x_l, x_l_pred, wn = False)
-        St_s = self.St.evaluate(hp, x_t, x_t_pred, wn = False)
+        Kl_s = self.Kl(hp, x_l, x_l_pred, wn = False)
+        Kt_s = self.Kt(hp, x_t, x_t_pred, wn = False)
+        Sl_s = self.Sl(hp, x_l, x_l_pred, wn = False)
+        St_s = self.St(hp, x_t, x_t_pred, wn = False)
         
         # Calculate the covariance between predicted points with other predicted points
-        Kl_ss = self.Kl.evaluate(hp, x_l_pred, x_l_pred, wn = wn)
-        Kt_ss = self.Kt.evaluate(hp, x_t_pred, x_t_pred, wn = wn)
-        Sl_ss = self.Sl.evaluate(hp, x_l_pred, x_l_pred, wn = wn)
-        St_ss = self.St.evaluate(hp, x_t_pred, x_t_pred, wn = wn)
+        Kl_ss = self.Kl(hp, x_l_pred, x_l_pred, wn = wn)
+        Kt_ss = self.Kt(hp, x_t_pred, x_t_pred, wn = wn)
+        Sl_ss = self.Sl(hp, x_l_pred, x_l_pred, wn = wn)
+        St_ss = self.St(hp, x_t_pred, x_t_pred, wn = wn)
 
         # Calculate K^-1 R
-        K_inv_R, stored_values = self.solve(hp, x_l, x_t, R, stored_values)
+        K_inv_R = K_inv_vec(R, stored_values)
 
         # Calculates the GP mean including the deterministic mean function at the prediction locations
         gp_mean = M_s + kron_prod(Kl_s.T, Kt_s.T, K_inv_R) + kron_prod(Sl_s.T, St_s.T, K_inv_R)

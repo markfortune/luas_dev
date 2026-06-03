@@ -170,7 +170,7 @@ class LuasLasrachKernel(CovType):
 
         kf_dense_blocks = BlockKernel((Identity(), self.Sigma[self.fast_dim]),
                                       (Diagonal(diag = all_lam), self.K[self.fast_dim]),
-                                      non_block_dim_size = non_fast_dim_size, block_dim=1, use_pmap = self.use_pmap)
+                                      non_block_dim_size = all_lam.size, block_dim=1, use_pmap = self.use_pmap)
         X_block = (jnp.zeros(non_fast_dim_size), X[self.fast_dim]) # all_lam is not used but is an array of the expected length
 
         # Optimised for low-rank kernels where a 2x2 block matrix is formed
@@ -180,7 +180,7 @@ class LuasLasrachKernel(CovType):
         if all_lam.size < non_fast_dim_size:
             kf_A = SingleKronTermKernel(Identity(), self.Sigma[self.fast_dim],
                                         inv_dims=self.Sigma[self.fast_dim].use_inv)
-            self.kf_tilde = Block2x2Kernel(kf_A = kf_A, kf_D_CAB = kf_dense_blocks, D_full = True,
+            self.kf_tilde = Block2x2Kernel(kf_A = kf_A, kf_D_CAB = kf_dense_blocks, D_full = False,
                                            dim_split = 0, split_loc = -all_lam.size)
         else:
             self.kf_tilde = kf_dense_blocks

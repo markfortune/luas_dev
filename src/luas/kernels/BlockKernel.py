@@ -227,8 +227,8 @@ class Block2x2Kernel(CovType):
                 idx_D = (idx[0], idx[1][self.split_loc:])
 
         if not self.split_idx:
-            idx_A = None
-            idx_D = None
+            idx_A = (None, None)
+            idx_D = (None, None)
         
         return X_A, X_D, idx_A, idx_D
 

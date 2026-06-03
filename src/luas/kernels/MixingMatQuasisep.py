@@ -31,7 +31,7 @@ class MixingMatQuasisep(CovType):
             return r.reshape(R_shape, order='F')
         
 
-    def _tinygp_coords(self, X, full = False, idx = None):
+    def _tinygp_coords(self, X, full = False, idx = (None, None)):
         # assert full or idx is not None
 
         cel_vec = X[self.fast_dim]
@@ -40,14 +40,14 @@ class MixingMatQuasisep(CovType):
         x_t_long = jnp.kron(cel_vec, jnp.ones(non_cel_vec.shape[-1]))
         multiband_idx = jnp.arange(x_t_long.shape[-1])
 
-        if idx is not None:
+        if idx[self.fast_dim] is not None:
             multiband_idx_2D = jnp.add.outer(idx[1-self.fast_dim], self.mixing_mat.shape[0] * idx[self.fast_dim])
             multiband_idx = multiband_idx_2D.ravel("F")
         
         return (x_t_long, multiband_idx)
 
 
-    def _to_symm_qsm(self, X, wn = True, full = False, idx = None):
+    def _to_symm_qsm(self, X, wn = True, full = False, idx = (None, None)):
         
         for i in range(self.rank):
             if i == 0:

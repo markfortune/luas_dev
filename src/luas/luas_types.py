@@ -20,12 +20,6 @@ class Kernel(metaclass=ABCMeta):
     # Base class for Kernel classes
     pass
 
-class CovType():
-    K_list = []
-    
-    def rank(self, x):
-        return x.shape[-1]
-
 
 def is_scalar(x):
     zero_d_array = hasattr(x, "shape") and x.shape == ()

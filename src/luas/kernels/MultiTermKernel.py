@@ -63,13 +63,15 @@ class MultiTermKernel(CovType):
     def decomp_no_stored_values(
         self,
         X: Tuple[JAXArray],
-        stored_values: Optional[PyTree] = {},
+        stored_values: Optional[PyTree] = None,
         full = True,
         idx = None,
     ) -> PyTree:
 
         # should to something about idx and full
         assert full == True
+
+        stored_values = {} if stored_values is None else stored_values
         
         non_cel_vec = X[1-self.fast_dim]
         cel_vec = X[self.fast_dim]
@@ -85,14 +87,14 @@ class MultiTermKernel(CovType):
             stored_values["non_cel_rank"] += K_i[1-self.fast_dim].rank(non_cel_vec)
         
         stored_values["A"] = jnp.zeros((non_cel_vec.shape[-1], stored_values["non_cel_rank"]))
-        stored_values["cel_kernel_order"] = []
+        cel_kernel_order = []
         
         col_i = 0
         for (i, K_i) in enumerate(self.K_list):
             if isinstance(K_i[1-self.fast_dim], Outer):
                 K_i_non_cel, _ = K_i[1-self.fast_dim].decompose(non_cel_vec)
                 stored_values["A"] = stored_values["A"].at[:, col_i].set(K_i_non_cel.alpha)
-                stored_values["cel_kernel_order"].append(K_i[self.fast_dim])
+                cel_kernel_order.append(K_i[self.fast_dim])
                 col_i += 1
             else:
                 lam, Q = K_i[1-self.fast_dim].eigendecomp(non_cel_vec)
@@ -109,7 +111,7 @@ class MultiTermKernel(CovType):
                     stored_values["A"] = stored_values["A"].at[:, col_i].set(alpha_eigen[:, j])
                     
                     # Could accept a list of kernels in K_i[self.fast_dim]
-                    stored_values["cel_kernel_order"].append(K_i[self.fast_dim])
+                    cel_kernel_order.append(K_i[self.fast_dim])
                     col_i += 1
         
         # Transform vectors 
@@ -127,7 +129,7 @@ class MultiTermKernel(CovType):
             stored_values["J"] = jnp.concatenate([stored_values["J"], add_basis], axis = 1)
 
             for j in range(stored_values["non_cel_rank"]):
-                stored_values["cel_kernel_order"].append(self.Sigma[self.fast_dim])
+                cel_kernel_order.append(self.Sigma[self.fast_dim])
 
             if hasattr(self.Sigma[self.fast_dim], "noise_model") and self.Sigma[self.fast_dim].noise_model is not None:
                 assert self.use_quasi == False # Not implemented otherwise
@@ -146,10 +148,10 @@ class MultiTermKernel(CovType):
             total_cel_diag = jnp.kron(cel_diag, jnp.ones(non_cel_vec.shape[-1]))
         
         if self.use_quasi:
-            kf_quasi2D = MixingMatQuasisep(mixing_mat = stored_values["J"], kernel_list = stored_values["cel_kernel_order"],
+            kf_quasi2D = MixingMatQuasisep(mixing_mat = stored_values["J"], kernel_list = cel_kernel_order,
                                             diag = total_cel_diag, fast_dim = self.fast_dim)
         else:
-            kf_quasi2D = MixingMatGeneral(mixing_mat = stored_values["J"], kernel_list = stored_values["cel_kernel_order"],
+            kf_quasi2D = MixingMatGeneral(mixing_mat = stored_values["J"], kernel_list = cel_kernel_order,
                                             diag = total_cel_diag, fast_dim = self.fast_dim)
 
         if self.reduce_dim:

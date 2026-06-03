@@ -97,8 +97,8 @@ class MultiTermBothDimKernel(CovType):
                 
         stored_values["A"] = jnp.zeros((X[0].shape[-1], self.N_alpha))
         stored_values["B"] = jnp.zeros((X[1].shape[-1], self.N_beta))
-        stored_values["A_kernel_order"] = []
-        stored_values["B_kernel_order"] = []
+        A_kernel_order = []
+        B_kernel_order = []
         
         col_i = 0
         col_j = 0
@@ -106,12 +106,12 @@ class MultiTermBothDimKernel(CovType):
             if isinstance(K_i[0], Outer):
                 K0_outer, _ = K_i[0].decompose(X[0])
                 stored_values["A"] = stored_values["A"].at[:, col_i].set(K0_outer.alpha)
-                stored_values["A_kernel_order"].append(K_i[1])
+                A_kernel_order.append(K_i[1])
                 col_i += 1
             elif isinstance(K_i[1], Outer):
                 K1_outer, _ = K_i[1].decompose(X[1])
                 stored_values["B"] = stored_values["B"].at[:, col_j].set(K1_outer.alpha)
-                stored_values["B_kernel_order"].append(K_i[0])
+                B_kernel_order.append(K_i[0])
                 col_j += 1
 
         # stored_values["A"] = self.Sigma_transf[0].matrix_inv_sqrt(stored_values["A"])
@@ -124,8 +124,8 @@ class MultiTermBothDimKernel(CovType):
         stored_values["J_A"], stored_values["U_A"], self.householder_transform_A = orthonormal_nullspace_gen(stored_values["A"])
         stored_values["J_B"], stored_values["U_B"], self.householder_transform_B = orthonormal_nullspace_gen(stored_values["B"])
 
-        kf_A = MixingMatTerm(stored_values["J_A"], stored_values["A_kernel_order"], diag = 1., fast_dim = 1)
-        kf_B = MixingMatTerm(stored_values["J_B"], stored_values["B_kernel_order"], diag = 1., fast_dim = 0)
+        kf_A = MixingMatTerm(stored_values["J_A"], A_kernel_order, diag = 1., fast_dim = 1)
+        kf_B = MixingMatTerm(stored_values["J_B"], B_kernel_order, diag = 1., fast_dim = 0)
 
         for i in range(self.N_alpha):
             kf_B = kf_B.householder_transform(X, stored_values["U_A"][:, i])
@@ -135,7 +135,7 @@ class MultiTermBothDimKernel(CovType):
 
         # Calculate component of K_l \otimes \beta \beta^T which falls within block A (concentrated in top left corner of matrix)
         top_corner_ind = (jnp.arange(self.N_alpha), jnp.arange(self.N_beta))
-        X_top_corner = (X[0][jnp.arange(self.N_alpha)], X[1][jnp.arange(self.N_alpha)])
+        X_top_corner = (X[0][:self.N_alpha], X[1][:self.N_alpha])
 
         top_corner_eval = kf_B.evaluate(X_top_corner, X_top_corner,
                                         row_idx = top_corner_ind, col_idx = top_corner_ind,

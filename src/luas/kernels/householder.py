@@ -2,7 +2,7 @@ from typing import Optional, Callable, Tuple, Any, Union
 from jax import tree_util
 import jax.numpy as jnp
 
-from luas.luas_types import Kernel, PyTree, JAXArray, Scalar, CovType, is_scalar
+from luas.luas_types import Kernel, PyTree, JAXArray, Scalar, is_scalar
 from luas.kronecker_fns import vmap_for_tensors
 
 

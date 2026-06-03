@@ -3,8 +3,8 @@ import scipy
 import jax
 import jax.numpy as jnp
 from luas.kernels.base import evaluate_kernel, squared_exp_calc, cosine_calc
-from luas.luas_types import Kernel, PyTree, JAXArray, Scalar, CovType, is_scalar
-from luas.kernels.covtype import Outer, General
+from luas.luas_types import Kernel, PyTree, JAXArray, Scalar, is_scalar
+from luas.kernels.covtype import Outer, General, CovType
 from luas.kernels.householder import HouseholderProduct
 import luas.kernels.tinygp_ext
 
@@ -41,8 +41,8 @@ class LowRank(CovType):
         self.use_shared_memory = use_shared_memory
 
         assert rank is not None
-
-    def eigendecomp(self, x, wn = True, **kwargs):
+    
+    def eigendecomp_scipy(self, x, wn = True, **kwargs):
 
         K = self.evaluate(x, x, full = True, wn = True)
 
@@ -102,7 +102,7 @@ class LowRank(CovType):
         else:
             raise Exception("Addition not implemented")
         
-    def transform_with_inv_sqrt(self, matrix_sqrt_fn):
+    def transform_with_inv_sqrt(self, matrix_sqrt_fn, x):
         def kf_transf(hp, x1, x2, **kwargs):
                 K_eval = self.evaluate(x1, x2, **kwargs)
                 K_prime = matrix_sqrt_fn(K_eval, transpose=0)
@@ -158,21 +158,20 @@ class LowRank(CovType):
 
 
 def SquaredExp(scale: Scalar, axes: JAXArray | None = None, rank = None, **kwargs) -> JAXArray:
-    r"""Squared exponential kernel function, also known as the radial basis function,
-    used with ``luas.kernels.evaluate_kernel`` to build a covariance matrix.
-    
+    r"""Low-rank squared-exponential (RBF) kernel factory.
+
     .. math::
 
-        k(x, y) = \exp\Bigg( -\frac{|x - y|^2}{2L^2}\Bigg)
-    
+        k(x,y)=\exp\left(-\frac{\|x-y\|^2}{2\,\mathrm{scale}^2}\right)
+
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        
+        scale (Scalar): Length scale.
+        axes (JAXArray | None, optional): Optional axes selector.
+        rank (optional): Target low-rank approximation rank.
+        **kwargs: Extra keyword arguments forwarded to ``LowRank``.
+
     Returns:
-        Scalar: Covariance between two input vectors
-        
+        JAXArray: ``LowRank`` covariance object.
     """
     
     return LowRank(lambda hp, x, y, **kwargs: evaluate_kernel(squared_exp_calc, x, y, scale), rank = rank, **kwargs)
@@ -180,67 +179,60 @@ ExpSquared = SquaredExp
 
 
 def Cosine(period: Scalar, **kwargs) -> JAXArray:
-    r"""Cosine kernel, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices which have periodic covariance.
-    
+    r"""Low-rank cosine periodic kernel factory.
+
     .. math::
 
-        k(x, y) = \cos\Bigg(\frac{2\pi|x - y|}{P}\Bigg)
-    
+        k(x,y)=\cos\left(2\pi\frac{\|x-y\|}{\mathrm{period}}\right)
+
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        P (Scalar): Period
-        
+        period (Scalar): Period.
+        **kwargs: Extra keyword arguments forwarded to ``LowRank``.
+
     Returns:
-        JAXArray: Covariance between two input vectors
-        
+        JAXArray: ``LowRank`` covariance object.
     """
 
     return LowRank(lambda hp, x, y, **kwargs: evaluate_kernel(cosine_calc, x, y, period), rank = 2, **kwargs)
 
 
+def MixingMat(V: JAXArray, **kwargs) -> JAXArray:
+    r"""Low-rank linear covariance term.
 
-def Linear(alpha: JAXArray, **kwargs) -> JAXArray:
-    r"""Matern 3/2 kernel function, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices.
-    
-    .. math::
-
-        k(x, y) = \Bigg(1 + \sqrt{3} \frac{|x - y|}{L}\Bigg) \exp\Bigg( -\sqrt{3} \frac{|x - y|}{L}\Bigg)
-    
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        
+        alpha (JAXArray): Coefficient vector defining the outer-product term.
+
     Returns:
-        Scalar: Covariance between two input vectors
-        
+        JAXArray: ``Outer`` covariance component.
+    """
+    return LowRank(lambda hp, x, y, **kwargs: V @ V.T, rank = V.shape[1], **kwargs)
+
+
+
+def Amplitude(alpha: JAXArray, **kwargs) -> JAXArray:
+    r"""Low-rank linear covariance term.
+
+    Args:
+        alpha (JAXArray): Coefficient vector defining the outer-product term.
+
+    Returns:
+        JAXArray: ``Outer`` covariance component.
     """
     
     return Outer(alpha = alpha)
 
 
 def Constant(const: JAXArray, **kwargs) -> JAXArray:
-    r"""Matern 3/2 kernel function, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices.
-    
-    .. math::
+    r"""Low-rank constant covariance term.
 
-        k(x, y) = \Bigg(1 + \sqrt{3} \frac{|x - y|}{L}\Bigg) \exp\Bigg( -\sqrt{3} \frac{|x - y|}{L}\Bigg)
-    
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        
+        const (JAXArray): Constant covariance amplitude term.
+
     Returns:
-        Scalar: Covariance between two input vectors
-        
+        JAXArray: ``Outer`` covariance component.
     """
     
-    return Outer(alpha = const)
+    return Outer(alpha = jnp.sqrt(const))
 
 
 def ExpSineSquaredApprox(gamma: Scalar, period: Scalar, order: int, sigma: Scalar = 1., **kwargs):

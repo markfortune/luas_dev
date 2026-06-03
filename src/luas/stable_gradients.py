@@ -15,25 +15,51 @@ __all__ = [
     "logdetK_calc_hessianable",
 ]
 
+# def stable_eigh(K):
+#     return jnp.linalg.eigh(K)
+
+# @jax.custom_jvp
+# def stable_eigh(K):
+#     result = jnp.linalg.eigh(K)
+#     return result.eigenvalues, result.eigenvectors
+
+# @stable_eigh.defjvp
+# def stable_eigh_jvp(primals, tangents):
+#     (K,) = primals
+#     (dK,) = tangents
+#     vals, vecs = stable_eigh(K)
+
+#     diffs = vals[:, None] - vals[None, :]
+#     F = diffs / (diffs**2 + 1e-6)
+
+#     VtdKV = vecs.T @ dK @ vecs
+#     d_vals = jnp.diag(VtdKV)
+#     d_vecs = vecs @ (F * VtdKV)
+
+#     return (vals, vecs), (d_vals, d_vecs)
 
 @jax.custom_vjp
 def stable_eigh(K):
-    result = jnp.linalg.eigh(K)
-    return result.eigenvalues, result.eigenvectors  # plain tuple
+    w, v = jnp.linalg.eigh(K)
+    return w, v  # plain tuple
 
 def stable_eigh_fwd(K):
-    vals, vecs = stable_eigh(K)
-    return (vals, vecs), (vals, vecs)
+    w, v = jnp.linalg.eigh(K)
+    return (w, v), (w, v)
 
 def stable_eigh_bwd(res, g):
-    vals, vecs = res
-    g_vals, g_vecs = g
+    w, v = res
+    g_w, g_v = g
 
-    diffs = vals[:, None] - vals[None, :]
-    F = diffs / (diffs**2 + 1e-6)
+    # F[i,j] = 1 / (w_j - w_i) off-diagonal, 0 on the diagonal.
+    # Sign matters: w_j - w_i, NOT w_i - w_j.
+    diffs = w[None, :] - w[:, None]          # w_j - w_i
+    eps = 1e-12                              # only for genuine degeneracy
+    F = diffs / (diffs**2 + eps)             # -> 1/diffs as eps->0; F_ii = 0
 
-    g_K = vecs @ (jnp.diag(g_vals) + F * (vecs.T @ g_vecs)) @ vecs.T
+    g_K = v @ (jnp.diag(g_w) + F * (v.T @ g_v)) @ v.T
     return ((g_K + g_K.T) / 2,)
+
 stable_eigh.defvjp(stable_eigh_fwd, stable_eigh_bwd)
 
 

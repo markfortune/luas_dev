@@ -88,6 +88,21 @@ def LuasPyMC(name, gp = None, var_dict = None, Y = None, likelihood_fn = None, j
     # Returns the log likelihood using the custom potential provided by PyMC
     return pm.Potential(name, logP_pymc(p_pymc))
 
+
+def build_pymc_model(gp, p_vary, Y, ordered_param_list, p_fixed = {}, param_bounds = {}):
+    with pm.Model() as model:
+        var_dict = deepcopy(p_fixed)
+
+        for par in ordered_param_list:
+            if par in param_bounds.keys():
+                var_dict[par] = pm.Uniform(par, lower=param_bounds[par][0], upper=param_bounds[par][1], shape=p_vary[par].shape)
+            else:
+                var_dict[par] = pm.Flat(par, shape=p_vary[par].shape)
+        LuasPyMC("log_like", gp = gp, var_dict = var_dict, Y = Y)
+        
+    return model, var_dict
+
+
     
 class LuasPyMCWrapper(Op):
     """Wrapper for log-likelihood calculations used by ``LuasGP`` which depending on the version of ``PyMC`` 
@@ -132,3 +147,4 @@ class LuasPyMCWrapper(Op):
         grad_result = value.owner.outputs[1]
 
         return [output_gradients[0] * grad_result]
+    

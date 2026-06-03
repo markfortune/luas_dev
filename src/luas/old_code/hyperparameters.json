@@ -1,0 +1,92 @@
+[
+    {
+        "hyperparameters": {
+            "S0": 18340.835205958254,
+            "w0": 5.35321843959353,
+            "Q": 0.6
+        },
+        "metadata": {
+            "source": "granulation"
+        }
+    },
+    {
+        "hyperparameters": {
+            "S0": 17.89841172794779,
+            "w0": 114.55520319850163,
+            "Q": 0.6
+        },
+        "metadata": {
+            "source": "granulation"
+        }
+    },
+    {
+        "hyperparameters": {
+            "S0": 0.5659662607164637,
+            "w0": 575.893886406892,
+            "Q": 0.6
+        },
+        "metadata": {
+            "source": "granulation"
+        }
+    },
+    {
+        "hyperparameters": {
+            "S0": 0.2960462107291726,
+            "w0": 5050.277958149664,
+            "Q": 0.6
+        },
+        "metadata": {
+            "source": "granulation"
+        }
+    },
+    {
+        "hyperparameters": {
+            "S0": 0.07160842899044823,
+            "w0": 20343.609557336833,
+            "Q": 0.6
+        },
+        "metadata": {
+            "source": "granulation"
+        }
+    },
+    {
+        "hyperparameters": {
+            "S0": 7.160744534863139e-06,
+            "Q": 2638.6200296239595
+        },
+        "metadata": {
+            "degree": 0,
+            "source": "oscillation"
+        }
+    },
+    {
+        "hyperparameters": {
+            "S0": 1.7501924007383615e-05,
+            "Q": 1739.8359964306403
+        },
+        "metadata": {
+            "degree": 1,
+            "source": "oscillation"
+        }
+    },
+    {
+        "hyperparameters": {
+            "S0": 9.435829574482945e-06,
+            "Q": 1286.0000231757188
+        },
+        "metadata": {
+            "degree": 2,
+            "source": "oscillation"
+        }
+    },
+    {
+        "hyperparameters": {
+            "S0": 8.392743868118509e-07,
+            "Q": 1424.2738543042017
+        },
+        "metadata": {
+            "degree": 3,
+            "source": "oscillation"
+        }
+    }
+]

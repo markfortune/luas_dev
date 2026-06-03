@@ -6,41 +6,51 @@ from luas.luas_types import JAXArray, Scalar, PyTree, is_scalar
 import luas.kernels.covtype as covtype
 
 __all__ = [
-    "Independent",
     "Noise",
+    "KroneckerDelta"
 ]
-    
-def KroneckerDelta(sigma: JAXArray | Scalar = None) -> JAXArray:
-    if sigma is not None:
-        if is_scalar(sigma):
-            return covtype.ScaledIdentity(diag = sigma**2)
-        else:
-            return covtype.Diagonal(diag = sigma**2)
-    else:
-        return covtype.Identity()
 
+def Noise(diag: JAXArray | Scalar) -> JAXArray:
+    r"""Diagonal white-noise covariance term.
 
-def Noise(sigma: JAXArray | Scalar) -> JAXArray:
-    r"""Matern 5/2 kernel function, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices.
-    
-    .. math::
+    Returns an identity-like covariance object with diagonal entries
+    :math:`\sigma^2` (scalar or element-wise).
 
-        k(x, y) = \Bigg(1 + \sqrt{5} \frac{|x - y|}{L} + \frac{5|x - y|^2}{3L^2}\Bigg) \exp\Bigg( -\sqrt{5}\frac{|x - y|}{L}\Bigg)
-    
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        
+        diag (JAXArray | Scalar): Noise variance(s).
+
     Returns:
-        Scalar: Covariance between two input vectors
-        
+        JAXArray: ``covtype.ScaledIdentity`` for scalar ``diag`` or
+        ``covtype.Diagonal`` for array-valued ``diag``.
     """
     
-    if is_scalar(sigma):
-        return covtype.ScaledIdentity(wn_diag = sigma**2)
+    if is_scalar(diag):
+        return covtype.ScaledIdentity(wn_diag = diag)
     else:
-        return covtype.Diagonal(wn_diag = sigma**2)
-
+        return covtype.Diagonal(wn_diag = diag)
  
+  
+def KroneckerDelta(diag: JAXArray | Scalar = None) -> JAXArray:
+    r"""Diagonal covariance term.
+
+    Returns an identity-like covariance object with diagonal entries
+    :math:`\sigma^2` (scalar or element-wise).
+    
+    Unlike ``Noise``, this term is for terms which are modelled as correlated, but are independent in this particular dimension.
+    Swapping out the ``Noise`` term for a ``KroneckerDelta`` term will give the same log-likelihood values but the GP predictive mean
+    will be different, as the GP predictive mean will try to fit this term rather than treating it as uncorrelated noise.
+
+    Args:
+        diag (JAXArray | Scalar): Noise variance(s).
+
+    Returns:
+        JAXArray: ``covtype.ScaledIdentity`` for scalar ``diag`` or
+        ``covtype.Diagonal`` for array-valued ``diag``.
+    """
+    if diag is not None:
+        if is_scalar(diag):
+            return covtype.ScaledIdentity(diag = diag)
+        else:
+            return covtype.Diagonal(diag = diag)
+    else:
+        return covtype.Identity()

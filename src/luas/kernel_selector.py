@@ -15,6 +15,7 @@ from luas import (
     WhiteNoiseKernel,
     SingleKronTermKernel,
     LuasKernel,
+    LuasKernelND,
     LuasLasrachKernel,
     MultiTermKernel,
     MultiTermBothDimKernel,
@@ -214,7 +215,7 @@ i.e. X should be a tuple the same length as the terms kf returns.""")
         # >2D GP
         # Could also do luaslasrach but often slower for >2D
         print_str += "For >2D with two Kronecker terms we currently default to LuasKernel, but LuasLasrachKernel may be worth checking too!\n"
-        return LuasKernel, {}
+        return LuasKernelND, {}
 
     if verbose:
         print(print_str)

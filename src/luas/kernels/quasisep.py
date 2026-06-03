@@ -30,46 +30,27 @@ from luas.kernels.diagonal import KroneckerDelta, Noise
 
 
 def CustomTinygp(kf_tinygp: Callable, params = None) -> JAXArray:
-    r"""Powered exponential kernel function, a family of kernel functions which
-    include the exponential and squared exponential kernels as special cases. 
-    Equivalent to the exponential kernel for k = 1 and the squared exponential kernel
-    for k = 2 (although the length scales will differ by sqrt(2) because 2 is not in
-    the denominator inside the exponent in this function).
-    Used with evaluate_kernel to build a covariance matrix.
-    
-    .. math::
+    r"""Wrap a tinygp-compatible kernel in a quasisep covariance object.
 
-        k(x, y) = \exp\Bigg( -\frac{|x - y|^k}{L^k}\Bigg)
-    
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        k (Scalar): Exponent which can take any positive real values between [0, 2]
-        
+        kf_tinygp (Callable): tinygp kernel object/callable.
+        params: Optional parameter metadata forwarded to the covariance wrapper.
+
     Returns:
-        Scalar: Covariance between two input vectors
+        JAXArray: A ``covtype.GeneralQuasisepPlusNoise`` covariance object.
     """
 
     return covtype.GeneralQuasisepPlusNoise(HandleIdx(kf_tinygp), params = params)
 
 
 def Constant(const: JAXArray) -> JAXArray:
-    r"""Matern 3/2 kernel function, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices.
-    
-    .. math::
+    r"""Constant covariance component.
 
-        k(x, y) = \Bigg(1 + \sqrt{3} \frac{|x - y|}{L}\Bigg) \exp\Bigg( -\sqrt{3} \frac{|x - y|}{L}\Bigg)
-    
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        
+        const (JAXArray): Constant covariance level (must be scalar).
+
     Returns:
-        Scalar: Covariance between two input vectors
-        
+        JAXArray: Outer-product covariance representation.
     """
     assert is_scalar(const)
 
@@ -77,21 +58,19 @@ def Constant(const: JAXArray) -> JAXArray:
 
 
 def Linear(alpha: JAXArray, sigma: Scalar = 1., use_block: bool = True, const: None = None) -> JAXArray:
-    r"""Matern 3/2 kernel function, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices.
-    
-    .. math::
+    r"""Linear covariance component.
 
-        k(x, y) = \Bigg(1 + \sqrt{3} \frac{|x - y|}{L}\Bigg) \exp\Bigg( -\sqrt{3} \frac{|x - y|}{L}\Bigg)
-    
+    If ``const`` is provided, returns a quasisep-plus-noise representation using
+    a tinygp linear kernel; otherwise returns an outer-product form.
+
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        
+        alpha (JAXArray): 1D coefficient vector for the linear term.
+        sigma (Scalar, optional): Amplitude scale.
+        use_block (bool, optional): Whether to use block implementation where supported.
+        const (None, optional): Optional constant offset for the tinygp linear kernel.
+
     Returns:
-        Scalar: Covariance between two input vectors
-        
+        JAXArray: Covariance object for the linear term.
     """
     assert alpha.ndim == 1
 
@@ -111,21 +90,15 @@ def Banded(diag: JAXArray, off_diags: JAXArray, use_block: bool = True) -> covty
 
 
 def ConstantBlocks(endpoints: JAXArray, sigma: Scalar = 1., use_block: bool = True) -> JAXArray:
-    r"""Matern 3/2 kernel function, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices.
-    
-    .. math::
+    r"""Piecewise-constant block kernel.
 
-        k(x, y) = \Bigg(1 + \sqrt{3} \frac{|x - y|}{L}\Bigg) \exp\Bigg( -\sqrt{3} \frac{|x - y|}{L}\Bigg)
-    
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        
+        endpoints (JAXArray): Block boundary locations.
+        sigma (Scalar, optional): Kernel amplitude.
+        use_block (bool, optional): Whether to use block implementation where supported.
+
     Returns:
-        Scalar: Covariance between two input vectors
-        
+        JAXArray: Quasisep covariance object with constant blocks.
     """
 
     tinygp_kf = luas.kernels.tinygp_ext.ConstantBlocks(endpoints = endpoints, sigma = sigma)
@@ -133,125 +106,107 @@ def ConstantBlocks(endpoints: JAXArray, sigma: Scalar = 1., use_block: bool = Tr
 
 
 def Exp(scale: Scalar, sigma: Scalar = 1., fast_eigen = False) -> JAXArray:
-    r"""Exponential kernel function, also known as the Matern 1/2 kernel, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices.
-    
+    r"""Exponential (Matérn-1/2) quasisep kernel.
+
     .. math::
 
-        k(x, y) = \Bigg(\frac{|x - y|}{L}\Bigg)
-    
+        k(x,y)=\sigma^2\exp\left(-\frac{\|x-y\|}{\mathrm{scale}}\right)
+
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        
+        scale (Scalar): Length scale :math:`L`.
+        sigma (Scalar, optional): Kernel amplitude.
+        fast_eigen (bool, optional): Use optimized eigendecomposition path when available.
+
     Returns:
-        Scalar: Covariance between two input vectors
-        
+        JAXArray: Exponential quasisep covariance object.
     """
     exp_kernel = tinygp.kernels.quasisep.Exp(scale = scale, sigma = sigma)
     return covtype.Exp(HandleIdx(exp_kernel), scale, sigma = sigma, fast_eigen = fast_eigen)
 
 
 def Matern32(scale: Scalar, sigma: Scalar = 1.) -> JAXArray:
-    r"""Matern 3/2 kernel function, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices.
-    
+    r"""Matérn-3/2 quasisep kernel factory.
+
     .. math::
 
-        k(x, y) = \Bigg(1 + \sqrt{3} \frac{|x - y|}{L}\Bigg) \exp\Bigg( -\sqrt{3} \frac{|x - y|}{L}\Bigg)
-    
+        k(x,y)=\sigma^2\left(1+\sqrt{3}r\right)e^{-\sqrt{3}r},\quad r=\frac{\|x-y\|}{\mathrm{scale}}
+
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        
+        scale (Scalar): Length scale.
+        sigma (Scalar, optional): Kernel amplitude.
+
     Returns:
-        Scalar: Covariance between two input vectors
-        
+        JAXArray: Quasisep covariance object.
     """
     
     return covtype.GeneralQuasisep(HandleIdx(tinygp.kernels.quasisep.Matern32(scale = scale, sigma = sigma)))
     
 
 def Matern52(scale: Scalar, sigma: Scalar = 1.) -> JAXArray:
-    r"""Matern 5/2 kernel function, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices.
-    
+    r"""Matérn-5/2 quasisep kernel factory.
+
     .. math::
 
-        k(x, y) = \Bigg(1 + \sqrt{5} \frac{|x - y|}{L} + \frac{5|x - y|^2}{3L^2}\Bigg) \exp\Bigg( -\sqrt{5}\frac{|x - y|}{L}\Bigg)
-    
+        k(x,y)=\sigma^2\left(1+\sqrt{5}r+\frac{5}{3}r^2\right)e^{-\sqrt{5}r},\quad r=\frac{\|x-y\|}{\mathrm{scale}}
+
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        
+        scale (Scalar): Length scale.
+        sigma (Scalar, optional): Kernel amplitude.
+
     Returns:
-        Scalar: Covariance between two input vectors
-        
+        JAXArray: Quasisep covariance object.
     """
     
     return covtype.GeneralQuasisep(HandleIdx(tinygp.kernels.quasisep.Matern52(scale = scale, sigma = sigma)))
 
 
 def MaternHalfInt(scale: Scalar, double_nu: int, sigma = 1.) -> JAXArray:
-    r"""Matern half-integer kernel function
-    
+    r"""Half-integer Matérn quasisep kernel factory.
+
     .. math::
 
-        k(x, y) = \Bigg(1 + \sqrt{5} \frac{|x - y|}{L} + \frac{5|x - y|^2}{3L^2}\Bigg) \exp\Bigg( -\sqrt{5}\frac{|x - y|}{L}\Bigg)
-    
+        k(x,y)=\sigma^2\,\mathrm{Mat\'ern}_{\nu}(r),\quad \nu=\tfrac{1}{2}\,\mathrm{double\_nu},\; r=\frac{\|x-y\|}{\mathrm{scale}}
+
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        
+        scale (Scalar): Length scale.
+        double_nu (int): Twice the Matérn smoothness parameter :math:`\nu`.
+        sigma (Scalar, optional): Kernel amplitude.
+
     Returns:
-        Scalar: Covariance between two input vectors
-        
+        JAXArray: Quasisep covariance object.
     """
     tinygp_kf = luas.kernels.tinygp_ext.MaternHalfInt(scale = scale, double_nu = double_nu, sigma = sigma)
     return covtype.GeneralQuasisep(HandleIdx(tinygp_kf))
 
 
 def SHO(omega: Scalar, quality: Scalar, sigma = 1.) -> JAXArray:
-    r"""Matern 5/2 kernel function, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices.
-    
-    .. math::
+    r"""Simple harmonic oscillator (SHO) quasisep kernel.
 
-        k(x, y) = \Bigg(1 + \sqrt{5} \frac{|x - y|}{L} + \frac{5|x - y|^2}{3L^2}\Bigg) \exp\Bigg( -\sqrt{5}\frac{|x - y|}{L}\Bigg)
-    
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        
+        omega (Scalar): Angular frequency parameter.
+        quality (Scalar): Quality factor.
+        sigma (Scalar, optional): Kernel amplitude.
+
     Returns:
-        Scalar: Covariance between two input vectors
-        
+        JAXArray: SHO quasisep covariance object.
     """
     
     return covtype.GeneralQuasisep(HandleIdx(tinygp.kernels.quasisep.SHO(omega = omega, quality = quality, sigma = sigma)))
 
 
 def Cosine(scale: Scalar, sigma: Scalar = 1.) -> JAXArray:
-    r"""Cosine kernel, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices which have periodic covariance.
-    
+    r"""Cosine periodic quasisep kernel factory.
+
     .. math::
 
-        k(x, y) = \cos\Bigg(\frac{2\pi|x - y|}{P}\Bigg)
-    
+        k(x,y)=\sigma^2\cos\left(2\pi\frac{\|x-y\|}{\mathrm{scale}}\right)
+
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        scale (Scalar): Period
-        
+        scale (Scalar): Period/scale parameter used by tinygp cosine kernel.
+        sigma (Scalar, optional): Kernel amplitude.
+
     Returns:
-        JAXArray: Covariance between two input vectors
-        
+        JAXArray: Periodic quasisep covariance object.
     """
 
     return covtype.PeriodicQuasisep(HandleIdx(tinygp.kernels.quasisep.Cosine(scale = scale, sigma = sigma)))

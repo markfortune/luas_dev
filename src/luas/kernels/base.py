@@ -26,18 +26,19 @@ __all__ = [
 from luas.kernels.diagonal import KroneckerDelta, Noise
 
 def evaluate_kernel(kernel_fn: Callable, x: JAXArray, y: JAXArray, *args, axes = None) -> JAXArray:
-    """Uses the ``jax.vmap`` function to efficiently build the covariance matrix from
-    a given kernel function.
-    
+    r"""Build a pairwise covariance matrix using ``jax.vmap``.
+
+    For a pointwise kernel :math:`k`, this computes :math:`K_{ij}=k(x_i,y_j)`.
+
     Args:
-        kernel_fn (Callable): The desired kernel function to use
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        l (Scalar): Length scale
-    
+        kernel_fn (Callable): Pointwise kernel function.
+        x (JAXArray): Input coordinates for the first axis.
+        y (JAXArray): Input coordinates for the second axis.
+        *args: Additional positional parameters forwarded to ``kernel_fn``.
+        axes (JAXArray | None, optional): Optional subset of dimensions to evaluate.
+
     Returns:
-        JAXArray: The constructed covariance matrix
-        
+        JAXArray: Pairwise covariance matrix.
     """
     if axes is not None:
         K = vmap(lambda x1: vmap(lambda y1: kernel_fn(x1, y1, *args), in_axes = -1)(y[axes, :]), in_axes = -1)(x[axes, :])
@@ -46,7 +47,7 @@ def evaluate_kernel(kernel_fn: Callable, x: JAXArray, y: JAXArray, *args, axes =
     return K
     
 
-def distanceL1(x: JAXArray, y: JAXArray, L: Scalar) -> JAXArray:
+def distanceL1(x: JAXArray, y: JAXArray, scale: Scalar) -> JAXArray:
     r"""Evaluates the L1 norm of two input vectors divided by a length scale.
     
     .. math::
@@ -56,17 +57,17 @@ def distanceL1(x: JAXArray, y: JAXArray, L: Scalar) -> JAXArray:
     Args:
         x (JAXArray): Input vector 1
         y (JAXArray): Input vector 2
-        L (Scalar): Length scale
+        scale (Scalar): Length scale
         
     Returns:
         Scalar: L1 norm between two input vectors
         
     """
     
-    return jnp.sum(jnp.abs(x - y)/L)
+    return jnp.sum(jnp.abs(x - y)/scale)
 
 
-def distanceL2Sq(x: JAXArray, y: JAXArray, L: Scalar) -> JAXArray:
+def distanceL2Sq(x: JAXArray, y: JAXArray, scale: Scalar) -> JAXArray:
     r"""Evaluates the Squared L2 norm of two input vectors divided by the length scale ``L``.
     
     .. math::
@@ -76,32 +77,30 @@ def distanceL2Sq(x: JAXArray, y: JAXArray, L: Scalar) -> JAXArray:
     Args:
         x (JAXArray): Input vector 1
         y (JAXArray): Input vector 2
-        L (Scalar): Length scale
+        scale (Scalar): Length scale
         
     Returns:
         Scalar: L2 norm between two input vectors
         
     """
     
-    return jnp.sum(jnp.square(x - y)/L**2)
+    return jnp.sum(jnp.square(x - y)/scale**2)
     
     
 def SquaredExp(scale: Scalar, sigma: Scalar = 1., axes: JAXArray | None = None) -> JAXArray:
-    r"""Squared exponential kernel function, also known as the radial basis function,
-    used with ``luas.kernels.evaluate_kernel`` to build a covariance matrix.
-    
+    r"""Squared exponential (RBF) kernel.
+
     .. math::
 
-        k(x, y) = \exp\Bigg( -\frac{|x - y|^2}{2L^2}\Bigg)
-    
+        k(x,y)=\sigma^2\exp\left(-\frac{\|x-y\|^2}{2\,\mathrm{scale}^2}\right)
+
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        
+        scale (Scalar): Length scale :math:`L`.
+        sigma (Scalar, optional): Kernel amplitude.
+        axes (JAXArray | None, optional): Optional axes selector forwarded internally.
+
     Returns:
-        Scalar: Covariance between two input vectors
-        
+        JAXArray: A ``covtype.General`` covariance object.
     """
     
     return covtype.General(lambda hp, x, y, **kwargs: sigma**2 * evaluate_kernel(squared_exp_calc, x, y, scale))
@@ -117,21 +116,18 @@ def squared_exp_calc(x: JAXArray, y: JAXArray, L: Scalar) -> JAXArray:
 
 
 def Exp(scale: Scalar, sigma: Scalar = 1.) -> JAXArray:
-    r"""Exponential kernel function, also known as the Matern 1/2 kernel, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices.
-    
+    r"""Exponential (Matérn-1/2) kernel factory.
+
     .. math::
 
-        k(x, y) = \Bigg(\frac{|x - y|}{L}\Bigg)
-    
+        k(x,y)=\sigma^2\exp\left(-\frac{\|x-y\|}{\mathrm{scale}}\right)
+
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        
+        scale (Scalar): Length scale :math:`L`.
+        sigma (Scalar, optional): Kernel amplitude.
+
     Returns:
-        Scalar: Covariance between two input vectors
-        
+        JAXArray: A ``covtype.General`` covariance object.
     """
     
     return covtype.General(lambda hp, x, y, **kwargs: sigma**2 * evaluate_kernel(exp_calc, x, y, scale))
@@ -145,25 +141,18 @@ def exp_calc(x: JAXArray, y: JAXArray, L: Scalar) -> JAXArray:
     return jnp.exp(-delta_t)
 
 def Custom(kf: Callable, hp: PyTree, params = None, kf_args = (), kf_kwargs = {}) -> JAXArray:
-    r"""Powered exponential kernel function, a family of kernel functions which
-    include the exponential and squared exponential kernels as special cases. 
-    Equivalent to the exponential kernel for k = 1 and the squared exponential kernel
-    for k = 2 (although the length scales will differ by sqrt(2) because 2 is not in
-    the denominator inside the exponent in this function).
-    Used with evaluate_kernel to build a covariance matrix.
-    
-    .. math::
+    r"""Wrap a user-provided kernel callable into a ``covtype.General`` object.
 
-        k(x, y) = \exp\Bigg( -\frac{|x - y|^k}{L^k}\Bigg)
-    
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        k (Scalar): Exponent which can take any positive real values between [0, 2]
-        
+        kf (Callable): Kernel callable with signature compatible with
+            ``kf(hp, x1, x2, *kf_args, **kf_kwargs, **kwargs)``.
+        hp (PyTree): Hyperparameter pytree passed to ``kf``.
+        params: Optional parameter metadata forwarded to ``covtype.General``.
+        kf_args (tuple, optional): Positional args forwarded to ``kf``.
+        kf_kwargs (dict, optional): Keyword args forwarded to ``kf``.
+
     Returns:
-        Scalar: Covariance between two input vectors
+        JAXArray: A ``covtype.General`` covariance object.
     """
     custom_kf = lambda _, x1, x2, full = True, row_idx = None, col_idx = None, **kwargs: kf(hp, x1, x2,
                                                                                             *kf_args, **kf_kwargs,
@@ -184,25 +173,15 @@ def Fixed(cov_mat: JAXArray, params = None, ignore_idx = False, sigma: Scalar = 
 
 
 def PoweredExp(scale: Scalar, k: Scalar, sigma: Scalar = 1.) -> JAXArray:
-    r"""Powered exponential kernel function, a family of kernel functions which
-    include the exponential and squared exponential kernels as special cases. 
-    Equivalent to the exponential kernel for k = 1 and the squared exponential kernel
-    for k = 2 (although the length scales will differ by sqrt(2) because 2 is not in
-    the denominator inside the exponent in this function).
-    Used with evaluate_kernel to build a covariance matrix.
-    
-    .. math::
+    r"""Powered exponential kernel factory.
 
-        k(x, y) = \exp\Bigg( -\frac{|x - y|^k}{L^k}\Bigg)
-    
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        k (Scalar): Exponent which can take any positive real values between [0, 2]
-        
+        scale (Scalar): Length scale.
+        k (Scalar): Exponent parameter.
+        sigma (Scalar, optional): Kernel amplitude.
+
     Returns:
-        Scalar: Covariance between two input vectors
+        JAXArray: A ``covtype.General`` covariance object.
     """
 
     return covtype.General(lambda hp, x, y, **kwargs: sigma**2 * evaluate_kernel(powered_exp_calc, x, y, scale, k))
@@ -217,63 +196,51 @@ def powered_exp_calc(x: JAXArray, y: JAXArray, L: Scalar, k: Scalar) -> JAXArray
 
 
 def Linear(alpha: JAXArray, sigma: Scalar = 1.) -> JAXArray:
-    r"""Matern 3/2 kernel function, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices.
-    
-    .. math::
+    r"""Linear kernel represented as an outer-product covariance component.
 
-        k(x, y) = \Bigg(1 + \sqrt{3} \frac{|x - y|}{L}\Bigg) \exp\Bigg( -\sqrt{3} \frac{|x - y|}{L}\Bigg)
-    
+    This returns a ``covtype.Outer`` object parameterized by ``sigma * alpha``.
+    It is useful when building separable or low-rank covariance terms.
+
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        
+        alpha (JAXArray): Feature/basis vector used to construct the outer product.
+        sigma (Scalar, optional): Overall amplitude scale.
+
     Returns:
-        Scalar: Covariance between two input vectors
-        
+        JAXArray: A ``covtype.Outer`` covariance object.
     """
     
     return covtype.Outer(alpha = sigma * alpha)
 
 
 def Constant(const: JAXArray) -> JAXArray:
-    r"""Matern 3/2 kernel function, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices.
-    
-    .. math::
+    r"""Constant covariance term represented as an outer-product component.
 
-        k(x, y) = \Bigg(1 + \sqrt{3} \frac{|x - y|}{L}\Bigg) \exp\Bigg( -\sqrt{3} \frac{|x - y|}{L}\Bigg)
-    
+    This returns a ``covtype.Outer`` object with amplitude equivalent to a
+    constant covariance level.
+
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        
+        const (JAXArray): Constant covariance level (or broadcastable array).
+
     Returns:
-        Scalar: Covariance between two input vectors
-        
+        JAXArray: A ``covtype.Outer`` covariance object.
     """
     
     return covtype.Outer(alpha = jnp.sqrt(const))
 
 
 def Matern32(scale: Scalar, sigma: Scalar = 1.) -> JAXArray:
-    r"""Matern 3/2 kernel function, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices.
-    
+    r"""Matérn-3/2 kernel factory.
+
     .. math::
 
-        k(x, y) = \Bigg(1 + \sqrt{3} \frac{|x - y|}{L}\Bigg) \exp\Bigg( -\sqrt{3} \frac{|x - y|}{L}\Bigg)
-    
+        k(x,y)=\sigma^2\left(1+\sqrt{3}r\right)e^{-\sqrt{3}r},\quad r=\frac{\|x-y\|}{\mathrm{scale}}
+
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        
+        scale (Scalar): Length scale.
+        sigma (Scalar, optional): Kernel amplitude.
+
     Returns:
-        Scalar: Covariance between two input vectors
-        
+        JAXArray: A ``covtype.General`` covariance object.
     """
 
     return covtype.General(lambda hp, x, y, **kwargs: sigma**2 * evaluate_kernel(matern32_calc, x, y, scale))
@@ -289,21 +256,18 @@ def matern32_calc(x: JAXArray, y: JAXArray, L: Scalar) -> JAXArray:
     
 
 def Matern52(scale: Scalar, sigma: Scalar = 1.) -> JAXArray:
-    r"""Matern 5/2 kernel function, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices.
-    
+    r"""Matérn-5/2 kernel factory.
+
     .. math::
 
-        k(x, y) = \Bigg(1 + \sqrt{5} \frac{|x - y|}{L} + \frac{5|x - y|^2}{3L^2}\Bigg) \exp\Bigg( -\sqrt{5}\frac{|x - y|}{L}\Bigg)
-    
+        k(x,y)=\sigma^2\left(1+\sqrt{5}r+\frac{5}{3}r^2\right)e^{-\sqrt{5}r},\quad r=\frac{\|x-y\|}{\mathrm{scale}}
+
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        
+        scale (Scalar): Length scale.
+        sigma (Scalar, optional): Kernel amplitude.
+
     Returns:
-        Scalar: Covariance between two input vectors
-        
+        JAXArray: A ``covtype.General`` covariance object.
     """
     
     return covtype.General(lambda hp, x, y, **kwargs: sigma**2 * evaluate_kernel(matern52_calc, x, y, scale))
@@ -318,29 +282,28 @@ def matern52_calc(x: JAXArray, y: JAXArray, L: Scalar) -> JAXArray:
     
 
 def MaternHalfInt(scale: Scalar, double_nu: int, sigma: Scalar = 1.) -> JAXArray:
-    r"""Matern 5/2 kernel function, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices.
-    
-    .. math::
+    r"""Half-integer Matérn kernel family.
 
-        k(x, y) = \Bigg(1 + \sqrt{5} \frac{|x - y|}{L} + \frac{5|x - y|^2}{3L^2}\Bigg) \exp\Bigg( -\sqrt{5}\frac{|x - y|}{L}\Bigg)
-    
+    Constructs a Matérn covariance with :math:`\nu = (\text{double_nu})/2`,
+    where ``double_nu`` is expected to be an odd positive integer for
+    half-integer :math:`\nu` values.
+
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        
+        scale (Scalar): Length scale parameter.
+        double_nu (int): Twice the Matérn smoothness parameter :math:`\nu`.
+        sigma (Scalar, optional): Kernel amplitude.
+
     Returns:
-        Scalar: Covariance between two input vectors
-        
+        JAXArray: A ``covtype.General`` covariance object.
     """
     p = (double_nu - 1)//2
     return covtype.General(lambda hp, x, y, **kwargs: sigma**2 * evaluate_kernel(matern_half_int_calc, x, y, scale, p))
 
 
 def matern_half_int_calc(x: JAXArray, y: JAXArray, scale: Scalar, p: int) -> JAXArray:
-    """Function used by matern52 to evaluate the Matern 5/2 kernel function. 
-    
+    """Evaluate the half-integer Matérn kernel polynomial form.
+
+    Internal helper used by :func:`MaternHalfInt`.
     """
 
     f = jnp.sqrt(2*p + 1)
@@ -362,22 +325,19 @@ def matern_half_int_calc(x: JAXArray, y: JAXArray, scale: Scalar, p: int) -> JAX
 
     
 def RationalQuadratic(scale: Scalar, alpha: Scalar, sigma: Scalar = 1.) -> JAXArray:
-    r"""Rational quadratic kernel function, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices.
-    
+    r"""Rational quadratic kernel factory.
+
     .. math::
 
-        k(x, y) = \Bigg(1 + \frac{|x - y|^2}{2 \alpha L^2}\Bigg)^{-\alpha}
-    
+        k(x,y)=\sigma^2\left(1+\frac{\|x-y\|^2}{2\alpha\,\mathrm{scale}^2}\right)^{-\alpha}
+
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        alpha (Scalar): Scale mixture parameter
-        
+        scale (Scalar): Length scale.
+        alpha (Scalar): Scale-mixture parameter.
+        sigma (Scalar, optional): Kernel amplitude.
+
     Returns:
-        Scalar: Covariance between two input vectors
-        
+        JAXArray: A ``covtype.General`` covariance object.
     """
     return covtype.General(lambda hp, x, y, **kwargs: sigma**2 * evaluate_kernel(rational_quadratic_calc, x, y, scale, alpha))
 
@@ -392,22 +352,19 @@ def rational_quadratic_calc(x: JAXArray, y: JAXArray, L: Scalar, alpha: Scalar) 
 
 
 def ExpSineSquared(gamma: Scalar, period: Scalar, sigma: Scalar = 1.) -> JAXArray:
-    r"""Exponential sine squared kernel, used with evaluate_kernel
-    to build covariance matrices which have periodic covariance.
-    
+    r"""Exponentiated-sine-squared periodic kernel factory.
+
     .. math::
 
-        k(x, y) = \exp\Bigg( -\frac{2 \sin^2(\pi(x - y)/P)}{L^2}\Bigg)
-    
+        k(x,y)=\sigma^2\exp\left[-\gamma\,\sin^2\!\left(\pi\frac{x-y}{\mathrm{period}}\right)\right]
+
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        L (Scalar): Length scale
-        P (Scalar): Period
-        
+        gamma (Scalar): Periodic smoothness parameter.
+        period (Scalar): Period.
+        sigma (Scalar, optional): Kernel amplitude.
+
     Returns:
-        JAXArray: Covariance between two input vectors
-        
+        JAXArray: A ``covtype.General`` covariance object.
     """
     return covtype.General(lambda hp, x, y, **kwargs: sigma**2 * evaluate_kernel(exp_sine_squared_calc, x, y, gamma, period))
 
@@ -422,21 +379,18 @@ def exp_sine_squared_calc(x: JAXArray, y: JAXArray, gamma: Scalar, period: Scala
     
 
 def Cosine(period: Scalar, sigma: Scalar = 1.) -> JAXArray:
-    r"""Cosine kernel, used with ``luas.kernels.evaluate_kernel``
-    to build covariance matrices which have periodic covariance.
-    
+    r"""Cosine periodic kernel factory.
+
     .. math::
 
-        k(x, y) = \cos\Bigg(\frac{2\pi|x - y|}{P}\Bigg)
-    
+        k(x,y)=\sigma^2\cos\left(2\pi\frac{\|x-y\|}{\mathrm{period}}\right)
+
     Args:
-        x (JAXArray): Input vector 1
-        y (JAXArray): Input vector 2
-        P (Scalar): Period
-        
+        period (Scalar): Period.
+        sigma (Scalar, optional): Kernel amplitude.
+
     Returns:
-        JAXArray: Covariance between two input vectors
-        
+        JAXArray: A ``covtype.General`` covariance object.
     """
 
     return covtype.General(lambda hp, x, y, **kwargs: sigma**2 * evaluate_kernel(cosine_calc, x, y, period))
