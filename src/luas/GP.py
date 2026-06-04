@@ -104,7 +104,7 @@ class GP(object):
         if mf is None:
             # Mean function returns zeros by default
             # Returns a zero array which varies in shape depending on the inputs
-            self.mf = lambda p, X: jnp.zeros(self.data_shape)
+            self.mf = lambda p, X: jnp.zeros(calc_data_shape(X))
         else:
             # Ensure mean function is of the form mf(p, X) and for the
             # observed inputs X should return an array of the same shape
@@ -208,7 +208,7 @@ class GP(object):
         
         ordered_param_list = order_list(list(p_vary.keys()))
 
-        p_vary = check_params_in_bounds(p_vary, param_bounds)
+        p_vary = check_params_in_bounds(p_vary, param_bounds, bound_tol = bound_tol)
 
         print(f"Varying parameters: {ordered_param_list}\nFixed parameters: {list(p_fixed.keys())}")
 
@@ -383,28 +383,7 @@ class GP(object):
         L_inv_R = self.kf.matrix_inv_sqrt(R, transpose = transpose)
         
         return L_inv_R
-
-
-    def studentT_logL(
-        self,
-        p,
-        Y,
-    ):
-        R = Y - self.mf(p, self.x)
-        self.kf = self.build_kf(p, self.x)
-        
-        self.kf, stored_values = self.kf.decompose(self.x)
-        
-        logdetK = stored_values["logdetK"]
-        r_K_inv_r = self.kf.dot_solve(R)
-        
-        nu = jnp.power(10, p["nu"])
-        
-        N = R.size
-        other_terms = gammaln(0.5*(nu+N)) - gammaln(0.5 * nu) - 0.5 * N * jnp.log(jnp.pi*nu)
-        
-        logL = - 0.5 * (nu + N) * jnp.log(1 + r_K_inv_r/nu) - 0.5 * logdetK + other_terms
-        
+    
     
     def logL_stored(
         self,
@@ -522,7 +501,231 @@ class GP(object):
         return logP, stored_values
 
     
-    def predict(
+    def crossval(self, p, X, Y,
+                 train_l = None, train_t = None,
+                 stack_hp_dim1 = [], stack_hp_dim2 = [],
+                 return_predicted_loc = False,
+                 **kwargs):
+
+        x_l, x_t = X
+
+        Y_full = Y.copy()
+    
+        p_obs = deepcopy(p)
+        p_pred = deepcopy(p)
+
+        if train_l is None and train_t is None:
+            raise Exception("Both train_l and train_t cannot be None!")
+    
+        if train_l is not None:
+            ind_l = jnp.arange(x_l.shape[-1])[train_l]
+
+            x_l_pred = x_l[..., ~train_l]
+            x_l = x_l[..., train_l]
+            Y = Y[train_l, :]
+            
+            for par in stack_hp_dim1:
+                p_pred[par] = p_obs[par][~train_l]
+                p_obs[par] = p_obs[par][train_l]
+        else:
+            x_l_pred = None
+            ind_l = jnp.arange(x_l.shape[-1])
+    
+        if train_t is not None:
+            ind_t = jnp.arange(x_t.shape[-1])[train_t]
+
+            x_t_pred = x_t[..., ~train_t]
+            x_t = x_t[..., train_t]
+            Y = Y[:, train_t]
+            
+            for par in stack_hp_dim2:
+                p_pred[par] = p_obs[par][~train_t]
+                p_obs[par] = p_obs[par][train_t]
+        else:
+            x_t_pred = None
+            ind_t = jnp.arange(x_t.shape[-1])
+    
+        gp_mean_pred, M_pred, K_pred_inv_fn = self.predict(
+            p_obs, (x_l, x_t), Y,
+            p_pred = p_pred,
+            x_l_pred = x_l_pred, x_t_pred = x_t_pred,
+            stack_hp_dim1 = stack_hp_dim1, stack_hp_dim2 = stack_hp_dim2,
+            return_predicted_loc = return_predicted_loc,
+            sample = False, return_K_pred_inv = True,
+            **kwargs,
+        )
+        observed_ind = jnp.ix_(ind_l, ind_t)
+
+        gp_mean_pred = gp_mean_pred.at[observed_ind].set(Y_full[observed_ind])
+
+        mf_res = Y_full - M_pred
+        pred_err = Y_full - gp_mean_pred
+
+        mf_res = mf_res.at[observed_ind].set(0.)
+        pred_err = pred_err.at[observed_ind].set(0.)
+
+        K_pred_inv_err = K_pred_inv_fn(pred_err)
+        chi2_pred = (pred_err*K_pred_inv_err).sum()
+        chi2_reduced_pred = chi2_pred/(pred_err != 0).sum()
+        
+        return gp_mean_pred, pred_err, chi2_reduced_pred, mf_res
+    
+    
+    
+    def predict(self, p, X_obs, Y,
+                p_pred = None,
+                x_l_pred = None, x_t_pred = None,
+                interp_params_dim1 = [], interp_params_dim2 = [],
+                interp_row_l = None, interp_row_t = None,
+                stack_hp_dim1 = [], stack_hp_dim2 = [], 
+                sort_l = True, sort_t = True,
+                fast_dim = None, return_predicted_loc = True,
+                sample = False, return_K_pred_inv = False):
+    
+        p_obs = deepcopy(p)
+        
+        if p_pred is None:
+            p_pred = deepcopy(p_obs)
+    
+        # Calculate mean function at observed locations
+        M_obs = self.mf(p_obs, X_obs)
+        
+        pred_loc_equals_obs = False
+        if x_l_pred is None and x_t_pred is None:
+            # If no prediction locations given then taken to be same as observed locations
+            pred_loc_equals_obs = True
+            
+            if fast_dim is None:
+                x_l_pred = X_obs[0].copy()
+            elif fast_dim == 0:
+                x_l_pred = X_obs[0].copy()
+            elif fast_dim == 1:
+                x_t_pred = X_obs[1].copy()
+            else:
+                raise Exception("fast_dim keyword argument must be None, 0 or 1")
+    
+        # Stack observed and predicted locations together for each dimension
+        # Works out location of predicted and observed locations within array
+        # Will sort the total stacked regression variables if requested, necessary for celerite dimensions
+        x_l_total, x_l_pred, obs_points_l, pred_points_l, sort_fn_l = stack_obs_and_pred_points(X_obs[0], x_l_pred, sort = sort_l)
+        x_t_total, x_t_pred, obs_points_t, pred_points_t, sort_fn_t = stack_obs_and_pred_points(X_obs[1], x_t_pred, sort = sort_t)
+
+        x_total = (x_l_total, x_t_total)
+        x_pred = (x_l_pred, x_t_pred)
+        
+        N_l_total = x_l_total.shape[-1]
+        N_t_total = x_t_total.shape[-1]
+        
+        observed_ind = jnp.ix_(jnp.arange(N_l_total)[obs_points_l],
+                               jnp.arange(N_t_total)[obs_points_t])
+    
+        if return_predicted_loc:
+            predicted_ind = jnp.ix_(jnp.arange(N_l_total)[pred_points_l],
+                                    jnp.arange(N_t_total)[pred_points_t])
+        else:
+            predicted_ind = jnp.ix_(jnp.arange(N_l_total), jnp.arange(N_t_total))
+            
+        
+        p_pred = interp_params(p_obs, p_pred, X_obs[0], x_l_pred,
+                               interp_param = interp_params_dim1,
+                               interp_row = interp_row_l)
+        p_pred = interp_params(p_obs, p_pred, X_obs[1], x_t_pred,
+                               interp_param = interp_params_dim2,
+                               interp_row = interp_row_t)
+    
+        p_total = stack_params(p_obs, p_pred,
+                               stack_names_dim1 = stack_hp_dim1, sort_fn_dim1 = sort_fn_l,
+                               stack_names_dim2 = stack_hp_dim2, sort_fn_dim2 = sort_fn_t)
+        
+        if pred_loc_equals_obs:
+            M_pred = M_obs.copy()
+        elif return_predicted_loc:
+            M_pred = self.mf(p_pred, x_pred)
+        else:
+            M_pred = self.mf(p_total, x_total)
+    
+        
+        # GP mean calculation
+        R = Y - M_obs
+
+        self.kf = self.build_kf(p_obs, X_obs)
+        self.kf, stored_values = self.kf.decompose(X_obs)
+        K_inv_R = self.kf.inverse(R)
+        
+        K_inv_R_to_mult = jnp.zeros((N_l_total, N_t_total))
+        K_inv_R_to_mult = K_inv_R_to_mult.at[observed_ind].set(K_inv_R)
+
+        self.kf_total = self.build_kf(p_total, x_total)
+        Ks_Kinv_R_term = self.kf_total.matmul(x_total, x_total, K_inv_R_to_mult, wn = False, full = True)
+        
+        gp_mean_pred = M_pred + Ks_Kinv_R_term[predicted_ind]
+
+        if sample:
+            K_pred_draw = self.sample_conditional(p_obs, X_obs, p_total, x_total, observed_ind)
+            K_pred_draw = gp_mean_pred + K_pred_draw[predicted_ind]
+    
+            if not return_predicted_loc:
+                K_pred_draw = K_pred_draw.at[observed_ind].set(0.)
+
+        if return_K_pred_inv:
+            self.kf_total, stored_values_total = self.kf_total.decompose(x_total)
+            
+            def K_pred_inv_fn(R):
+                R_pred = R.at[observed_ind].set(0.)
+                K_pred_inv_R = self.kf_total.inverse(R_pred)
+                return K_pred_inv_R
+        
+        if sample and return_K_pred_inv:
+            return gp_mean_pred, M_pred, K_pred_draw, K_pred_inv_fn
+        elif sample and not return_K_pred_inv:
+            return gp_mean_pred, M_pred, K_pred_draw
+        elif not sample and return_K_pred_inv:
+            return gp_mean_pred, M_pred, K_pred_inv_fn
+        else:
+            return gp_mean_pred, M_pred
+
+    
+    def sample_conditional(self,
+               p_obs, x_obs,
+               p_total, x_total,
+               observed_ind,
+               stored_values = {}, stored_values_total = {}):
+        # Takes a draw from the predictive covariance matrix
+    
+        # First take a draw from K_pred^-1 (weird but it's just how this optimisation works...)
+        self.kf = self.build_kf(p_obs, x_obs)
+        self.kf_total = self.build_kf(p_total, x_total)
+        K_pred_inv_draw, stored_values_K_full = self.kf_total.K_inv_draw(p_total, x_total,
+                                                                         stored_values_total)
+
+        
+        # Zero out observed value locations as they don't correspond to a draw from K_pred_inv
+        K_pred_inv_draw = K_pred_inv_draw.at[observed_ind].set(0.)
+        
+        # Mult by K_full, calculates [K_s @ K_pred_inv_sqrt @ z, K_ss @ K_pred_inv_sqrt @ z]
+        K_pred_draw = self.kf_total.K_mult_vec(p_total, x_total, K_pred_inv_draw,
+                                            stored_values_total)
+        
+        # Take values corresponding to K_s @ K_pred_inv_sqrt @ z
+        K_s_K_inv_sqrt = K_pred_draw[observed_ind]
+        
+        # Calc K_inv @ K_s @ K_pred_inv_sqrt @ z
+        K_inv_K_s_K_inv_sqrt, stored_values_K = self.kf.solve(p_obs, x_obs,
+                                                              K_s_K_inv_sqrt, stored_values)
+        
+        # Calc K_s.T @ K_inv @ K_s @ K_pred_inv_sqrt @ z
+        final_K_mult = jnp.zeros_like(K_pred_draw)
+        final_K_mult = final_K_mult.at[observed_ind].set(K_inv_K_s_K_inv_sqrt)
+        Ks_Kinv_Ks_term = self.kf_total.K_mult_vec(p_total, x_total,
+                                                final_K_mult, stored_values_total)
+        
+        # Calc (K_ss - K_s.T @ K_inv @ K_s) @ K_pred_inv_sqrt @ z
+        K_pred_draw -= Ks_Kinv_Ks_term
+    
+        return K_pred_draw
+        
+        
+    def predict_old(
         self,
         p: PyTree,
         Y: JAXArray,
@@ -592,226 +795,6 @@ class GP(object):
         
         return gp_mean, pred_err, M_pred
 
-
-    
-    def crossval(self, p, x_l, x_t, Y,
-                 train_l = None, train_t = None,
-                 stack_hp_dim1 = [], stack_hp_dim2 = [],
-                 return_predicted_loc = False,
-                 **kwargs):
-
-        
-        observed_ind = jnp.ix_(jnp.arange(x_l.shape[-1])[train_l],
-                               jnp.arange(x_t.shape[-1])[train_t])
-
-        Y_full = Y.copy()
-    
-        p_obs = deepcopy(p)
-        p_pred = deepcopy(p)
-    
-        if train_l is not None:
-            x_l_pred = x_l[~train_l]
-            x_l = x_l[train_l]
-            Y = Y[train_l, :]
-            
-            for par in stack_hp_dim1:
-                p_pred[par] = p_obs[par][~train_l]
-                p_obs[par] = p_obs[par][train_l]
-    
-        if train_t is not None:
-            x_t_pred = x_t[~train_t]
-            x_t = x_t[train_t]
-            Y = Y[:, train_t]
-            
-            for par in stack_hp_dim2:
-                p_pred[par] = p_obs[par][~train_t]
-                p_obs[par] = p_obs[par][train_t]
-    
-        gp_mean_pred, M_pred, K_pred_inv_fn = self.predict_new(
-            p_obs, x_l, x_t, Y,
-            p_pred = p_pred,
-            x_l_pred = x_l_pred, x_t_pred = x_t_pred,
-            stack_hp_dim1 = stack_hp_dim1, stack_hp_dim2 = stack_hp_dim2,
-            return_predicted_loc = return_predicted_loc,
-            sort_l = True, sort_t = True, sample = False,
-            return_K_pred_inv = True,
-            **kwargs,
-        )
-
-        gp_mean_pred = gp_mean_pred.at[observed_ind].set(Y_full[observed_ind])
-
-        mf_res = Y_full - M_pred
-        pred_err = Y_full - gp_mean_pred
-
-        mf_res = mf_res.at[observed_ind].set(0.)
-        pred_err = pred_err.at[observed_ind].set(0.)
-
-        K_pred_inv_err = K_pred_inv_fn(pred_err)
-        chi2_pred = (pred_err*K_pred_inv_err).sum()
-        chi2_reduced_pred = chi2_pred/(pred_err != 0).sum()
-        
-        return gp_mean_pred, pred_err, chi2_reduced_pred, mf_res
-    
-    
-    
-    def predict_new(self, p, X_obs, Y,
-                p_pred = None,
-                x_l_pred = None, x_t_pred = None,
-                interp_params_dim1 = [], interp_params_dim2 = [],
-                interp_row_l = None, interp_row_t = None,
-                stack_hp_dim1 = [], stack_hp_dim2 = [], 
-                sort_l = True, sort_t = True,
-                fast_dim = None, return_predicted_loc = True,
-                sample = False, return_K_pred_inv = False):
-    
-        p_obs = deepcopy(p)
-        
-        if p_pred is None:
-            p_pred = deepcopy(p_obs)
-    
-        N_l = X_obs[0].shape[-1]
-        N_t = X_obs[1].shape[-1]
-
-    
-        # Calculate mean function at observed locations
-        M_obs = self.mf(p_obs, X_obs)
-        
-        pred_loc_equals_obs = False
-        if x_l_pred is None and x_t_pred is None:
-            # If no prediction locations given then taken to be same as observed locations
-            pred_loc_equals_obs = True
-            
-            if fast_dim is None:
-                x_l_pred = X_obs[0].copy()
-            elif fast_dim == 0:
-                x_l_pred = X_obs[0].copy()
-            elif fast_dim == 1:
-                x_t_pred = X_obs[1].copy()
-            else:
-                raise Exception("fast_dim keyword argument must be None, 0 or 1")
-    
-        # Stack observed and predicted locations together for each dimension
-        # Works out location of predicted and observed locations within array
-        # Will sort the total stacked regression variables if requested, necessary for celerite dimensions
-        x_l_total, x_l_pred, obs_points_l, pred_points_l, sort_fn_l = stack_obs_and_pred_points(X_obs[0], x_l_pred, sort = sort_l)
-        x_t_total, x_t_pred, obs_points_t, pred_points_t, sort_fn_t = stack_obs_and_pred_points(X_obs[1], x_t_pred, sort = sort_t)
-
-        x_total = (x_l_total, x_t_total)
-        x_pred = (x_l_pred, x_t_pred)
-        
-        N_l_total = x_l_total.shape[-1]
-        N_t_total = x_t_total.shape[-1]
-        x_total_shape = (N_l_total, N_t_total)
-        
-        observed_ind = jnp.ix_(jnp.arange(N_l_total)[obs_points_l],
-                               jnp.arange(N_t_total)[obs_points_t])
-    
-        if return_predicted_loc:
-            predicted_ind = jnp.ix_(jnp.arange(N_l_total)[pred_points_l],
-                                    jnp.arange(N_t_total)[pred_points_t])
-        else:
-            predicted_ind = jnp.ix_(jnp.arange(N_l_total), jnp.arange(N_t_total))
-            
-        
-        p_pred = interp_params(p_obs, p_pred, X_obs[0], x_l_pred,
-                               interp_param = interp_params_dim1,
-                               interp_row = interp_row_l)
-        p_pred = interp_params(p_obs, p_pred, X_obs[1], x_t_pred,
-                               interp_param = interp_params_dim2,
-                               interp_row = interp_row_t)
-    
-        p_total = stack_params(p_obs, p_pred,
-                               stack_names_dim1 = stack_hp_dim1, sort_fn_dim1 = sort_fn_l,
-                               stack_names_dim2 = stack_hp_dim2, sort_fn_dim2 = sort_fn_t)
-        
-        if pred_loc_equals_obs:
-            M_pred = M_obs.copy()
-        elif return_predicted_loc:
-            M_pred = self.mf(p_pred, x_pred)
-        else:
-            M_pred = self.mf(p_total, x_total)
-    
-        
-        # GP mean calculation
-        R = Y - M_obs
-
-        self.kf = self.build_kf(p_obs, X_obs)
-        self.kf, stored_values = self.kf.decompose(X_obs)
-        K_inv_R = self.kf.matrix_inv_sqrt(R)
-        
-        K_inv_R_to_mult = jnp.zeros((N_l_total, N_t_total))
-        K_inv_R_to_mult = K_inv_R_to_mult.at[observed_ind].set(K_inv_R)
-
-        self.kf_total = self.build_kf(p_total, x_total)
-        Ks_Kinv_R_term = self.kf_total.matmul(x_total, x_total, K_inv_R_to_mult, wn = False, full = True)
-        
-        gp_mean_pred = M_pred + Ks_Kinv_R_term[predicted_ind]
-
-        if sample:
-            K_pred_draw = self.sample_conditional(p_obs, X_obs, p_total, x_total, observed_ind)
-            K_pred_draw = gp_mean_pred + K_pred_draw[predicted_ind]
-    
-            if not return_predicted_loc:
-                K_pred_draw = K_pred_draw.at[observed_ind].set(0.)
-
-        if return_K_pred_inv:
-            self.kf_total, stored_values_total = self.kf_total.decompose(X_obs)
-            
-            def K_pred_inv_fn(R):
-                R_pred = R.at[observed_ind].set(0.)
-                K_pred_inv_R = self.kf_total.inverse(R_pred)
-                return K_pred_inv_R
-        
-        if sample and return_K_pred_inv:
-            return gp_mean_pred, M_pred, K_pred_draw, K_pred_inv_fn
-        elif sample and not return_K_pred_inv:
-            return gp_mean_pred, M_pred, K_pred_draw
-        elif not sample and return_K_pred_inv:
-            return gp_mean_pred, M_pred, K_pred_inv_fn
-        else:
-            return gp_mean_pred, M_pred
-
-    
-    def sample_conditional(self,
-               p_obs, x_obs,
-               p_total, x_total,
-               observed_ind,
-               stored_values = {}, stored_values_total = {}):
-        # Takes a draw from the predictive covariance matrix
-    
-        # First take a draw from K_pred^-1 (weird but it's just how this optimisation works...)
-        self.kf = self.build_kf(p_obs, x_obs)
-        self.kf_total = self.build_kf(p_total, x_total)
-        K_pred_inv_draw, stored_values_K_full = self.kf_total.K_inv_draw(p_total, x_total,
-                                                                         stored_values_total)
-
-        
-        # Zero out observed value locations as they don't correspond to a draw from K_pred_inv
-        K_pred_inv_draw = K_pred_inv_draw.at[observed_ind].set(0.)
-        
-        # Mult by K_full, calculates [K_s @ K_pred_inv_sqrt @ z, K_ss @ K_pred_inv_sqrt @ z]
-        K_pred_draw = self.kf_total.K_mult_vec(p_total, x_total, K_pred_inv_draw,
-                                            stored_values_total)
-        
-        # Take values corresponding to K_s @ K_pred_inv_sqrt @ z
-        K_s_K_inv_sqrt = K_pred_draw[observed_ind]
-        
-        # Calc K_inv @ K_s @ K_pred_inv_sqrt @ z
-        K_inv_K_s_K_inv_sqrt, stored_values_K = self.kf.solve(p_obs, x_obs,
-                                                              K_s_K_inv_sqrt, stored_values)
-        
-        # Calc K_s.T @ K_inv @ K_s @ K_pred_inv_sqrt @ z
-        final_K_mult = jnp.zeros_like(K_pred_draw)
-        final_K_mult = final_K_mult.at[observed_ind].set(K_inv_K_s_K_inv_sqrt)
-        Ks_Kinv_Ks_term = self.kf_total.K_mult_vec(p_total, x_total,
-                                                final_K_mult, stored_values_total)
-        
-        # Calc (K_ss - K_s.T @ K_inv @ K_s) @ K_pred_inv_sqrt @ z
-        K_pred_draw -= Ks_Kinv_Ks_term
-    
-        return K_pred_draw
-        
-    
     
     def sigma_clip(
         self,
@@ -1046,152 +1029,6 @@ class GP(object):
         else:
             # If not plotting then just returns the autocorrelation matrix
             return auto_corr
-    
-    
-    def logL_hessianable(
-        self,
-        p: PyTree,
-        Y: JAXArray,
-    ) -> Scalar:
-        """Computes the log likelihood without returning any stored values from the
-        decomposition of the covariance matrix. This function is slower for gradient calculations
-        than ``GP.logL`` but is more numerically stable for second-order derivative calculations as
-        required when calculating the hessian. This function still only returns the log likelihood
-        so ``jax.hessian`` must be applied to return the hessian of the log likelihood.
-        
-        Args:
-            p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
-                in addition to any mean function parameters which may be needed to calculate the mean function.
-            Y (JAXArray): Observed data to fit, must be of shape ``(N_l, N_t)``.
-        
-        Returns:
-            Scalar: The value of the log likelihood.
-            
-        """
-        
-        # Subtract mean function from observed data
-        R = Y - self.mf(p, self.x)
-        
-        # Calculate log likelihood and stored values from decomposition
-        self.kf = self.build_kf(p, self.x)
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})  
-        logL_val = self.kf.logL_hessianable(R, stored_values = stored_values)
-        
-        return logL_val
-
-    
-    def logL_hessianable_stored(
-        self,
-        p: PyTree,
-        Y: JAXArray,
-        stored_values: PyTree,
-    ) -> Tuple[Scalar, PyTree]:
-        """Computes the log likelihood and also returns any stored values from the
-        decomposition of the covariance matrix. This function is slower for gradient calculations
-        than ``GP.logL_stored`` but is more numerically stable for second-order derivative calculations as
-        required when calculating the hessian. This function still only returns the log likelihood
-        so jax.hessian must be applied to return the hessian of the log likelihood.
-        
-        Args:
-            p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
-                in addition to any mean function parameters which may be needed to calculate the mean function.
-            Y (JAXArray): Observed data to fit, must be of shape ``(N_l, N_t)``.
-            stored_values (PyTree): Stored values from the decomposition of the covariance matrix. The specific
-                values contained in this PyTree depend on the choice of :class:`Kernel` object and are returned by
-                ``Kernel.decomp_fn``.
-        
-        Returns:
-            (Scalar, PyTree): A tuple where the first element is the value of the log likelihood.
-            The second element is a PyTree which contains stored values from the decomposition of the
-            covariance matrix.
-            
-        """
-        
-        # Subtract mean function from observed data
-        R = Y - self.mf(p, self.x)
-
-        self.kf = self.build_kf(p, self.x)
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = stored_values)  
-        logL_val = self.kf.logL_hessianable(R, stored_values = stored_values)
-    
-        return logL_val, stored_values
-    
-    
-    def logP_hessianable(
-        self,
-        p: PyTree,
-        Y: JAXArray,
-    ) -> Scalar:
-        """Computes the log posterior without returning any stored values from the
-        decomposition of the covariance matrix. This function is slower for gradient calculations
-        than ``GP.logP`` but is more numerically stable for second-order derivative calculations as
-        required when calculating the hessian. This function still only returns the log posterior
-        so jax.hessian must be applied to return the hessian of the log posterior.
-        
-        Args:
-            p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
-                in addition to any mean function parameters which may be needed to calculate the mean function.
-                Also input to the logPrior function for the calculation of the log priors.
-            Y (JAXArray): Observed data to fit, must be of shape ``(N_l, N_t)``.
-        
-        Returns:
-            Scalar: The value of the log posterior.
-            
-        """
-        
-        logPrior = self.logPrior(p, self.x)
-        R = Y - self.mf(p, self.x)
-        
-        self.kf = self.build_kf(p, self.x)
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})  
-        logL_val = self.kf.logL_hessianable(R, stored_values = stored_values)
-        logP = logPrior + logL_val
-        
-        return logP
-
-    
-    def logP_hessianable_stored(
-        self,
-        p: PyTree,
-        Y: JAXArray,
-        stored_values: PyTree,
-    ) -> Tuple[Scalar, PyTree]:
-        """Computes the log posterior and also returns any stored values from the decomposition of the
-        covariance matrix.
-        
-        Note: 
-            This function is slower for gradient calculations than ``GP.logP_stored`` but is more numerically
-            stable for second-order derivative calculations as required when calculating the hessian.
-            This function still only returns the log posterior so ``jax.hessian`` must be applied to return
-            the hessian of the log posterior.
-        
-        Args:
-            p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
-                in addition to any mean function parameters which may be needed to calculate the mean function.
-                Also input to the logPrior function for the calculation of the log priors.
-            Y (JAXArray): Observed data to fit, must be of shape ``(N_l, N_t)``.
-            stored_values (PyTree): Stored values from the decomposition of the covariance matrix. The specific
-                values contained in this PyTree depend on the choice of :class:`Kernel` object and are returned by
-                ``Kernel.decomp_fn``.
-        
-        Returns:
-            (Scalar, PyTree): A tuple where the first element is the value of the log posterior.
-            The second element is a PyTree which contains stored values from the decomposition of the
-            covariance matrix.
-            
-        """
-
-        
-        R = Y - self.mf(p, self.x)
-
-        self.kf = self.build_kf(p, self.x)
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = stored_values)  
-        logL_val = self.kf.logL_hessianable(R, stored_values = stored_values)
-        
-        logPrior = self.logPrior(p, self.x)
-        logP = logPrior + logL_val
-        
-        return logP, stored_values
     
 
     
@@ -1432,7 +1269,6 @@ class GP(object):
             
         return cov_mat, ordered_param_list
 
-
     
     def plot_cov_mat(
         self,
@@ -1534,6 +1370,7 @@ class GP(object):
 
         if return_fig:
             return fig
+
 
     def gp_mean_calc(
             self,
@@ -1666,107 +1503,177 @@ class GP(object):
             return gp_mean, M
     
     
+
     
-    def plot_cov(
+    def logL_hessianable(
         self,
         p: PyTree,
-        i: int,
-        j: int,
-        corr: Optional[bool] = False,
-        wn: Optional[bool] = True,
-        x_l_plot: Optional[JAXArray] = None,
-        x_t_plot: Optional[JAXArray] = None,
-        **kwargs,
-    ) -> plt.Figure:
-        r"""Creates a plot to aid in visualising how the kernel function is defining the covariance between
-        different points in the observed data. Calculates the covariance of each point in the observed data
-        with a point located at ``(i, j)`` in the observed data. The plot then displays this covariance using
-        ``plt.pcolormesh`` with every other point in the observed data.
-        
-        If ``corr = True`` this will display the correlation instead of the covariance. Also if ``wn = False``
-        then white noise will be excluded from the calculation of the covariance/correlation between each point.
-        This can be helpful if the white noise has a much larger amplitude than correlated noise which can make
-        it difficult to visualise how points are correlated.
+        Y: JAXArray,
+    ) -> Scalar:
+        """Computes the log likelihood without returning any stored values from the
+        decomposition of the covariance matrix. This function is slower for gradient calculations
+        than ``GP.logL`` but is more numerically stable for second-order derivative calculations as
+        required when calculating the hessian. This function still only returns the log likelihood
+        so ``jax.hessian`` must be applied to return the hessian of the log likelihood.
         
         Args:
-            hp (Pytree): Hyperparameters needed to build the covariance matrices
-                ``Kl``, ``Kt``, ``Sl``, ``St``. Will be unaffected if additional mean function
-                parameters are also included.
-            x_l (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
-                for the observed locations. May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l``
-                different wavelength/vertical regression variables.
-            x_t (JAXArray): Array containing time/horizontal dimension regression variable(s) for the
-                observed locations. May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different
-                time/horizontal regression variables.
-            i (int): The wavelength/vertical location of the point to visualise covariance with.
-            j (int): The time/horizontal location of the point to visualise covariance with.
-            corr (bool, optional): If ``True`` will plot the correlation between points instead of the
-                covariance. Defaults to ``False``.
-            wn (bool, optional): Whether to include white noise in the calculation of covariance.
-                Defaults to ``True``.
-            x_l_plot (JAXArray, optional): The values on the y-axis used by ``plt.pcolormesh`` for the plot.
-                If not included will default to ``x_l`` if ``x_l`` is of shape ``(N_l,)`` or to ``x_l[0, :]``
-                if ``x_l`` is of shape ``(d_l, N_l)``.
-            x_t_plot (JAXArray, optional): The values on the x-axis used by ``plt.pcolormesh`` for the plot.
-                If not included will default to ``x_t`` if ``x_t`` is of shape ``(N_t,)`` or to ``x_t[0, :]``
-                if ``x_t`` is of shape ``(d_t, N_t)``.
+            p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
+                in addition to any mean function parameters which may be needed to calculate the mean function.
+            Y (JAXArray): Observed data to fit, must be of shape ``(N_l, N_t)``.
         
         Returns:
-            plt.Figure: A figure displaying the covariance of each point in the observed data with the
-            selected point located at ``(i, j)`` in the observed data ``Y``.
-        
+            Scalar: The value of the log likelihood.
+            
         """
         
-        N_kron_terms = 1 + len(self.kf.K_list)
+        # Subtract mean function from observed data
+        R = Y - self.mf(p, self.x)
         
-        # If no x and y axes for the plots specified, defaults to x_l, x_t
-        # If x_l or x_t contain multiple rows then pick the first row
-        if x_l_plot is None:
-            if self.x_l.ndim == 1:
-                x_l_plot = self.x_l
-            else:
-                x_l_plot = self.x_l[0, :]
-                
-        if x_t_plot is None:
-            if self.x_t.ndim == 1:
-                x_t_plot = self.x_t
-            else:
-                x_t_plot = self.x_t[0, :]
+        # Calculate log likelihood and stored values from decomposition
+        self.kf = self.build_kf(p, self.x)
+        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})  
+        logL_val = self.kf.logL_hessianable(R, stored_values = stored_values)
+        
+        return logL_val
+
+    
+    def logL_hessianable_stored(
+        self,
+        p: PyTree,
+        Y: JAXArray,
+        stored_values: PyTree,
+    ) -> Tuple[Scalar, PyTree]:
+        """Computes the log likelihood and also returns any stored values from the
+        decomposition of the covariance matrix. This function is slower for gradient calculations
+        than ``GP.logL_stored`` but is more numerically stable for second-order derivative calculations as
+        required when calculating the hessian. This function still only returns the log likelihood
+        so jax.hessian must be applied to return the hessian of the log likelihood.
+        
+        Args:
+            p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
+                in addition to any mean function parameters which may be needed to calculate the mean function.
+            Y (JAXArray): Observed data to fit, must be of shape ``(N_l, N_t)``.
+            stored_values (PyTree): Stored values from the decomposition of the covariance matrix. The specific
+                values contained in this PyTree depend on the choice of :class:`Kernel` object and are returned by
+                ``Kernel.decomp_fn``.
+        
+        Returns:
+            (Scalar, PyTree): A tuple where the first element is the value of the log likelihood.
+            The second element is a PyTree which contains stored values from the decomposition of the
+            covariance matrix.
+            
+        """
+        
+        # Subtract mean function from observed data
+        R = Y - self.mf(p, self.x)
 
         self.kf = self.build_kf(p, self.x)
-        Sl = self.kf.Sigma[0].evaluate(p, self.x_l, self.x_l, wn = wn)
-        St = self.kf.Sigma[1].evaluate(p, self.x_t, self.x_t, wn = wn)
-
-        cov = jnp.outer(Sl[i, :], St[j, :])
+        self.kf, stored_values = self.kf.decompose(self.x, stored_values = stored_values)  
+        logL_val = self.kf.logL_hessianable(R, stored_values = stored_values)
+    
+        return logL_val, stored_values
+    
+    
+    def logP_hessianable(
+        self,
+        p: PyTree,
+        Y: JAXArray,
+    ) -> Scalar:
+        """Computes the log posterior without returning any stored values from the
+        decomposition of the covariance matrix. This function is slower for gradient calculations
+        than ``GP.logP`` but is more numerically stable for second-order derivative calculations as
+        required when calculating the hessian. This function still only returns the log posterior
+        so jax.hessian must be applied to return the hessian of the log posterior.
         
-        if corr:
-            diag = jnp.outer(jnp.diag(Sl), jnp.diag(St))
-            
-
-        # Build each component matrix
-        for i in range(N_kron_terms-1):
-            Kl = self.kf.K_list[i][0].evaluate(p, self.x_l, self.x_l, wn = wn)
-            Kt = self.kf.K_list[i][1].evaluate(p, self.x_t, self.x_t, wn = wn)
-
-            cov += jnp.outer(Kl[i, :], Kt[j, :])
-
-            if corr:
-                diag += jnp.outer(jnp.diag(Kl), jnp.diag(Kt))
-
-        if corr:
-            cov /= jnp.sqrt(diag[i, j]*diag)
-            
-        # Generate plot as a pcolormesh
-        fig = plt.pcolormesh(x_t_plot, x_l_plot, cov, **kwargs)
-        plt.gca().invert_yaxis()
-        plt.xlabel(r"$x_t$")
-        plt.ylabel(r"$x_\lambda$")
-        plt.colorbar()
+        Args:
+            p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
+                in addition to any mean function parameters which may be needed to calculate the mean function.
+                Also input to the logPrior function for the calculation of the log priors.
+            Y (JAXArray): Observed data to fit, must be of shape ``(N_l, N_t)``.
         
-        return fig
+        Returns:
+            Scalar: The value of the log posterior.
+            
+        """
+        
+        logPrior = self.logPrior(p, self.x)
+        R = Y - self.mf(p, self.x)
+        
+        self.kf = self.build_kf(p, self.x)
+        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})  
+        logL_val = self.kf.logL_hessianable(R, stored_values = stored_values)
+        logP = logPrior + logL_val
+        
+        return logP
 
+    
+    def logP_hessianable_stored(
+        self,
+        p: PyTree,
+        Y: JAXArray,
+        stored_values: PyTree,
+    ) -> Tuple[Scalar, PyTree]:
+        """Computes the log posterior and also returns any stored values from the decomposition of the
+        covariance matrix.
+        
+        Note: 
+            This function is slower for gradient calculations than ``GP.logP_stored`` but is more numerically
+            stable for second-order derivative calculations as required when calculating the hessian.
+            This function still only returns the log posterior so ``jax.hessian`` must be applied to return
+            the hessian of the log posterior.
+        
+        Args:
+            p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
+                in addition to any mean function parameters which may be needed to calculate the mean function.
+                Also input to the logPrior function for the calculation of the log priors.
+            Y (JAXArray): Observed data to fit, must be of shape ``(N_l, N_t)``.
+            stored_values (PyTree): Stored values from the decomposition of the covariance matrix. The specific
+                values contained in this PyTree depend on the choice of :class:`Kernel` object and are returned by
+                ``Kernel.decomp_fn``.
+        
+        Returns:
+            (Scalar, PyTree): A tuple where the first element is the value of the log posterior.
+            The second element is a PyTree which contains stored values from the decomposition of the
+            covariance matrix.
+            
+        """
 
+        
+        R = Y - self.mf(p, self.x)
 
+        self.kf = self.build_kf(p, self.x)
+        self.kf, stored_values = self.kf.decompose(self.x, stored_values = stored_values)  
+        logL_val = self.kf.logL_hessianable(R, stored_values = stored_values)
+        
+        logPrior = self.logPrior(p, self.x)
+        logP = logPrior + logL_val
+        
+        return logP, stored_values
+    
+
+    def studentT_logL(
+        self,
+        p,
+        Y,
+    ):
+        R = Y - self.mf(p, self.x)
+        self.kf = self.build_kf(p, self.x)
+        
+        self.kf, stored_values = self.kf.decompose(self.x)
+        
+        logdetK = stored_values["logdetK"]
+        r_K_inv_r = self.kf.dot_solve(R)
+        
+        nu = jnp.power(10, p["nu"])
+        
+        N = R.size
+        other_terms = gammaln(0.5*(nu+N)) - gammaln(0.5 * nu) - 0.5 * N * jnp.log(jnp.pi*nu)
+        
+        logL = - 0.5 * (nu + N) * jnp.log(1 + r_K_inv_r/nu) - 0.5 * logdetK + other_terms
+
+        return logL
+        
+    
 
 def interp_params(p_obs, p_pred, x, x_pred,
             interp_param = None, interp_row = 0):
@@ -1775,7 +1682,7 @@ def interp_params(p_obs, p_pred, x, x_pred,
     
     if x.ndim > 1:
         x = x[interp_row, :]
-        x_pred = x_l_pred[interp_row, :]
+        x_pred = x_pred[interp_row, :]
     
     for par in interp_param:
         p_interp[par] = jnp.interp(x_pred, x, p_obs[par])

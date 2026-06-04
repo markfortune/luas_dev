@@ -4,10 +4,10 @@ from luas.kernels.SingleKronTermKernel import SingleKronTermKernel
 from luas.kernels.LuasKernel import LuasKernel
 from luas.kernels.LuasKernelND import LuasKernelND
 from luas.kernels.LuasLasrachKernel import LuasLasrachKernel
-from luas.kernels.MultiTermKernel import MultiTermKernel
-from luas.kernels.MultiTermBothDimKernel import MultiTermBothDimKernel
-from luas.kernels.LuasPlusMultiTermKernel import LuasPlusMultiTermKernel
-from luas.kernels.LuasPlusMultiTermBothDimKernel import LuasPlusMultiTermBothDimKernel
+from luas.kernels.MultiLowRankKernel import MultiLowRankKernel
+from luas.kernels.DoubleMultiLowRankKernel import DoubleMultiLowRankKernel
+from luas.kernels.LuasPlusMultiLowRankKernel import LuasPlusMultiLowRankKernel
+from luas.kernels.ExtendedLuasKernel import ExtendedLuasKernel
 from luas.kernels.LuasLasrachPlusPeriodicKernel import LuasLasrachPlusPeriodicKernel
 from luas.kernels.BlockKernel import BlockKernel
 from luas import kernels as kernels

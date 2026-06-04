@@ -5,7 +5,7 @@ import jax
 from typing import Callable, Tuple, Union, Any, Optional
 import tinygp
 
-from luas import WhiteNoiseKernel, SingleKronTermKernel
+from luas import WhiteNoiseKernel
 from luas.kernels.covtype import Outer, Exp, GeneralQuasisep, CovType, Identity, ScaledIdentity, Diagonal
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar, is_scalar
 from luas.kronecker_fns import kron_prod, tensor_mult
@@ -14,15 +14,12 @@ from luas.kernels.BlockKernel import Block2x2Kernel
 from luas.kernels.MixingMatQuasisep import MixingMatQuasisep
 from luas.kernels.MixingMatGeneral import MixingMatGeneral
 from luas.kernels.householder import orthonormal_nullspace_gen
-from tinygp.solvers.quasisep.core import DiagQSM, StrictLowerTriQSM, SymmQSM
 
 __all__ = [
-    "KinvR_block",
-    "logL_block",
-    "LuasLasrachKernel",
+    "DoubleMultiLowRankKernel",
 ]
     
-class MultiTermBothDimKernel(CovType):
+class DoubleMultiLowRankKernel(CovType):
     
     def __init__(
         self,
