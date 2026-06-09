@@ -9,7 +9,8 @@ from jax.flatten_util import ravel_pytree
 
 import luas.kernels.covtype as covtype
 from luas.kernels.covtype import CovType, Outer
-from luas.kronecker_fns import calc_data_shape, read_K_list_2D
+from luas.kronecker_fns import calc_data_shape
+from luas.kernel_interface import read_K_list_2D
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar
 from luas import (
     WhiteNoiseKernel,
@@ -64,6 +65,9 @@ def kernel_selector(
         elif kf is None:
             # Least squares or some other CovType without parameters
             build_kf = lambda p, X: use_kernel(**kernel_kwargs)
+
+        else:
+            raise Exception(f"use_kernel = {use_kernel} not recognised!")
 
     else:
         # use_kernel is None
@@ -180,6 +184,8 @@ def fastest_opt_2D(dense_kron, N_alpha, N_beta, data_shape,
         longest_dim = 0
     else:
         longest_dim = 1
+
+    print_str = ""
 
     kernel_kwargs = {}
     if dense_kron:

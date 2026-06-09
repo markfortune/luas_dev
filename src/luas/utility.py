@@ -458,7 +458,7 @@ def bin_data_1D(t, y, bin_size):
 
     if bin_size > 1:
         bin_mat = np.kron(np.eye(N//bin_size), np.ones(bin_size)/bin_size)
-        clip = N%bin_size
+        clip = N % bin_size
 
         if clip:
             t_bin = bin_mat @ t[:-clip]

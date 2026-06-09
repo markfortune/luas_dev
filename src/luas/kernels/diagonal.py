@@ -10,27 +10,27 @@ __all__ = [
     "KroneckerDelta"
 ]
 
-def Noise(diag: JAXArray | Scalar) -> JAXArray:
+def Noise(sigma: JAXArray | Scalar) -> JAXArray:
     r"""Diagonal white-noise covariance term.
 
     Returns an identity-like covariance object with diagonal entries
     :math:`\sigma^2` (scalar or element-wise).
 
     Args:
-        diag (JAXArray | Scalar): Noise variance(s).
+        sigma (JAXArray | Scalar): Noise standard deviation(s).
 
     Returns:
-        JAXArray: ``covtype.ScaledIdentity`` for scalar ``diag`` or
-        ``covtype.Diagonal`` for array-valued ``diag``.
+        JAXArray: ``covtype.ScaledIdentity`` for scalar ``sigma`` or
+        ``covtype.Diagonal`` for array-valued ``sigma``.
     """
     
-    if is_scalar(diag):
-        return covtype.ScaledIdentity(wn_diag = diag)
+    if is_scalar(sigma):
+        return covtype.ScaledIdentity(wn_diag = sigma**2)
     else:
-        return covtype.Diagonal(wn_diag = diag)
+        return covtype.Diagonal(wn_diag = sigma**2)
  
   
-def KroneckerDelta(diag: JAXArray | Scalar = None) -> JAXArray:
+def KroneckerDelta(sigma: JAXArray | Scalar = None) -> JAXArray:
     r"""Diagonal covariance term.
 
     Returns an identity-like covariance object with diagonal entries
@@ -41,16 +41,16 @@ def KroneckerDelta(diag: JAXArray | Scalar = None) -> JAXArray:
     will be different, as the GP predictive mean will try to fit this term rather than treating it as uncorrelated noise.
 
     Args:
-        diag (JAXArray | Scalar): Noise variance(s).
+        diag (JAXArray | Scalar): Noise standard deviation(s).
 
     Returns:
-        JAXArray: ``covtype.ScaledIdentity`` for scalar ``diag`` or
-        ``covtype.Diagonal`` for array-valued ``diag``.
+        JAXArray: ``covtype.ScaledIdentity`` for scalar ``sigma`` or
+        ``covtype.Diagonal`` for array-valued ``sigma``.
     """
-    if diag is not None:
-        if is_scalar(diag):
-            return covtype.ScaledIdentity(diag = diag)
+    if sigma is not None:
+        if is_scalar(sigma):
+            return covtype.ScaledIdentity(diag = sigma**2)
         else:
-            return covtype.Diagonal(diag = diag)
+            return covtype.Diagonal(diag = sigma**2)
     else:
         return covtype.Identity()

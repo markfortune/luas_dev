@@ -271,14 +271,17 @@ def transit_light_curve_no_ld(par, t, **kwargs):
     
     return lc(t)
 
+def eclipse_light_curve(par, t, **kwargs):
+    return transit_light_curve_no_ld(par, t, **kwargs)/par["rho"]**2
+
 
 def eclipse_2D(mfp, X, **kwargs):
     x_t = X[1]
     t_baseline = x_t - x_t.mean()
 
     # only generate one transit light curve and rescale for all wavelengths with jnp.outer
-    scaled_transit = transit_light_curve_no_ld(mfp, x_t, **kwargs)/mfp["rho"]**2
-    eclipse_lc = 1. + jnp.outer(mfp["fp_fs"], scaled_transit)
+    normalised_transit = eclipse_light_curve(mfp, x_t, **kwargs)
+    eclipse_lc = 1. + jnp.outer(mfp["fp_fs"], normalised_transit)
 
     # baseline functions can also be outer products
     baseline = jnp.outer(mfp["Tgrad"], t_baseline) + jnp.outer(mfp["Foot"], jnp.ones(x_t.size))

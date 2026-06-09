@@ -212,20 +212,20 @@ def Linear(alpha: JAXArray, sigma: Scalar = 1.) -> JAXArray:
     return covtype.Outer(alpha = sigma * alpha)
 
 
-def Constant(const: JAXArray) -> JAXArray:
+def Constant(sigma: JAXArray) -> JAXArray:
     r"""Constant covariance term represented as an outer-product component.
 
     This returns a ``covtype.Outer`` object with amplitude equivalent to a
     constant covariance level.
 
     Args:
-        const (JAXArray): Constant covariance level (or broadcastable array).
+        sigma (JAXArray): Constant standard deviation.
 
     Returns:
         JAXArray: A ``covtype.Outer`` covariance object.
     """
     
-    return covtype.Outer(alpha = jnp.sqrt(const))
+    return covtype.Outer(alpha = sigma)
 
 
 def Matern32(scale: Scalar, sigma: Scalar = 1.) -> JAXArray:

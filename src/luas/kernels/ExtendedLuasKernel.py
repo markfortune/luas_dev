@@ -5,11 +5,13 @@ import matplotlib.pyplot as plt
 
 from luas.kernels.covtype import Outer, Exp, GeneralQuasisep, CovType, Identity, ScaledIdentity, Diagonal, General
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar, is_scalar
-from luas.kronecker_fns import tensor_mult, vmap_for_tensors, cyclic_transpose, read_K_list_2D
+from luas.kronecker_fns import tensor_mult, vmap_for_tensors, cyclic_transpose
+from luas.kernel_interface import read_K_list_2D
 from luas.kernels.householder import orthonormal_nullspace_gen
 from luas.kernels.BlockKernel import Block2x2Kernel
 from luas.kernels.GeneralKernel import GeneralKernel
-from luas.kernels.LuasPlusMultiTermKernel import LuasPlusMultiTermKernel
+from luas.kernels.LuasPlusMultiLowRankKernel import LuasPlusMultiLowRankKernel
+from luas.stable_gradients import stable_eigh
 import luas.kernels
 
 __all__ = [
@@ -28,6 +30,7 @@ class ExtendedLuasKernel(CovType):
         
         self.Sigma = Sigma[0], Sigma[1]
         self.K_list = K_list
+        self.opt_name = "ExtendedLuasKernel"
 
         self.logL_hessianable = self.logL
         self.decompose = self.decomp_no_stored_values
@@ -85,7 +88,7 @@ class ExtendedLuasKernel(CovType):
         self.K_transf0_B = K_transf0_eval[:-self.N_alpha, -self.N_alpha:]
         self.K_transf0_D = K_transf0_eval[-self.N_alpha:, -self.N_alpha:]
         
-        self.lam_K_transf0_A, self.Q_K_transf0_A = jnp.linalg.eigh(self.K_transf0_A)
+        self.lam_K_transf0_A, self.Q_K_transf0_A = stable_eigh(self.K_transf0_A)
 
         self.K_beta_A = jnp.zeros((self.N_beta, self.N_l - self.N_alpha, self.N_l - self.N_alpha))
         self.K_beta_B = jnp.zeros((self.N_beta, self.N_l - self.N_alpha, self.N_alpha))
@@ -131,7 +134,7 @@ class ExtendedLuasKernel(CovType):
         for j in range(self.N_beta):
             K_A_kernel += ((luas.kernels.Fixed(self.Q_K_transf0_A.T @ self.K_beta_A[j] @ self.Q_K_transf0_A, ignore_idx = True), Outer(self.J_B[:, j])),)
 
-        kf_A = LuasPlusMultiTermKernel(*K_A_kernel, eigen_both = True, fast_dim=1,
+        kf_A = LuasPlusMultiLowRankKernel(*K_A_kernel, eigen_both = True, fast_dim=1,
                                         transform=False, transform_fn = K_A_transform_fn, inv_transform_fn = K_A_inv_transform_fn)
         kf_A, stored_values_A = kf_A.decompose((X[0][:-self.N_alpha], X[1]))
 

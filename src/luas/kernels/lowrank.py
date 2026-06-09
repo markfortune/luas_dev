@@ -222,17 +222,17 @@ def Amplitude(alpha: JAXArray, **kwargs) -> JAXArray:
     return Outer(alpha = alpha)
 
 
-def Constant(const: JAXArray, **kwargs) -> JAXArray:
+def Constant(sigma: JAXArray, **kwargs) -> JAXArray:
     r"""Low-rank constant covariance term.
 
     Args:
-        const (JAXArray): Constant covariance amplitude term.
+        sigma (JAXArray): Constant standard deviation amplitude.
 
     Returns:
         JAXArray: ``Outer`` covariance component.
     """
     
-    return Outer(alpha = jnp.sqrt(const))
+    return Outer(alpha = sigma)
 
 
 def ExpSineSquaredApprox(gamma: Scalar, period: Scalar, order: int, sigma: Scalar = 1., **kwargs):

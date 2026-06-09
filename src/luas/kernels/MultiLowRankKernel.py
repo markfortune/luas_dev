@@ -16,10 +16,10 @@ from luas.kernels.MixingMatQuasisep import MixingMatQuasisep
 from luas.kernels.MixingMatGeneral import MixingMatGeneral
 
 __all__ = [
-    "MultiTermKernel",
+    "MultiLowRankKernel",
 ]
 
-class MultiTermKernel(CovType):
+class MultiLowRankKernel(CovType):
     def __init__(
         self,
         Sigma,

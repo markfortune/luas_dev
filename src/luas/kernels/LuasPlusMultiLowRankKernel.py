@@ -4,11 +4,12 @@ from typing import Callable, Tuple, Union, Any, Optional
 
 from luas.kernels.covtype import Outer, Exp, GeneralQuasisep, CovType, Identity, ScaledIdentity, Diagonal, General
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar, is_scalar
-from luas.kronecker_fns import tensor_mult, vmap_for_tensors, cyclic_transpose, read_K_list_2D
+from luas.kronecker_fns import tensor_mult, vmap_for_tensors, cyclic_transpose
+from luas.kernel_interface import read_K_list_2D
 from luas.kernels.householder import orthonormal_nullspace_gen
 from luas.kernels.BlockKernel import Block2x2Kernel, BlockKernel
 from luas.kernels.GeneralKernel import GeneralKernel
-from luas.kernels.LuasKernel import LuasKernel
+from luas.kernels.LuasKernelND import LuasKernelND
 
 __all__ = [
     "LuasPlusMultiLowRankKernel",
@@ -175,9 +176,9 @@ class LuasPlusMultiLowRankKernel(CovType):
                     (K_fast_tilde, Diagonal(diag = self.lam_K_tilde))
                     )
 
-        # A block consists of a Block Kernel which could be handled through LuasLasrachKernel or LuasKernel
+        # A block consists of a Block Kernel which could be handled through LuasLasrachKernel or LuasKernelND
         if self.eigen_both:
-            kf_A = LuasKernel(*K_A_kernel)
+            kf_A = LuasKernelND(*K_A_kernel)
                 
             kf_A, kf_A_stored_values = kf_A.decompose((X[self.fast_dim][:-self.N_alpha], X[1-self.fast_dim]),
                                                             full = False, idx = (jnp.arange(self.N_fast - self.N_alpha), jnp.arange(self.N_slow))

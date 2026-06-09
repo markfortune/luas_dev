@@ -43,18 +43,18 @@ def CustomTinygp(kf_tinygp: Callable, params = None) -> JAXArray:
     return covtype.GeneralQuasisepPlusNoise(HandleIdx(kf_tinygp), params = params)
 
 
-def Constant(const: JAXArray) -> JAXArray:
+def Constant(sigma: JAXArray) -> JAXArray:
     r"""Constant covariance component.
 
     Args:
-        const (JAXArray): Constant covariance level (must be scalar).
+        const (JAXArray): Constant standard deviation (must be scalar).
 
     Returns:
         JAXArray: Outer-product covariance representation.
     """
-    assert is_scalar(const)
+    assert is_scalar(sigma)
 
-    return covtype.Outer(alpha = jnp.sqrt(const))
+    return covtype.Outer(alpha = sigma)
 
 
 def Linear(alpha: JAXArray, sigma: Scalar = 1., use_block: bool = True, const: None = None) -> JAXArray:

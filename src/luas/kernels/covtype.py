@@ -10,7 +10,6 @@ import jax.scipy.linalg as JLA
 import tinygp
 from tinygp.solvers.quasisep.core import SymmQSM, StrictLowerTriQSM, DiagQSM
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar, is_scalar
-from luas.kronecker_fns import vmap_for_tensors
 import luas.kernels.tinygp_ext
 from luas.kernels.tinygp_ext import ScaledKernel, HandleIdx
 from luas.kernels.householder import HouseholderTransform
@@ -333,7 +332,7 @@ class ScaledIdentity(CovType):
         assert is_scalar(self.diag)
         assert is_scalar(self.wn_diag)
         
-    def evaluate(self, x1, x2, wn = True, row_idx = None, col_idx = None, full = False, **kwargs):
+    def evaluate(self, x1, x2, wn = True, row_idx = None, col_idx = None, full = True, **kwargs):
 
         if full:
             mat = (self.diag + wn*self.wn_diag) * jnp.eye(x1.shape[-1])

@@ -219,10 +219,10 @@ class GP(object):
 
 
 
-    def optimise(self, p_init, Y, param_bounds = {}, vars = [], fixed_vars = [], maxeval = 5000, include_transformed = False):
+    def optimise(self, p_init, Y, param_bounds = {}, vars = None, fixed_vars = None, maxeval = 5000, include_transformed = False):
         import pymc as pm
 
-        pymc_model, var_dict, p_pymc = self.pymc_model(p_init, Y, param_bounds = param_bounds, fixed_vars = fixed_vars)
+        pymc_model, var_dict, p_pymc = self.pymc_model(p_init, Y, param_bounds = param_bounds, vars = vars, fixed_vars = fixed_vars)
 
         # Use PyMC's maximum posteriori optimisation function
         map_estimate = pm.find_MAP(
@@ -554,21 +554,22 @@ class GP(object):
             sample = False, return_K_pred_inv = True,
             **kwargs,
         )
-        observed_ind = jnp.ix_(ind_l, ind_t)
+        return gp_mean_pred, M_pred, K_pred_inv_fn
+        # observed_ind = jnp.ix_(ind_l, ind_t)
 
-        gp_mean_pred = gp_mean_pred.at[observed_ind].set(Y_full[observed_ind])
+        # gp_mean_pred = gp_mean_pred.at[observed_ind].set(Y_full[observed_ind])
 
-        mf_res = Y_full - M_pred
-        pred_err = Y_full - gp_mean_pred
+        # mf_res = Y_full - M_pred
+        # pred_err = Y_full - gp_mean_pred
 
-        mf_res = mf_res.at[observed_ind].set(0.)
-        pred_err = pred_err.at[observed_ind].set(0.)
+        # mf_res = mf_res.at[observed_ind].set(0.)
+        # pred_err = pred_err.at[observed_ind].set(0.)
 
-        K_pred_inv_err = K_pred_inv_fn(pred_err)
-        chi2_pred = (pred_err*K_pred_inv_err).sum()
-        chi2_reduced_pred = chi2_pred/(pred_err != 0).sum()
+        # K_pred_inv_err = K_pred_inv_fn(pred_err)
+        # chi2_pred = (pred_err*K_pred_inv_err).sum()
+        # chi2_reduced_pred = chi2_pred/(pred_err != 0).sum()
         
-        return gp_mean_pred, pred_err, chi2_reduced_pred, mf_res
+        # return gp_mean_pred, pred_err, chi2_reduced_pred, mf_res
     
     
     
@@ -1447,34 +1448,18 @@ class GP(object):
             ax = fig.subplots(1, 4, sharey = True)
         else:
             ax = fig.subplots(1, 4, sharey = True)
-        
-        # # First plot is just the observed data
-        # ax[0].set_title("Data")
-        # # Second plot is just the deterministic mean function
-        # ax[1].set_title("Mean function")
-        # # Third plot is the GP mean fit to the data without the mean function included
-        # ax[2].set_title("GP mean (excl. mean function)")
-        # # Final plot is the residuals of the observed data after subtraction of the GP
-        # # predictive mean (including the deterministic mean function)
-        # ax[3].set_title("Residual noise")
+
+
+        titles = ["Data", "Mean function", "GP mean (excl. mean function)", "Residual noise"]
+        data = [Y, M, gp_mean - M, Y - gp_mean]
 
         if self.dim == 1:
-            ax[0].plot(x_plot[0], Y)
-            ax[1].plot(x_plot[0], M)
-            ax[2].plot(x_plot[0], gp_mean - M)
-            ax[3].plot(x_plot[0], Y - gp_mean)
-
             for i in range(4):
-                ax[i].set_xlabel(r'$x$')
-                
+                ax[i].plot(x_plot[0], data[i])
+                ax[i].set_xlabel(axes_labels[0])
+                ax[i].set_title(titles[i])
+        
         elif self.dim == 2:
-            # ax[0].pcolormesh(x_plot[1], x_plot[0], Y, shading = "nearest")
-            # ax[1].pcolormesh(x_plot[1], x_plot[0], M, shading = "nearest")
-            # ax[2].pcolormesh(x_plot[1], x_plot[0], gp_mean - M, shading = "nearest")
-            # ax[3].pcolormesh(x_plot[1], x_plot[0], Y - gp_mean, shading = "nearest")
-
-            titles = ["Data", "Mean function", "GP mean (excl. mean function)", "Residual noise"]
-            data = [Y, M, gp_mean - M, Y - gp_mean]
 
             ims = [ax[i].pcolormesh(x_plot[1], x_plot[0], data[i], shading="nearest")
                    for i in range(4)]
@@ -1488,7 +1473,7 @@ class GP(object):
             ax[0].set_ylabel(axes_labels[0], fontsize = 14)
             for i in range(4):
                 ax[i].set_xlabel(axes_labels[1], fontsize = 14)
-    
+
             # pcolormesh defaults to having the y-axis decrease with height which is weird so invert it
             plt.gca().invert_yaxis()
 
