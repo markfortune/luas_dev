@@ -165,6 +165,7 @@ class LuasKernel(Kernel):
 
         self.Sigma = Sigma
         self.K_list = [K]
+        self.opt_name = "LuasKernel"
 
         for i in range(2):
             S_i = [self.Sl, self.St][i]

@@ -30,6 +30,7 @@ class SingleKronTermKernel(CovType):
         self.Sigma = Sigma
         self.dim = len(Sigma)
         self.inv_dims = inv_dims
+        self.opt_name = "SingleKronTermKernel"
 
         if inv_dims:
             self.dot_solve = self.dot_solve_w_inv_dims

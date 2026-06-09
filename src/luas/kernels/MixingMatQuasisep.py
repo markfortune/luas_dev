@@ -17,6 +17,7 @@ class MixingMatQuasisep(CovType):
         self.params = params
         self.fast_dim = fast_dim
         self.use_block = use_block
+        self.opt_name = "Gordon et al. (2020)/tinygp method"
     
     def _flatten_R(self, R):
         if self.fast_dim == 0:

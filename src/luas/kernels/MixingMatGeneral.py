@@ -20,6 +20,7 @@ class MixingMatGeneral(CovType):
         self.params = params
         self.fast_dim = fast_dim
         self.use_block = use_block
+        self.opt_name = "MixingMatGeneral"
     
     def _flatten_R(self, R):
         if False: #self.fast_dim == 0:

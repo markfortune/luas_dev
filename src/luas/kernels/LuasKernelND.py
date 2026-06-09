@@ -49,6 +49,7 @@ class LuasKernelND(CovType):
         self.Sigma = Sigma
         self.K = K
         self.dim = len(Sigma)
+        self.opt_name = "LuasKernelND"
         
         self.K_list = [K]
            

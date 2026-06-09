@@ -38,6 +38,7 @@ class LuasPlusMultiLowRankKernel(CovType):
         self.eigen_both = eigen_both
         self.transform = transform
         self.use_pmap = use_pmap
+        self.opt_name = "LuasPlusMultiLowRankKernel"
 
         if transform_fn is not None:
             self.transform_fn = transform_fn

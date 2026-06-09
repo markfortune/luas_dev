@@ -36,6 +36,7 @@ class LuasLasrachPlusPeriodicKernel(CovType):
         self.fast_dim = fast_dim
         self.period = period
         self.K_list = (K,periodic_term)
+        self.opt_name = "LuasLasrachPlusPeriodicKernel"
            
         # Have different decomposition functions depending on whether previous stored values
         # are to be used to avoid recalculating eigendecompositions

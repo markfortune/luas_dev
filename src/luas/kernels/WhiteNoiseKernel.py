@@ -18,38 +18,6 @@ __all__ = ["WhiteNoiseKernel"]
 
 
 class WhiteNoiseKernel(CovType):
-    """Kernel object which solves for the log likelihood for any general kernel function ``K``.
-    Can also generate noise from ``K`` and can be used to compute the GP predictive mean and 
-    predictive covariance matrix conditioned on observed data.
-    
-    Note:
-        This method scales poorly in runtime and memory and is likely only appropriate for 
-        small data sets. If the covariance matrix ``K`` possesses structure which can be exploited
-        for matrix decomposition then specifying a ``decomp_fn`` which can more efficiently return
-        a Cholesky factor and log determinant of ``K`` could lead to significant runtime savings.
-        The :class:`LuasKernel` class should provide significant runtime savings if the covariance matrix
-        has kronecker product structure in each dimension except in cases where one of the dimensions
-        is very small or a sum of more than two kronecker products is needed.
-        
-    .. code-block:: python
-
-        >>> from luas import GeneralKernel, kernels
-        >>> def K_fn(hp, x_l1, x_l2, x_t1, x_t2, wn = True):
-        >>> ... Kl = hp["h"]**2*kernels.squared_exp(x_l1, x_l2, hp["l_l"])
-        >>> ... Kt = kernels.squared_exp(x_l1, x_l2, hp["l_t"])
-        >>> ... K = jnp.kron(Kl, Kt)
-        >>> ... return K
-        >>> kernel = GeneralKernel(K = K_fn)
-        ... )
-    
-    Args:
-        K (Callable, optional): Function which returns the covariance matrix ``K``.
-        decomp_fn (Callable, optional): Function which given the covariance matrix ``K``
-            computes the Cholesky decomposition and log determinant of ``K``.
-            Defaults to ``luas.GeneralKernel.general_cholesky`` which performs Cholesky decomposition for
-            any general covariance matrix.
-            
-    """
     
     def __init__(
         self,
@@ -60,6 +28,7 @@ class WhiteNoiseKernel(CovType):
         # Function used to build the covariance matrix K
         self.diag = diag
         self.wn_diag = wn_diag
+        self.opt_name = "WhiteNoiseKernel"
         
         # alias to maintain consistency with LuasKernel which has a separate fn for calculating the hessian
         self.logL_hessianable = self.logL

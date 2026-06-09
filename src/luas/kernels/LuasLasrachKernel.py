@@ -22,50 +22,6 @@ __all__ = [
 ]
 
 class LuasLasrachKernel(CovType):
-    r"""Kernel class which solves for the log likelihood for any covariance matrix which
-    is the sum of two kronecker products of the covariance matrix in each of two dimensions
-    i.e. the full covariance matrix K is given by:
-    
-    .. math::
-        K = K_l \otimes K_t + S_l \otimes S_t
-    
-    although we can avoid calculating ``K`` for many calculations implemented here.
-        
-    The ``Kl`` and ``Sl`` functions should both return ``(N_l, N_l)`` matrices which will be the covariance
-    matrices in the wavelength/vertical direction.
-    
-    The ``Kt`` and ``St`` functions should both return ``(N_t, N_t)`` matrices which will by the covariance
-    matrices in the time/horizontal direction.
-    
-    .. code-block:: python
-
-        >>> from luas import LuasKernel, kernels
-        >>> def Kl_fn(hp, x_l1, x_l2, wn = True):
-        >>> ... return hp["h"]**2*kernels.squared_exp(x_l1, x_l2, hp["l_l"])
-        >>> def Kt_fn(hp, x_t1, x_t2, wn = True):
-        >>> ... return kernels.squared_exp(x_t1, x_t2, hp["l_t"])
-        >>> # ... And similarly for Sl_fn, St_fn
-        >>> kernel = LuasKernel(Kl = Kl_fn, Kt = Kt_fn, Sl = Sl_fn, St = St_fn)
-        ... )
-    
-    See https://luas.readthedocs.io/en/latest/tutorials.html for more detailed tutorials on how to use.
-        
-    Args:
-        Kl (Callable): Function which returns the covariance matrix Kl, should be of the form
-            ``Kl(hp, x_l1, x_l2, wn = True)``.
-        Kt (Callable): Function which returns the covariance matrix Kt, should be of the form
-            ``Kt(hp, x_t1, x_t2, wn = True)``.
-        Sl (Callable): Function which returns the covariance matrix Sl, should be of the form
-            ``Sl(hp, x_l1, x_l2, wn = True)``.
-        St (Callable): Function which returns the covariance matrix St, should be of the form
-            ``St(hp, x_t1, x_t2, wn = True)``.
-        use_stored_values (bool, optional): Whether to perform checks if any of the component
-            covariance matrices have changed and to make use of previously stored values for
-            the decomposition of those matrices if they're the same. If ``False`` then will
-            not perform these checks and will compute the eigendecomposition of all matrices
-            for every calculation.
-    
-    """
     
     def __init__(
         self,
@@ -82,6 +38,7 @@ class LuasLasrachKernel(CovType):
         self.fast_dim = fast_dim
         self.K_list = (K,)
         self.use_pmap = use_pmap
+        self.opt_name = "LuasLasrachKernel"
            
         # Have different decomposition functions depending on whether previous stored values
         # are to be used to avoid recalculating eigendecompositions

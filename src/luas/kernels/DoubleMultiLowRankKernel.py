@@ -38,6 +38,7 @@ class DoubleMultiLowRankKernel(CovType):
         self.never_reduce_dim = never_reduce_dim
         self.N_alpha = len(K_list)
         self.use_quasi = use_quasi
+        self.opt_name = "DoubleMultiLowRankKernel"
 
         self.logL_hessianable = self.logL
         self.decompose = self.decomp_no_stored_values

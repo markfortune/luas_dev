@@ -154,6 +154,7 @@ class General(CovType):
         self.kf = kf
         self.hp = hp
         self.params = params
+        self.opt_name = "General (1D)"
         
     def evaluate(self, x1, x2, **kwargs):
         K = self.kf(self.hp, x1, x2, **kwargs)
@@ -238,6 +239,7 @@ class Identity(CovType):
         self.wn_diag = 0.
         self.logdet = 0.
         self.params = []
+        self.opt_name = "WhiteNoiseKernel (1D)"
 
     def evaluate(self, x1, x2, row_idx = None, col_idx = None, full = True, **kwargs):
 
@@ -328,6 +330,7 @@ class ScaledIdentity(CovType):
         self.diag = diag
         self.wn_diag = wn_diag
         self.params = params
+        self.opt_name = "WhiteNoiseKernel (1D)"
 
         assert is_scalar(self.diag)
         assert is_scalar(self.wn_diag)
@@ -430,6 +433,7 @@ class Diagonal(CovType):
         self.N = (diag + wn_diag).size
         self.diag = diag * jnp.ones(self.N)
         self.wn_diag = wn_diag * jnp.ones(self.N)
+        self.opt_name = "WhiteNoiseKernel (1D)"
 
         assert self.diag.ndim == 1
         assert self.wn_diag.ndim == 1
@@ -582,6 +586,7 @@ class GeneralQuasisepPlusNoise(CovType):
         self.noise_model = noise_model
         self.use_block = use_block
         self.params = params
+        self.opt_name = "Quasiseparable (1D)"
 
 
     def _tinygp_coords(self, x1, x2, row_idx = None, col_idx = None, full = True):
@@ -829,6 +834,7 @@ class GeneralQuasisep(CovType):
         self.use_block = use_block
         self.noise_model = None
         self.params = params
+        self.opt_name = "Quasiseparable (1D)"
 
     def _to_symm_qsm(self, x, wn = True, idx = None, stored_values = {}):
 
@@ -978,6 +984,7 @@ class Exp(GeneralQuasisep):
         self.use_block = use_block
         self.params = params
         self.fast_eigen = fast_eigen
+        self.opt_name = "Quasiseparable (1D)"
 
         if self.fast_eigen:
             # Note gradients not implemented yet for this method
@@ -1019,6 +1026,7 @@ class Outer(CovType):
         self.diag = 0.
         self.wn_diag = 0.
         self.params = params
+        self.opt_name = "Not a valid kernel!"
 
         if is_scalar(alpha):
             self.tinygp_kf = HandleIdx(luas.kernels.tinygp_ext.Constant(const = alpha**2))
@@ -1181,6 +1189,7 @@ class OuterPlusScaledIdentity(CovType):
         self.diag = diag
         self.wn_diag = wn_diag
         self.params = params
+        self.opt_name = "Rank 1 matrix plus noise"
 
         if is_scalar(alpha):
             self.tinygp_kf = HandleIdx(luas.kernels.tinygp_ext.Constant(const = alpha**2))

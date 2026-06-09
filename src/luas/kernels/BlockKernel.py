@@ -20,6 +20,7 @@ class BlockKernel(CovType):
         self.K_list = K_list
         self.block_dim = block_dim
         self.non_block_dim_size = non_block_dim_size
+        self.opt_name = "Block diagonal covariance matrix"
         
         if use_pmap:
             print("pmap size", self.non_block_dim_size)

@@ -16,10 +16,10 @@ import arviz as az
 import corner
 import pandas as pd
 
-from .GP import GP
-from .pymc_ext import LuasPyMC
-from .numpyro_ext import LuasNumPyro
-from .integrators import BouncingLeapfrog
+from ..GP import GP
+from ..pymc_ext import LuasPyMC
+from ..numpyro_ext import LuasNumPyro
+from ..integrators import BouncingLeapfrog
 
 import numpyro
 import numpyro.distributions as dist
@@ -28,7 +28,7 @@ from numpyro.infer.autoguide import AutoLaplaceApproximation
 from numpyro.infer.initialization import init_to_value
 from jax import random
 
-from .jax_convenience_fns import order_list, order_dict, pytree_to_array_2D, array_to_pytree_2D, varying_params_wrapper
+from ..jax_convenience_fns import order_list, order_dict, pytree_to_array_2D, array_to_pytree_2D, varying_params_wrapper
 
 # # Ensure we are using double precision floats as JAX uses single precision by default
 # jax.config.update("jax_enable_x64", True)

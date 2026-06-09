@@ -29,41 +29,43 @@ __all__ = ["GP"]
 
 
 class GP(object):
-    """Gaussian process class specialised to make the analysis of 2D data sets simple and efficient.
-    Can be used with any :class:`Kernel` such as :class:`LuasKernel` to perform
-    the required log-likelihood calculations in addition to performing GP regression.
-    Support for calculating Laplace approximations of the posterior with respect to
-    the input parameters is also provided as it can be very useful when sampling large numbers of parameters
-    (such as for tuning the MCMC).
+    """Gaussian process interface specialised to make the analysis of grid-based data sets simple and efficient.
     
-    Must have two separate input dimensions which are used to compute the covariance matrix and may additionally
-    be used to compute the deterministic mean function. The observed data ``Y`` is assumed to have shape ``(N_l, N_t)``
-    and will be a parameter of most methods.
-    
-    The first input ``x_l`` is the wavelength/vertical dimension of the observed data ``Y`` and is expected to
-    have shape ``(N_l,)`` or ``(d_l, N_l)`` where N_l is the number of rows of ``Y`` and ``d_l`` is the number
-    of regression variables along the wavelength/vertical dimension used for kernel inputs and/or mean function inputs.
-    Similarly ``x_t`` is assumed to lie along the time/horizontal dimension of the observed data with shape ``(N_t,)`` or
-    ``(d_t, N_t)`` where ``N_t`` is the number of columns of ``Y`` and ``d_t`` is the number of regression variables
-    along the column dimension used as kernel inputs and/or mean function inputs.
+    Must have separable input dimensions which are used to compute the covariance matrix and may additionally
+    be used to compute the mean function and log prior. The observed data ``Y`` used for calculations is assumed to be a JAXArray
+    matching the dimensions of the input regression tuple and input kernel function and mean function.
 
     Args:
-        kf (Kernel): Kernel object which has already been initialised with the desired kernel function.
-        x_l (JAXArray): Array containing wavelength/vertical dimension regression variable(s).
-            May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l`` different wavelength/vertical
-            regression variables.
-        x_t (JAXArray): Array containing time/horizontal dimension regression variable(s).
-            May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different time/horizontal
-            regression variables.
+        p (PyTree | dict): A PyTree of parameters which 
+        X (JAXArray | tuple): For 1D this should be a JAXArray containing the regression variable(s).
+            May be of shape ``(N,)`` or ``(d, N)`` for ``d`` different regression variables.
+            For 2D or higher this should be a tuple of JAXArrays containing the regression variable(s) in each dimension.
+            The order of the regression variables should match the shape of the observed data array.
+        kf (Callable, optional): Function which returns the kernel function to use. Needs to be in the format ``kf(p, X, *kf_args, **kf_kwargs)``
+            For 1D this should return a kernel or sum/product of kernels from luas.kernels directly.
+            For 2D or higher, this should return a tuple or multiple tuples containing the kernel functions in each dimension,
+            in the same order as X and the observed data array.
         mf (Callable, optional): The deterministic mean function, by default returns a JAXArray of zeros.
-            Needs to be in the format ``mf(params, x_l, x_t)`` and returns a JAXArray of shape ``(N_l, N_t)``.
-            matching the shape of the observed data Y.
+            Needs to be in the format ``mf(p, X, *mf_args, **mf_kwargs)`` and returns a JAXArray of the same shape
+            as the observed data array.
         logPrior (Callable, optional): Log prior function, by default returns zero.
-            Needs to be in the format ``logPrior(params)`` and return a scalar.
+            Needs to be in the format ``logPrior(params, X, *logPrior_args, **logPrior_kwargs)`` and return a scalar.
         jit (bool, optional): Whether to ``jax.jit`` compile the likelihood, posterior and GP prediction
             functions. If set to ``False`` then mean functions not written in ``JAX`` are supported and
             can still be used with ``PyMC`` (but not ``NumPyro`` which requires JIT compilation).
             Defaults to ``True``.
+        use_kernel (CovType, optional): Whether to use a specific GP optimisation, rather than the one automatically identified as fast by luas.
+            For example, luas.GeneralKernel will force luas to avoid any optimisations and just build the full covariance matrix and use Cholesky decomposition.
+            In some cases, multiple GP optimisations are valid and it may be worth testing which is fastest,
+            such as luas.LuasKernel and luas.LuasLasrachKernel which should always be valid for the same kernel functions.
+            Some kernels require certain keyword arguments to be specified, which can be input as any additional keyword arguments within kernel_kwargs.
+        verbose (bool, optional): Print information about which optimisations are being used at initialisation.
+        kf_args (tuple, optional): Any additional parameters to input to the kernel function ``kf(p, X, *kf_args, **kf_kwargs)``.
+        kf_kwargs (dict, optional): Any keyword arguments to input to the kernel function ``kf(p, X, *kf_args, **kf_kwargs)``.
+        mf_args (tuple, optional): Any additional parameters to input to the mean function ``mf(p, X, *mf_args, **mf_kwargs)``.
+        mf_kwargs (dict, optional): Any keyword arguments to input to the mean function ``mf(p, X, *mf_args, **mf_kwargs)``.
+        logPrior_args (tuple, optional): Any additional parameters to input to the logPrior function ``logPrior(p, X, *logPrior_args, **logPrior_kwargs)``.
+        logPrior_kwargs (dict, optional): Any keyword arguments to input to the logPrior function ``logPrior(p, X, *logPrior_args, **logPrior_kwargs)``.
             
     """
     
@@ -77,9 +79,9 @@ class GP(object):
         jit: Optional[bool] = True,
         use_kernel: Kernel = None,
         kernel_select_kwargs: Optional[PyTree] = {},
-        verbose = False,
-        mf_args = (), mf_kwargs = {},
+        verbose = True,
         kf_args = (), kf_kwargs = {},
+        mf_args = (), mf_kwargs = {},
         logPrior_args = (), logPrior_kwargs = {},
         **kernel_kwargs,
     ):
@@ -130,7 +132,10 @@ class GP(object):
         self.build_kf = kernel_selector(p, X, kf = self.kf, use_kernel = use_kernel,
                                         verbose = verbose, kernel_select_kwargs = kernel_select_kwargs,
                                         **kernel_kwargs)
-
+        self.kf_eval = self.build_kf(p, self.x)
+        self.opt_name = self.kf_eval.opt_name
+        if verbose:
+            print(f"Using GP optimisation {self.opt_name}")
         if jit:
             # Have to option to avoid JIT compiling which can sometimes be useful
             # e.g. it can make debugging easier
@@ -142,15 +147,15 @@ class GP(object):
             self.logP_stored = jax.jit(self.logP_stored)
             self.logL_hessianable = jax.jit(self.logL_hessianable)
             self.logP_hessianable = jax.jit(self.logP_hessianable)
-    
+
 
     def sample(self, p, add_mf = True, **kwargs):
 
-        self.kf = self.build_kf(p, self.x)
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})
+        self.kf_eval = self.build_kf(p, self.x)
+        self.kf_eval, stored_values = self.kf_eval.decompose(self.x, stored_values = {})
 
         z = np.random.normal(size = self.data_shape)
-        R = self.kf.matrix_sqrt(z, **kwargs)
+        R = self.kf_eval.matrix_sqrt(z, **kwargs)
 
         if add_mf:
             R += self.mf(p, self.x)
@@ -178,11 +183,11 @@ class GP(object):
         
         # Calculate the residuals after subtraction of the deterministic mean function
         R = Y - self.mf(p, self.x)
-        self.kf = self.build_kf(p, self.x)
+        self.kf_eval = self.build_kf(p, self.x)
         
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})
+        self.kf_eval, stored_values = self.kf_eval.decompose(self.x, stored_values = {})
         
-        logL_val = self.kf.logL(R, stored_values = stored_values)
+        logL_val = self.kf_eval.logL(R, stored_values = stored_values)
         
         return logL_val
     
@@ -261,14 +266,14 @@ class GP(object):
         
         # Calculate the residuals after subtraction of the deterministic mean function
         R = Y - self.mf(p, self.x)
-        self.kf = self.build_kf(p, self.x)
+        self.kf_eval = self.build_kf(p, self.x)
         
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})
+        self.kf_eval, stored_values = self.kf_eval.decompose(self.x, stored_values = {})
         
         if inverse:
-            logL_val = self.kf.inv_transform_fn(R, transpose = transpose)
+            logL_val = self.kf_eval.inv_transform_fn(R, transpose = transpose)
         else:
-            logL_val = self.kf.transform_fn(R, transpose = transpose)
+            logL_val = self.kf_eval.transform_fn(R, transpose = transpose)
         
         return logL_val
 
@@ -293,10 +298,10 @@ class GP(object):
             
         """
         
-        self.kf = self.build_kf(p, self.x)
+        self.kf_eval = self.build_kf(p, self.x)
         
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})
-        K_inv_R = self.kf.inverse(R, **kwargs)
+        self.kf_eval, stored_values = self.kf_eval.decompose(self.x, stored_values = {})
+        K_inv_R = self.kf_eval.inverse(R, **kwargs)
         
         return K_inv_R
 
@@ -321,12 +326,12 @@ class GP(object):
             
         """
         
-        self.kf = self.build_kf(p, self.x)
+        self.kf_eval = self.build_kf(p, self.x)
 
         if len(self.x) == 1:
-            K_R = self.kf.matmul(self.x[0], self.x[0], R, full = full, **kwargs)
+            K_R = self.kf_eval.matmul(self.x[0], self.x[0], R, full = full, **kwargs)
         else:
-            K_R = self.kf.matmul(self.x, self.x, R, full = full, **kwargs)
+            K_R = self.kf_eval.matmul(self.x, self.x, R, full = full, **kwargs)
         
         return K_R
         
@@ -350,10 +355,10 @@ class GP(object):
             
         """
         
-        self.kf = self.build_kf(p, self.x)
+        self.kf_eval = self.build_kf(p, self.x)
         
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})
-        L_R = self.kf.matrix_sqrt(R, transpose = transpose)
+        self.kf_eval, stored_values = self.kf_eval.decompose(self.x, stored_values = {})
+        L_R = self.kf_eval.matrix_sqrt(R, transpose = transpose)
         
         return L_R
 
@@ -377,10 +382,10 @@ class GP(object):
             
         """
         
-        self.kf = self.build_kf(p, self.x)
+        self.kf_eval = self.build_kf(p, self.x)
         
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})
-        L_inv_R = self.kf.matrix_inv_sqrt(R, transpose = transpose)
+        self.kf_eval, stored_values = self.kf_eval.decompose(self.x, stored_values = {})
+        L_inv_R = self.kf_eval.matrix_inv_sqrt(R, transpose = transpose)
         
         return L_inv_R
     
@@ -418,9 +423,9 @@ class GP(object):
         
         R = Y - self.mf(p,  self.x)
         
-        self.kf = self.build_kf(p, self.x)
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})  
-        logL_val = self.kf.logL(R, stored_values = stored_values)
+        self.kf_eval = self.build_kf(p, self.x)
+        self.kf_eval, stored_values = self.kf_eval.decompose(self.x, stored_values = {})  
+        logL_val = self.kf_eval.logL(R, stored_values = stored_values)
     
         return logL_val, stored_values
 
@@ -446,9 +451,9 @@ class GP(object):
 
         R = Y - self.mf(p,  self.x)
 
-        self.kf = self.build_kf(p, self.x)
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})  
-        logL_val = self.kf.logL(R, stored_values = stored_values)
+        self.kf_eval = self.build_kf(p, self.x)
+        self.kf_eval, stored_values = self.kf_eval.decompose(self.x, stored_values = {})  
+        logL_val = self.kf_eval.logL(R, stored_values = stored_values)
 
         logPrior = self.logPrior(p, self.x)
         logP = logPrior + logL_val
@@ -491,9 +496,9 @@ class GP(object):
         
         R = Y - self.mf(p,  self.x)
         
-        self.kf = self.build_kf(p, self.x)
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})  
-        logL_val = self.kf.logL(R, stored_values = stored_values)
+        self.kf_eval = self.build_kf(p, self.x)
+        self.kf_eval, stored_values = self.kf_eval.decompose(self.x, stored_values = {})  
+        logL_val = self.kf_eval.logL(R, stored_values = stored_values)
 
         logPrior = self.logPrior(p, self.x)
         logP = logPrior + logL_val
@@ -649,15 +654,15 @@ class GP(object):
         # GP mean calculation
         R = Y - M_obs
 
-        self.kf = self.build_kf(p_obs, X_obs)
-        self.kf, stored_values = self.kf.decompose(X_obs)
-        K_inv_R = self.kf.inverse(R)
+        self.kf_eval = self.build_kf(p_obs, X_obs)
+        self.kf_eval, stored_values = self.kf_eval.decompose(X_obs)
+        K_inv_R = self.kf_eval.inverse(R)
         
         K_inv_R_to_mult = jnp.zeros((N_l_total, N_t_total))
         K_inv_R_to_mult = K_inv_R_to_mult.at[observed_ind].set(K_inv_R)
 
-        self.kf_total = self.build_kf(p_total, x_total)
-        Ks_Kinv_R_term = self.kf_total.matmul(x_total, x_total, K_inv_R_to_mult, wn = False, full = True)
+        self.kf_eval_total = self.build_kf(p_total, x_total)
+        Ks_Kinv_R_term = self.kf_eval_total.matmul(x_total, x_total, K_inv_R_to_mult, wn = False, full = True)
         
         gp_mean_pred = M_pred + Ks_Kinv_R_term[predicted_ind]
 
@@ -669,11 +674,11 @@ class GP(object):
                 K_pred_draw = K_pred_draw.at[observed_ind].set(0.)
 
         if return_K_pred_inv:
-            self.kf_total, stored_values_total = self.kf_total.decompose(x_total)
+            self.kf_eval_total, stored_values_total = self.kf_eval_total.decompose(x_total)
             
             def K_pred_inv_fn(R):
                 R_pred = R.at[observed_ind].set(0.)
-                K_pred_inv_R = self.kf_total.inverse(R_pred)
+                K_pred_inv_R = self.kf_eval_total.inverse(R_pred)
                 return K_pred_inv_R
         
         if sample and return_K_pred_inv:
@@ -694,9 +699,9 @@ class GP(object):
         # Takes a draw from the predictive covariance matrix
     
         # First take a draw from K_pred^-1 (weird but it's just how this optimisation works...)
-        self.kf = self.build_kf(p_obs, x_obs)
-        self.kf_total = self.build_kf(p_total, x_total)
-        K_pred_inv_draw, stored_values_K_full = self.kf_total.K_inv_draw(p_total, x_total,
+        self.kf_eval = self.build_kf(p_obs, x_obs)
+        self.kf_eval_total = self.build_kf(p_total, x_total)
+        K_pred_inv_draw, stored_values_K_full = self.kf_eval_total.K_inv_draw(p_total, x_total,
                                                                          stored_values_total)
 
         
@@ -704,20 +709,20 @@ class GP(object):
         K_pred_inv_draw = K_pred_inv_draw.at[observed_ind].set(0.)
         
         # Mult by K_full, calculates [K_s @ K_pred_inv_sqrt @ z, K_ss @ K_pred_inv_sqrt @ z]
-        K_pred_draw = self.kf_total.K_mult_vec(p_total, x_total, K_pred_inv_draw,
+        K_pred_draw = self.kf_eval_total.K_mult_vec(p_total, x_total, K_pred_inv_draw,
                                             stored_values_total)
         
         # Take values corresponding to K_s @ K_pred_inv_sqrt @ z
         K_s_K_inv_sqrt = K_pred_draw[observed_ind]
         
         # Calc K_inv @ K_s @ K_pred_inv_sqrt @ z
-        K_inv_K_s_K_inv_sqrt, stored_values_K = self.kf.solve(p_obs, x_obs,
+        K_inv_K_s_K_inv_sqrt, stored_values_K = self.kf_eval.solve(p_obs, x_obs,
                                                               K_s_K_inv_sqrt, stored_values)
         
         # Calc K_s.T @ K_inv @ K_s @ K_pred_inv_sqrt @ z
         final_K_mult = jnp.zeros_like(K_pred_draw)
         final_K_mult = final_K_mult.at[observed_ind].set(K_inv_K_s_K_inv_sqrt)
-        Ks_Kinv_Ks_term = self.kf_total.K_mult_vec(p_total, x_total,
+        Ks_Kinv_Ks_term = self.kf_eval_total.K_mult_vec(p_total, x_total,
                                                 final_K_mult, stored_values_total)
         
         # Calc (K_ss - K_s.T @ K_inv @ K_s) @ K_pred_inv_sqrt @ z
@@ -790,8 +795,8 @@ class GP(object):
         
         # Kernel object computes GP regression as the most efficient method depends on the form of
         # the kernel function
-        self.kf = self.build_kf(p, self.x)
-        gp_mean, pred_err = self.kf.predict(p, self.x_l, x_l_pred, self.x_t, x_t_pred, R, M_pred,
+        self.kf_eval = self.build_kf(p, self.x)
+        gp_mean, pred_err = self.kf_eval.predict(p, self.x_l, x_l_pred, self.x_t, x_t_pred, R, M_pred,
                                             return_std_dev = return_std_dev, **kwargs)
         
         return gp_mean, pred_err, M_pred
@@ -1317,8 +1322,8 @@ class GP(object):
         
         """
         
-        self.kf = self.build_kf(p, self.x)
-        N_kron_terms = 1 + len(self.kf.K_list)
+        self.kf_eval = self.build_kf(p, self.x)
+        N_kron_terms = 1 + len(self.kf_eval.K_list)
     
         # If no x and y axes for the plots specified, defaults to x_l, x_t
         # If x_l or x_t contain multiple rows then pick the first row
@@ -1334,14 +1339,14 @@ class GP(object):
         fig, ax = plt.subplots(N_kron_terms, self.dim, figsize = (5*self.dim, 5*N_kron_terms), squeeze=False)
 
         if self.dim == 1:
-            self.kf.Sigma = (self.kf,)
+            self.kf_eval.Sigma = (self.kf_eval,)
         K_list = []
         for d in range(self.dim):
-            K_list.append([self.kf.Sigma[d].evaluate(self.x[d], self.x[d], wn = wn, full = True)])
+            K_list.append([self.kf_eval.Sigma[d].evaluate(self.x[d], self.x[d], wn = wn, full = True)])
             
             # Build each component matrix
             for i in range(N_kron_terms-1):
-                K_list[-1].append(self.kf.K_list[i][d].evaluate(self.x[d], self.x[d], wn = wn, full = True))
+                K_list[-1].append(self.kf_eval.K_list[i][d].evaluate(self.x[d], self.x[d], wn = wn, full = True))
 
         if full:
             raise Exception("Plotting full covariance matrix not implemented")
@@ -1515,9 +1520,9 @@ class GP(object):
         R = Y - self.mf(p, self.x)
         
         # Calculate log likelihood and stored values from decomposition
-        self.kf = self.build_kf(p, self.x)
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})  
-        logL_val = self.kf.logL_hessianable(R, stored_values = stored_values)
+        self.kf_eval = self.build_kf(p, self.x)
+        self.kf_eval, stored_values = self.kf_eval.decompose(self.x, stored_values = {})  
+        logL_val = self.kf_eval.logL_hessianable(R, stored_values = stored_values)
         
         return logL_val
 
@@ -1552,9 +1557,9 @@ class GP(object):
         # Subtract mean function from observed data
         R = Y - self.mf(p, self.x)
 
-        self.kf = self.build_kf(p, self.x)
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = stored_values)  
-        logL_val = self.kf.logL_hessianable(R, stored_values = stored_values)
+        self.kf_eval = self.build_kf(p, self.x)
+        self.kf_eval, stored_values = self.kf_eval.decompose(self.x, stored_values = stored_values)  
+        logL_val = self.kf_eval.logL_hessianable(R, stored_values = stored_values)
     
         return logL_val, stored_values
     
@@ -1584,9 +1589,9 @@ class GP(object):
         logPrior = self.logPrior(p, self.x)
         R = Y - self.mf(p, self.x)
         
-        self.kf = self.build_kf(p, self.x)
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = {})  
-        logL_val = self.kf.logL_hessianable(R, stored_values = stored_values)
+        self.kf_eval = self.build_kf(p, self.x)
+        self.kf_eval, stored_values = self.kf_eval.decompose(self.x, stored_values = {})  
+        logL_val = self.kf_eval.logL_hessianable(R, stored_values = stored_values)
         logP = logPrior + logL_val
         
         return logP
@@ -1626,9 +1631,9 @@ class GP(object):
         
         R = Y - self.mf(p, self.x)
 
-        self.kf = self.build_kf(p, self.x)
-        self.kf, stored_values = self.kf.decompose(self.x, stored_values = stored_values)  
-        logL_val = self.kf.logL_hessianable(R, stored_values = stored_values)
+        self.kf_eval = self.build_kf(p, self.x)
+        self.kf_eval, stored_values = self.kf_eval.decompose(self.x, stored_values = stored_values)  
+        logL_val = self.kf_eval.logL_hessianable(R, stored_values = stored_values)
         
         logPrior = self.logPrior(p, self.x)
         logP = logPrior + logL_val
@@ -1642,12 +1647,12 @@ class GP(object):
         Y,
     ):
         R = Y - self.mf(p, self.x)
-        self.kf = self.build_kf(p, self.x)
+        self.kf_eval = self.build_kf(p, self.x)
         
-        self.kf, stored_values = self.kf.decompose(self.x)
+        self.kf_eval, stored_values = self.kf_eval.decompose(self.x)
         
         logdetK = stored_values["logdetK"]
-        r_K_inv_r = self.kf.dot_solve(R)
+        r_K_inv_r = self.kf_eval.dot_solve(R)
         
         nu = jnp.power(10, p["nu"])
         

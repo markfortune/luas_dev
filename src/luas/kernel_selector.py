@@ -112,7 +112,6 @@ def find_best_optimisation(X, cov_form, verbose = True, **kwargs):
 
     if is_singlekronterm:
         use_kernel, kernel_kwargs = SingleKronTermKernel, {}
-        print_str += "One Kronecker term detected, using method from Saatchi (2011)\n"
     else:
         Sigma, *args = cov_form
 
@@ -123,9 +122,9 @@ def find_best_optimisation(X, cov_form, verbose = True, **kwargs):
 
         if dim == 1:
             raise Exception("""One regressor specified but kernel function doesn't return a kernel.
-    For 1D data make sure the kernel function kf returns a Kernel object rather than a tuple.
-    For >1D data make sure as many regressors are specified as kernel dimensions
-    i.e. X should be a tuple the same length as the terms kf returns.""")
+            For 1D data make sure the kernel function kf returns a Kernel object rather than a tuple.
+            For >1D data make sure as many regressors are specified as kernel dimensions
+            i.e. X should be a tuple the same length as the terms kf returns.""")
         
         elif dim == 2:
             dense_kron, alpha_terms, beta_terms = read_K_list_2D(cov_form[1:], X)
@@ -170,7 +169,7 @@ def find_best_optimisation(X, cov_form, verbose = True, **kwargs):
             print_str += "For >2D with two Kronecker terms we currently default to LuasKernelND, but LuasLasrachKernel may be worth checking too!\n"
             use_kernel, kernel_kwargs = LuasKernelND, {}
 
-    if verbose:
+    if verbose and print_str:
         print(print_str)
     
     return use_kernel, kernel_kwargs

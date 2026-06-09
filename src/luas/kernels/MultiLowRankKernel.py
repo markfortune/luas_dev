@@ -38,6 +38,12 @@ class MultiLowRankKernel(CovType):
         self.N_alpha = len(K_list)
         self.use_quasi = use_quasi
 
+        if self.N_alpha == 1:
+            # For one term converges to same optimisation as LuasLasrachKernel
+            self.opt_name = "LuasLasrachKernel/MultiLowRankKernel"
+        else:
+            self.opt_name = "MultiLowRankKernel"
+
         self.logL_hessianable = self.logL
         self.decompose = self.decomp_no_stored_values
 
