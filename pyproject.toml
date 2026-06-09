@@ -16,6 +16,12 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"luas.kernels" = ["data/*"]
+
 [project.optional-dependencies]
 test = ["pytest"]
 docs = [
