@@ -106,7 +106,7 @@ class LuasKernelND(CovType):
             else:
                 K_d = self.K[d]
             
-            K_d_new = Sigma_d_new.inv_sqrt_transform(K_d, X[d])
+            K_d_new = Sigma_d_new.inv_sqrt_transform(K_d, X[d], full = full, idx = idx[d])
             
             if gp_dim > 2:
                 Sigma_d_new.matrix_sqrt = vmap_for_tensors(Sigma_d_new.matrix_sqrt)

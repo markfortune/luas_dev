@@ -129,13 +129,15 @@ class GP(object):
                                    For a single argument use logPrior_args = (arg1,)""")
         
         # Identify GP optimisation to use
-        self.build_kf = kernel_selector(p, X, kf = self.kf, use_kernel = use_kernel,
+        self.build_kf = kernel_selector(p, self.x, kf = self.kf, use_kernel = use_kernel,
                                         verbose = verbose, kernel_select_kwargs = kernel_select_kwargs,
                                         **kernel_kwargs)
         self.kf_eval = self.build_kf(p, self.x)
+        
         self.opt_name = self.kf_eval.opt_name
         if verbose:
             print(f"Using GP optimisation {self.opt_name}")
+
         if jit:
             # Have to option to avoid JIT compiling which can sometimes be useful
             # e.g. it can make debugging easier

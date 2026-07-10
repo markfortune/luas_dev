@@ -139,8 +139,8 @@ def find_best_optimisation(X, cov_form, verbose = True, **kwargs):
                 longest_dim = 1
 
             # Check whether there is a valid "Celerite dimension", will do nothing if args is None
-            dim0_quasi_compat = True
-            dim1_quasi_compat = True
+            dim0_quasi_compat = isinstance(Sigma[0], quasisep_compatible_list)
+            dim1_quasi_compat = isinstance(Sigma[1], quasisep_compatible_list)
 
             for arg in args:
                 dim0_quasi_compat = isinstance(arg[0], quasisep_compatible_list) and dim0_quasi_compat

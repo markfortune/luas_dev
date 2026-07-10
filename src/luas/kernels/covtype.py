@@ -94,7 +94,7 @@ class CovType():
         elif isinstance(K, (General, GeneralQuasisep, GeneralQuasisepPlusNoise, Identity,
                             ScaledIdentity, Diagonal, OuterPlusScaledIdentity)):
             # Define a new General covtype for K where it's kernel function transforms it
-            K_eval = K.evaluate(x, x, **K_kwargs)
+            K_eval = K.evaluate(x, x, row_idx = K_kwargs.get("idx"), col_idx = K_kwargs.get("idx"), full = K_kwargs.get("full", True))
             K_prime = self.matrix_inv_sqrt(K_eval, transpose=0)
             K_tilde_eval = self.matrix_inv_sqrt(K_prime.T, transpose=0)
 
@@ -205,7 +205,7 @@ class General(CovType):
                 u_row, u_col = u.copy(), u.copy()
                 w_i_row, w_i_col = w_i.copy(), w_i.copy()
             else:
-                raise Exception("AHHHH")
+                raise Exception("Must specify row and col indices or else set full = True to evaluate the full covariance matrix")
             
             K += 4 * u_dot_w * jnp.outer(u_row, u_col)
             K -= 2 * (jnp.outer(u_row, w_i_col) + jnp.outer(w_i_row, u_col))
@@ -507,7 +507,7 @@ class Diagonal(CovType):
 
         elif isinstance(K, General):
             D_inv_sqrt = 1/jnp.sqrt(self.D)
-            K_eval = jnp.outer(D_inv_sqrt, D_inv_sqrt) * K.evaluate(x, x, **K_kwargs)
+            K_eval = jnp.outer(D_inv_sqrt, D_inv_sqrt) * K.evaluate(x, x, row_idx = K_kwargs.get("idx"), col_idx = K_kwargs.get("idx"), full = K_kwargs.get("full", True))
             # Define a new General covtype for K where it's kernel function transforms it
             def kf_transf(hp, x1, x2, full = True, row_idx = None, col_idx = None, **kwargs):
                 if full:
@@ -1191,25 +1191,39 @@ class OuterPlusScaledIdentity(CovType):
         self.params = params
         self.opt_name = "Rank 1 matrix plus noise"
 
-        if is_scalar(alpha):
-            self.tinygp_kf = HandleIdx(luas.kernels.tinygp_ext.Constant(const = alpha**2))
+        if is_scalar(self.alpha_init):
+            self.tinygp_kf = HandleIdx(luas.kernels.tinygp_ext.Constant(const = self.alpha_init**2))
         else:
             const_kf = HandleIdx(luas.kernels.tinygp_ext.Constant(1.))
-            self.tinygp_kf = ScaledKernel(kernel = const_kf, amplitudes = alpha)
+            self.tinygp_kf = ScaledKernel(kernel = const_kf, amplitudes = self.alpha_init)
 
         assert is_scalar(self.alpha_init) or self.alpha_init.ndim == 1
         assert is_scalar(self.diag)
         assert is_scalar(self.wn_diag)
     
-    def evaluate(self, x1, x2, wn = True, **kwargs):
-        if x1.shape == x2.shape:
-            D = (self.diag + wn*self.wn_diag)*jnp.ones(x1.shape[-1])
+    def evaluate(self, x1, x2, wn = True, row_idx = None, col_idx = None, full = True, **kwargs):
+
+        if full:
+            diag_mat = (self.diag + wn*self.wn_diag) * jnp.eye(x1.shape[0])
         else:
-            raise Exception("Not implemented")
+            idx_specified = (row_idx is not None) and (col_idx is not None)
+
+            if idx_specified:
+                mask = row_idx[:, None] == col_idx[None, :]  # (n1, n2) bool matrix
+
+                # Pick the diagonal values where they match
+                diag_val = self.diag + wn*self.wn_diag
+                diag_mat = jnp.where(mask, diag_val, 0.0)
+                
+            else:
+                raise Exception("""Cannot evaluate non-stationary diagonal covariance without specifying matrix indices to evaluate.
+                                Either specify the row and col indices by the keyword arguments row_idx and col_idx
+                                or specify that the full covariance matrix is being evaluated by setting full = True"""
+                            )
             
-        rank1_mat = jnp.outer(self.alpha * jnp.ones(x1.shape[-1]), self.alpha * jnp.ones(x2.shape[-1]))
+        rank1_mat = jnp.outer(self.alpha_init * jnp.ones(x1.shape[-1]), self.alpha_init * jnp.ones(x2.shape[-1]))
         
-        return rank1_mat + jnp.diag(D)
+        return rank1_mat + diag_mat
 
     def decompose(self, x, wn = True, i = -1, **kwargs):
 
@@ -1257,10 +1271,17 @@ class OuterPlusScaledIdentity(CovType):
         self.logdet = jnp.log(self.lam).sum()
             
         return self.lam, self.H
+    
+
+    def householder_transform(self, x, u):
+        K_general = General(kf = lambda hp, x1, x2, **kwargs: self.evaluate(x1, x2, **kwargs))
+        
+        return K_general.householder_transform(x, u)
+
 
     def matmul(self, x1, x2, other, wn = True, **kwargs):
-        self.vec1 = self.alpha * jnp.ones(x1.shape[-1])
-        self.vec2 = self.alpha * jnp.ones(x2.shape[-1])
+        self.vec1 = self.alpha_init * jnp.ones(x1.shape[-1])
+        self.vec2 = self.alpha_init * jnp.ones(x2.shape[-1])
 
         D = self.diag + wn * self.wn_diag
         
@@ -1270,16 +1291,19 @@ class OuterPlusScaledIdentity(CovType):
             return D * other + jnp.outer(self.vec1, self.vec2 @ other)
         else:
             raise Exception("Not implemented")
+        
+    def scale(self, c):
+        return OuterPlusScaledIdentity(alpha = self.alpha_init * jnp.sqrt(c), diag = self.diag * c, wn_diag = self.wn_diag * c)
 
     def __add__(self, K):
         if isinstance(K, (Identity, ScaledIdentity)):
-            K_sum = OuterPlusScaledIdentity(self.alpha, diag = self.diag + K.diag, wn_diag = self.wn_diag + K.wn_diag)
+            K_sum = OuterPlusScaledIdentity(self.alpha_init, diag = self.diag + K.diag, wn_diag = self.wn_diag + K.wn_diag)
 
         elif isinstance(K, (GeneralQuasisepPlusNoise, GeneralQuasisep)):
             if is_scalar(self.alpha_init):
-                outer_kf = luas.kernels.quasisep.Constant(self.alpha_init**2)
+                outer_kf = luas.kernels.tinygp_ext.Constant(self.alpha_init**2)
             else:
-                outer_kf = luas.kernels.quasisep.Linear(self.alpha_init)
+                outer_kf = luas.kernels.tinygp_ext.Linear(self.alpha_init)
 
             if K.tinygp_kf is not None:
                 new_tinygp_kf = luas.kernels.tinygp_ext.Sum(outer_kf, K.tinygp_kf, use_block = K.use_block)
@@ -1296,3 +1320,8 @@ class OuterPlusScaledIdentity(CovType):
             raise Exception("Addition of kernels not implemented")
         return K_sum
 
+    def __mul__(self, other) -> Kernel:
+        if is_scalar(other):
+            return self.scale(other)
+        else:
+            raise Exception("Not implemented")

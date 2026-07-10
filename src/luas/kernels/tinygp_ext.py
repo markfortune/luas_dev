@@ -263,16 +263,16 @@ class Linear(Quasisep):
         return X[0]
 
     def design_matrix(self) -> JAXArray:
-            return jnp.zeros((1, 1))
+        return jnp.zeros((1, 1))
     
     def stationary_covariance(self) -> JAXArray:
-            return self.const*jnp.ones((1, 1))
+        return self.const*jnp.ones((1, 1))
     
     def observation_model(self, X: JAXArray) -> JAXArray:
-            return self.alpha[X[1]] * jnp.ones(1)
+        return self.alpha[X[1]] * jnp.ones(1)
     
     def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
-            return jnp.ones((1, 1))
+        return jnp.ones((1, 1))
 
 
 @tinygp.helpers.dataclass
@@ -281,38 +281,19 @@ class ConstantBlocks(Quasisep):
     sigma: float = 1.
     
     def design_matrix(self) -> JAXArray:
-            return jnp.zeros((1, 1))
+        return jnp.zeros((1, 1))
         
     def stationary_covariance(self) -> JAXArray:
-            return self.sigma*jnp.ones((1, 1))
-        
-    def observation_model(self, X: JAXArray) -> JAXArray:
-            del X
-            return jnp.array([1.])
-      
-    def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
-            same_cal = jax.lax.cond(jnp.all((X2 - self.endpoints) * (X1 - self.endpoints) >= 0.), lambda _: 1., lambda _: 0., 1.)
-            return same_cal * jnp.ones((1, 1))
-
-@tinygp.helpers.dataclass
-class CubicSpline(Quasisep):
-    lambda: float
-    sigma: float = 1.
-    
-    def design_matrix(self) -> JAXArray:
-        return jnp.array([[0., 1.], [0., 0.]])
-        
-    def stationary_covariance(self) -> JAXArray:
-        return jnp.array([[self.sigma**2, 0.], [0., 0.]])
+        return self.sigma*jnp.ones((1, 1))
         
     def observation_model(self, X: JAXArray) -> JAXArray:
         del X
-        return jnp.array([1., 0.])
+        return jnp.array([1.])
       
     def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
-        dx = X2 - X1
-        return jax.scipy.linalg.expm(self.design_matrix() * dx)
-        # return jnp.array([[1., dx], [0., 1.]])
+        same_cal = jax.lax.cond(jnp.all((X2 - self.endpoints) * (X1 - self.endpoints) >= 0.), lambda _: 1., lambda _: 0., 1.)
+        return same_cal * jnp.ones((1, 1))
+
 
 
 @tinygp.helpers.dataclass
@@ -709,133 +690,6 @@ class GeneralCARMA(Quasisep):
 
         return H
 
-
-# class MaternNuHalf(Quasisep):
-#     nu: int = eqx.field(static=True)
-#     scale: JAXArray | float
-#     sigma: JAXArray | float = eqx.field(default_factory=lambda: jnp.ones(()))
-
-#     def __init__(self, double_nu, scale, sigma = 1):
-#         assert double_nu % 2 == 1, "Only odd integer double_nu supported for MaternNuHalf"
-#         self.nu = double_nu
-#         self.scale = scale
-#         self.sigma = sigma
-
-#     def _f(self):
-#         return jnp.sqrt(self.nu - ((self.nu - 1) % 2)) / self.scale
-
-#     def design_matrix(self):
-#         f = self._f()
-#         dtype = jnp.result_type(f, self.sigma)
-#         C = companion_C((self.nu - 1)//2, dtype)
-#         return f * C
-
-#     def stationary_covariance(self):
-#         dtype = jnp.result_type(self.scale, self.sigma)
-#         return stationary_covariance_C((self.nu - 1)//2, dtype)
-
-#     def observation_model(self, X):
-#         del X
-#         h = jnp.zeros(((self.nu + 1)//2,), dtype=jnp.result_type(self.sigma))
-#         return h.at[0].set(self.sigma)
-
-#     def transition_matrix(self, X1, X2):
-#         dt = X2 - X1
-#         tau = dt * self._f()
-#         dtype = jnp.result_type(tau, self.sigma)
-#         C = companion_C((self.nu - 1)//2, dtype)
-
-#         # print(dt, self.p, self.scale, self.sigma)
-
-#         # optional safety cutoff for huge tau
-#         tau_max = 80.0
-#         return lax.cond(
-#             tau > tau_max,
-#             lambda _: jnp.zeros_like(C),
-#             lambda _: jsp.linalg.expm(C.T * tau),
-#             operand=None,
-#         )
-
-# def solve_continuous_lyapunov_kron(F, Q):
-#     n = F.shape[0]
-#     I = jnp.eye(n, dtype=F.dtype)
-#     A = jnp.kron(I, F) + jnp.kron(F, I)
-#     b = -Q.reshape(-1)
-#     P = jnp.linalg.solve(A, b).reshape(n, n)
-#     return 0.5 * (P + P.T)
-
-# def binom_row(n, dtype):
-#     # Returns [C(n,0), C(n,1), ..., C(n,n-1)]
-#     ks = jnp.arange(n, dtype=dtype)
-
-#     def step(c, k):
-#         c_next = c * (n - k) / (k + 1)
-#         return c_next, c
-
-#     _, coeffs = lax.scan(step, jnp.array(1.0, dtype), ks)
-#     return coeffs
-
-# def companion_C(p, dtype):
-#     n = p + 1
-#     coeffs = binom_row(n, dtype)
-#     C = jnp.eye(n, k=1, dtype=dtype)
-#     return C.at[-1, :].set(-coeffs)
-
-# def stationary_covariance_C(p, dtype):
-#     C = companion_C(p, dtype)
-#     n = p + 1
-#     E = jnp.zeros((n, n), dtype=dtype).at[-1, -1].set(1.0)
-#     P0 = solve_continuous_lyapunov_kron(C, E)
-#     return P0 / P0[0, 0]  # normalized, independent of scale
-
-
-
-# """Taylor-spectrum quasisep approximation to the squared exponential kernel.
-
-# Trainable/JIT-friendly design:
-# - Root solving and polynomial algebra are done once at construction time for
-#   a reference scale (=1.0).
-# - For arbitrary scale ``ell``, AR coefficients are scaled analytically, so
-#   ``scale`` remains differentiable and JIT-compatible.
-# - Runtime methods are pure JAX.
-# """
-
-
-# def _inverse_psd_taylor_poly(scale: float, order: int) -> np.ndarray:
-#     """p(s) = sum_{k=0}^order [(-1)^k (0.5*scale^2)^k / k!] s^(2k)."""
-#     if order < 1:
-#         raise ValueError("order must be >= 1")
-#     a = 0.5 * float(scale) ** 2
-#     coeffs = np.zeros(2 * order + 1, dtype=np.float64)
-#     for k in range(order + 1):
-#         idx = 2 * order - 2 * k
-#         coeffs[idx] = ((-1) ** k) * (a**k) / math.factorial(k)
-#     return coeffs
-
-
-# def _stable_ar_coeffs(scale: float, order: int) -> np.ndarray:
-#     """Return monic AR polynomial coefficients [a0, ..., a_{p-1}] for p(s)."""
-#     poly = _inverse_psd_taylor_poly(scale=scale, order=order)
-#     roots = np.roots(poly)
-
-#     tol = 1e-10
-#     stable = roots[np.real(roots) < -tol]
-#     if stable.size != order:
-#         idx = np.argsort(np.real(roots))
-#         stable = roots[idx[:order]]
-
-#     monic_desc = np.poly(stable)  # [1, a_{p-1}, ..., a0]
-#     monic_desc = np.real_if_close(monic_desc, tol=1e4).astype(np.float64)
-#     return monic_desc[1:][::-1]
-
-
-# def _solve_continuous_lyapunov_kron(F: JAXArray, Q: JAXArray) -> JAXArray:
-#     n = F.shape[0]
-#     I = jnp.eye(n, dtype=F.dtype)
-#     A = jnp.kron(I, F) + jnp.kron(F, I)
-#     b = -Q.reshape(-1)
-#     P = jnp.linalg.solve(A, b).reshape(n, n)
-#     return 0.5 * (P + P.T)
 
 
 @tinygp.helpers.dataclass

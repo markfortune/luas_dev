@@ -181,7 +181,7 @@ class MultiLowRankKernel(CovType):
         else:
             self.kf_tilde = kf_quasi2D
         
-        self.kf_tilde, stored_values["kf_tilde_stored"] = self.kf_tilde.decompose(X)
+        self.kf_tilde, stored_values["kf_tilde_stored"] = self.kf_tilde.decompose(X, full = True)
         stored_values["logdet"] += stored_values["kf_tilde_stored"]["logdet"]
 
         self.logdet = stored_values["logdet"]

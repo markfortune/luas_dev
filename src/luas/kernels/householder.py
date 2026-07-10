@@ -123,23 +123,70 @@ class HouseholderTransform:
         return cls(*children)
 
 
+
 def orthonormal_nullspace_gen(A, reverse = False):
+    
+    N_alpha = A.shape[1]
+
+    # Compute the QR decomposition of A (produces orthonormal basis for the column space of A)
+    # More numerically stable than the Gram-Schmidt process used in orthonormal_nullspace_gen_unstable
+    V, J = jnp.linalg.qr(A, mode = 'reduced')
+    
+    U = jnp.zeros_like(A)
+    # Householder vector
+    for i in range(N_alpha):
+        w_i = V[:, i]
+
+        for j in range(i):
+            w_i -= 2 * jnp.dot(U[:, j], w_i) * U[:, j]
+
+        idx = -N_alpha + i if reverse else i
+
+        # sign chosen so u = w + s*e_i never cancels; define sign(0) = +1
+        s = jnp.where(w_i[idx] >= 0, 1.0, -1.0)
+
+        # Must flip the sign of corresponding row of J to construct the correct vector from flipped orthogonal vector
+        J = J.at[idx, :].multiply(s)
+
+        u_i = w_i.at[idx].add(s)
+        u_i /= jnp.linalg.norm(u_i)
+
+        U = U.at[:, i].set(u_i)
+
+    def householder_transform(R, transpose = 0):
+        R_prime = R.copy()
+
+        if transpose:
+            for i in range(N_alpha):
+                u_R_prime = U[:, -i-1].T @ R_prime
+                R_prime -= jnp.outer(2*U[:, -i-1], u_R_prime)
+        else:
+            for i in range(N_alpha):
+                u_R_prime = U[:, i].T @ R_prime
+                R_prime -= jnp.outer(2*U[:, i], u_R_prime)
+
+        return R_prime
+    
+    return J, U, householder_transform
+
+
+def orthonormal_nullspace_gen_unstable(A, reverse = False):
     
     N_l = A.shape[0]
     N_alpha = A.shape[1]
 
     V = jnp.zeros_like(A)
     U = jnp.zeros_like(A)
-    Lam = jnp.zeros((N_alpha, N_alpha))
+    J = jnp.zeros((N_alpha, N_alpha))
 
     for i in range(N_alpha):
         v_i = A[:, i]
         for j in range(i):
-            Lam = Lam.at[j, i].set(jnp.dot(v_i, V[:, j]))
-            v_i -= Lam[j, i] * V[:, j]
+            J = J.at[j, i].set(jnp.dot(v_i, V[:, j]))
+            v_i -= J[j, i] * V[:, j]
             
-        Lam = Lam.at[i, i].set(jnp.linalg.norm(v_i))
-        v_i /= Lam[i, i]
+        J = J.at[i, i].set(jnp.linalg.norm(v_i))
+        v_i /= J[i, i]
         V = V.at[:, i].set(v_i)
     
     # Householder vector
@@ -173,6 +220,6 @@ def orthonormal_nullspace_gen(A, reverse = False):
 
         return R_prime
     
-    return Lam, U, householder_transform
+    return J, U, householder_transform
 
     
