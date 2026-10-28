@@ -113,7 +113,7 @@ class GeneralKernel(CovType):
         R: JAXArray,
         **kwargs,
     ) -> JAXArray:
-        r"""Calculates the product of the covariance matrix with a vector, represented by a JAXArray of shape ``(N_l, N_t)`.
+        r"""Calculates the product of the covariance matrix with a vector, represented by a JAXArray of shape ``(N_l, N_t)``.
         Useful for testing for numerical stability.
         
         Args:

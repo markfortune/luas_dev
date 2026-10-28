@@ -30,6 +30,8 @@ docs = [
     "tqdm",
     "jax", 
     "jaxlib",
+    "scipy",
+    "equinox",
     "astropy",
     "sphinx-book-theme",
     "myst-nb",

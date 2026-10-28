@@ -6,9 +6,25 @@ We have detailed documentation for luas included in this section. For getting st
 
 ## Primary Interface
 ```{toctree}
-:maxdepth: 2
+:maxdepth: 1
+
 GP
-LuasKernel
+```
+
+## Kronecker Kernels
+
+```{toctree}
+:maxdepth: 1
+
+kronecker_kernels
+```
+
+## Kernel Functions
+
+```{toctree}
+:maxdepth: 1
+
+kernels
 ```
 
 ## Subpackages
@@ -18,7 +34,6 @@ LuasKernel
 
 pymc_ext
 numpyro_ext
-kernels
 kronecker_fns
 jax_convenience_fns
 exoplanet

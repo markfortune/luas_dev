@@ -5,7 +5,12 @@ from .jax_convenience_fns import order_dict
 import pymc as pm
 from copy import deepcopy
 
-pymc_version = int(pm.__version__[0])
+try:
+    pymc_version = int(str(pm.__version__).split(".")[0])
+except ValueError:
+    # pm.__version__ is not a normal version string. This happens when Sphinx
+    # builds the docs with PyMC replaced by a placeholder module, so assume v5.
+    pymc_version = 5
 
 if pymc_version == 4:
     # PyMC v4 uses aesara as a backend
