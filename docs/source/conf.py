@@ -62,6 +62,10 @@ exclude_patterns = [
     # to a toctree in api.md to show them again.
     'LuasLasrachPlusPeriodicKernel.rst',
     'BlockKernel.rst',
+    # Tutorials hidden for now. Delete these lines (and add the NumPyro example
+    # back to tutorials.md) to show them again.
+    'tutorials/Numpyro Example.ipynb',
+    'tutorials/PyMC Example 1D GP.ipynb',
 ]
 
 

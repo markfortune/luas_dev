@@ -125,7 +125,7 @@ class MultiLowRankKernel(CovType):
                     cel_kernel_order.append(K_i[self.fast_dim])
                     col_i += 1
         if stored_values["A"].shape[1] > stored_values["A"].shape[0] and self.orthogonalise:
-            raise Exception(f"Too many components to orthogonalise! Rank of low-rank dimension = {stored_values["A"].shape[1]},"\
+            raise Exception(f"Too many components to orthogonalise! Rank of low-rank dimension = {stored_values['A'].shape[1]},"\
                             f"which is greater than the length of the low-rank dimension {non_cel_vec.shape[-1]}")
         
         # Transform vectors 
