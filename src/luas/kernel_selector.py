@@ -14,7 +14,7 @@ from luas.kernel_interface import read_K_list_2D
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar
 from luas import (
     WhiteNoiseKernel,
-    SingleKronTermKernel,
+    SeparableKernel,
     LuasKernel,
     LuasKernelND,
     LuasLasrachKernel,
@@ -111,7 +111,7 @@ def find_best_optimisation(X, cov_form, verbose = True, **kwargs):
             is_singlekronterm = False
 
     if is_singlekronterm:
-        use_kernel, kernel_kwargs = SingleKronTermKernel, {}
+        use_kernel, kernel_kwargs = SeparableKernel, {}
     else:
         Sigma, *args = cov_form
 
@@ -220,7 +220,7 @@ def fastest_opt_2D(dense_kron, N_alpha, N_beta, data_shape,
                 kernel_kwargs = {"use_quasi":False}
 
         elif N_alpha == 0 and N_beta == 0:
-            use_kernel = SingleKronTermKernel
+            use_kernel = SeparableKernel
 
         else:
             use_kernel = MultiLowRankKernel
@@ -251,7 +251,7 @@ def valid_kernels(dense_kron, N_alpha, N_beta, longest_fast_dim = None):
             use_kernels = [DoubleMultiLowRankKernel]
             kernel_kwarg_list = [{"use_quasi":False}] # {"use_quasi":True}, 
         elif N_alpha == 0 and N_beta == 0:
-            use_kernels = [SingleKronTermKernel]
+            use_kernels = [SeparableKernel]
         else:
             use_kernels = [MultiLowRankKernel, MultiLowRankKernel]
             kernel_kwarg_list = [{"fast_dim":N_alpha > 0, "use_quasi":True}, {"fast_dim":N_alpha > 0, "use_quasi":False}]

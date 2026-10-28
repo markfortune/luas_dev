@@ -14,7 +14,7 @@ from luas.luas_types import Kernel, PyTree, JAXArray, Scalar
 from luas.kronecker_fns import kron_prod, calc_total_size, cyclic_transpose, vmap_for_tensors, tensor_mult
 from luas.jax_convenience_fns import array_to_pytree_2D, get_corr_mat
 from luas.kernels.WhiteNoiseKernel import WhiteNoiseKernel
-from luas.kernels.SingleKronTermKernel import SingleKronTermKernel
+from luas.kernels.SeparableKernel import SeparableKernel
 from luas.kernels.BlockKernel import Block2x2Kernel, BlockKernel
 
 __all__ = [
@@ -135,7 +135,7 @@ class LuasLasrachKernel(CovType):
         # D block is I \otimes Sigma_bb
         # B and C blocks are zero and ignored
         if all_lam.size < non_fast_dim_size:
-            kf_A = SingleKronTermKernel(Identity(), self.Sigma[self.fast_dim],
+            kf_A = SeparableKernel(Identity(), self.Sigma[self.fast_dim],
                                         inv_dims=self.Sigma[self.fast_dim].use_inv)
             self.kf_tilde = Block2x2Kernel(kf_A = kf_A, kf_D_CAB = kf_dense_blocks, D_full = False,
                                            dim_split = 0, split_loc = -all_lam.size)

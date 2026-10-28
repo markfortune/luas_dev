@@ -5,7 +5,7 @@ import jax
 from typing import Callable, Tuple, Union, Any, Optional
 import tinygp
 
-from luas import WhiteNoiseKernel, SingleKronTermKernel
+from luas import WhiteNoiseKernel, SeparableKernel
 from luas.kernels.covtype import Outer, GeneralQuasisepPlusNoise, GeneralQuasisep, CovType, Identity, ScaledIdentity, Diagonal
 from luas.kernels.householder import HouseholderProduct, orthonormal_nullspace_gen
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar
@@ -195,9 +195,9 @@ class MultiLowRankKernel(CovType):
                 kf_D = WhiteNoiseKernel(diag = rest_cel_diag)
             else:
                 if self.fast_dim == 0:
-                    kf_D = SingleKronTermKernel(self.Sigma[self.fast_dim], Identity())
+                    kf_D = SeparableKernel(self.Sigma[self.fast_dim], Identity())
                 else:
-                    kf_D = SingleKronTermKernel(Identity(), self.Sigma[self.fast_dim])
+                    kf_D = SeparableKernel(Identity(), self.Sigma[self.fast_dim])
 
             self.kf_tilde = Block2x2Kernel(kf_A = kf_quasi2D, kf_D_CAB = kf_D,
                                            dim_split = 1-self.fast_dim, A_full = True, D_full = True,

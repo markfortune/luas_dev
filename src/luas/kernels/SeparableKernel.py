@@ -13,10 +13,10 @@ from luas.kronecker_fns import kron_prod, calc_total_size, calc_data_shape, cycl
 from luas.jax_convenience_fns import array_to_pytree_2D, get_corr_mat
 
 __all__ = [
-    "SingleKronTermKernel",
+    "SeparableKernel",
 ]
 
-class SingleKronTermKernel(CovType):
+class SeparableKernel(CovType):
     
     def __init__(
         self,
@@ -30,7 +30,7 @@ class SingleKronTermKernel(CovType):
         self.Sigma = Sigma
         self.dim = len(Sigma)
         self.inv_dims = inv_dims
-        self.opt_name = "SingleKronTermKernel"
+        self.opt_name = "SeparableKernel"
 
         if inv_dims:
             self.dot_solve = self.dot_solve_w_inv_dims
