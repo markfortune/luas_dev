@@ -284,8 +284,8 @@ class ExtendedLuasKernel(CovType):
         N_total = self.N_alpha * self.N_t
         full_A_dense = full_A.reshape(N_total, N_total)
 
-        I_kron_K_transf1_B = jnp.kron(jnp.eye(self.N_alpha), K_tilde_B)
-        Lam_QKT = I_kron_K_transf1_B @ jnp.kron(jnp.eye(self.N_alpha), jax.scipy.linalg.block_diag(self.Q_K_transf1_A, jnp.eye(self.N_beta)))
+        B_Q = jax.scipy.linalg.block_diag(self.Q_K_transf1_A, jnp.eye(self.N_beta))
+        Lam_QKT = jnp.kron(jnp.eye(self.N_alpha), K_tilde_B @ B_Q)
         C_A_inv_B = Lam_QKT @ full_A_dense @ Lam_QKT.T
 
         # Add additional terms corresponding to beta_kernels in inner D block of outer B block

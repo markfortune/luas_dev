@@ -45,15 +45,10 @@ class GeneralKernel(CovType):
         self.logL_hessianable = self.logL
     
     
-    def evaluate(self, X1, X2, full = True, idx = (None, None), **kwargs):
-        # full = True
-        # idx = (None, None)
+    def evaluate(self, X1, X2, full = True, idx = None, **kwargs):
 
-        # print(self.Sigma, self.K_list)
-        # all_K =  (self.Sigma,) + self.K_list
-        # for K_alpha_i in all_K:
-        #     print("even later", K_alpha_i[0].alpha_init, K_alpha_i[1](X1[1], X2[1])[0, 0])
-
+        if idx is None:
+            idx = (None,)*self.dim
 
         Sigma = self.Sigma[0].evaluate(X1[0], X2[0], full = full, row_idx = idx[0], col_idx = idx[0], **kwargs)
         

@@ -1407,7 +1407,8 @@ class GP(object):
         return_fig = False,
         return_fit = False,
         axes_labels = [r"$x_1$", r"$x_2$"],
-        **kwargs,
+        sharey = True,
+        **fig_kwargs,
     ) -> plt.Figure:
         """Visualises the fit to the data. Displays the observed data as well as the mean function,
         the GP predictive mean (not including the mean function) and the residuals of the data
@@ -1449,13 +1450,8 @@ class GP(object):
         # Perform GP regression at the observed data locations
         gp_mean, M = self.gp_mean_calc(p, Y, return_mf = True)
         
-        fig = plt.figure(figsize = (20, 5))
-
-        if self.dim == 1:
-            ax = fig.subplots(1, 4, sharey = True)
-        else:
-            ax = fig.subplots(1, 4, sharey = True)
-
+        fig = plt.figure(figsize = (20, 5), **fig_kwargs)
+        ax = fig.subplots(1, 4, sharey = sharey)
 
         titles = ["Data", "Mean function", "GP mean (excl. mean function)", "Residual noise"]
         data = [Y, M, gp_mean - M, Y - gp_mean]

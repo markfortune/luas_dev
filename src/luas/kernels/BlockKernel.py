@@ -94,13 +94,20 @@ class BlockKernel(CovType):
             return kf_block.matrix_sqrt(r, transpose = transpose), stored_values["logdet"]
         
         def logL_calc(r, lam_arr):
-
             kf_block = lam_arr[0] * self.block_kernels[0]
             for i in range(1, len(self.block_kernels)):
                 kf_block += lam_arr[i] * self.block_kernels[i]
 
             kf_block, _ = kf_block.decompose(X[self.block_dim], idx = idx[self.block_dim])
             return kf_block.logL(r)
+        
+        def logdet_calc(lam_arr):
+            kf_block =  lam_arr[0] * self.block_kernels[0]
+            for i in range(1, len(self.block_kernels)):
+                kf_block += lam_arr[i] * self.block_kernels[i]
+
+            kf_block, stored_values = kf_block.decompose(X[self.block_dim], idx = idx[self.block_dim])
+            return stored_values["logdet"]
 
 
         self.matrix_inv_sqrt_calc_vmap = self.parallel_method(matrix_inv_sqrt_calc, in_axes = (1-self.block_dim, 0, None),
@@ -109,30 +116,24 @@ class BlockKernel(CovType):
                                               out_axes = (1-self.block_dim, 0), **self.parallel_kwargs)
 
         self.logL_vmap = self.parallel_method(logL_calc, in_axes = (1-self.block_dim, 0), **self.parallel_kwargs)
-        
-        # Really need to improve
-        R_zero = jnp.zeros((self.non_block_dim_size, X[self.block_dim].shape[-1]))
 
-        if self.block_dim == 0:
-            R_zero = R_zero.T
+        self.logL_vmap = self.parallel_method(logdet_calc, in_axes = (0), **self.parallel_kwargs)
         
-        R_prime, logdet_arr = self.matrix_sqrt_calc_vmap(R_zero, self.lam_arr, 0)
-        self.logdet = logdet_arr.sum()
+        self.logdet = self.logL_vmap(self.lam_arr).sum()
 
         return self, {"logdet":self.logdet}
-    
+
     def matrix_sqrt(self, R, transpose = 0):
         R_prime, logdet_arr = self.matrix_sqrt_calc_vmap(R, self.lam_arr, transpose)
 
-        # self.logdet = logdet_arr.sum()
         return R_prime
     
     def matrix_inv_sqrt(self, R, transpose = 0):
         R_prime, logdet_arr = self.matrix_inv_sqrt_calc_vmap(R, self.lam_arr, transpose)
 
-        # self.logdet = logdet_ar.sum()
+        # self.logdet = logdet_arr.sum()
         return R_prime
-        
+    
     def scale(self, c):
         raise Exception("Not implemented")
 
@@ -144,7 +145,106 @@ class BlockKernel(CovType):
     #         R_prime += tensor_mult(self.K_list[i], X1, X2, R, **kwargs)
         
     #     return R_prime
+
+
+
+class DifferentBlocksKernel(CovType):
+    def __init__(
+        self,
+        D,
+        amplitudes,
+        kernel_list,
+        block_dim = 1,
+        use_stored_values: Optional[bool] = True,
+    ):
+        
+        self.D = D
+        self.amplitudes = amplitudes
+        self.block_kernels = kernel_list
+        self.block_dim = block_dim
+        self.non_block_dim_size = D.shape[1-self.block_dim]
+        self.opt_name = "Block diagonal covariance matrix"
+        
+
+
+    def evaluate(self, X1, X2, full = True, row_idx = (None, None), col_idx = (None, None), **kwargs):
+        assert full == True
+
+        if self.block_dim == 1:
+            K_eval = jnp.diag(self.D.ravel(order = "C"))
+        elif self.block_dim == 0:
+            K_eval = jnp.diag(self.D.ravel(order = "F"))
+
+        for i in range(self.non_block_dim_size):
+            e_i = jnp.zeros(self.non_block_dim_size)
+            e_i = e_i.at[i].set(1.)
+                                
+            K_i_eval = self.amplitudes[i] * self.block_kernels[i].evaluate(X1[self.block_dim], X2[self.block_dim],
+                                                        row_idx = row_idx[self.block_dim],
+                                                        col_idx = col_idx[self.block_dim],
+                                                        full = full, **kwargs)
+            if self.block_dim == 1:
+                K_eval = jnp.kron(jnp.outer(e_i, e_i), K_i_eval)
+            else:
+                K_eval = jnp.kron(K_i_eval, jnp.outer(e_i, e_i))
+
+        return K_eval
+
+
+    def decompose(self, X, full = True, idx = (None, None), **kwargs):
+
+        self.K_decomp_list = []
+        self.logdet = 0.
+        for i in range(len(self.block_kernels)):
+            if self.block_dim == 1:
+                self.K_decomp_list.append(self.amplitudes[i] * self.block_kernels[i] + Diagonal(diag = self.D[i, :]))
+                self.K_decomp_list[-1], stored_values_i = self.K_decomp_list[-1].decompose(X[self.block_dim], idx = idx[self.block_dim])
+            else:
+                self.K_decomp_list.append(self.amplitudes[i] * self.block_kernels[i] + Diagonal(diag = self.D[:, i]))
+                self.K_decomp_list[-1], stored_values_i = self.K_decomp_list[-1].decompose(X[self.block_dim], idx = idx[self.block_dim])
+
+            self.logdet += stored_values_i["logdet"]
+
+        return self, {"logdet":self.logdet}
+
+
+    def matrix_inv_sqrt(self, R, transpose = 0):
+
+        R_prime = jnp.zeros_like(R)
+        for i in range(len(self.block_kernels)):
+            if self.block_dim == 1:
+                R_prime = R_prime.at[i, :].set(self.K_decomp_list[i].matrix_inv_sqrt(R[i, :], transpose = transpose))
+            else:
+                R_prime = R_prime.at[:, i].set(self.K_decomp_list[i].matrix_inv_sqrt(R[i, :], transpose = transpose))
+        
+        return R_prime
     
+
+    def matrix_sqrt(self, R, transpose = 0):
+
+        R_prime = jnp.zeros_like(R)
+        for i in range(len(self.block_kernels)):
+            if self.block_dim == 1:
+                R_prime = R_prime.at[i, :].set(self.K_decomp_list[i].matrix_sqrt(R[i, :], transpose = transpose))
+            else:
+                R_prime = R_prime.at[:, i].set(self.K_decomp_list[i].matrix_sqrt(R[i, :], transpose = transpose))
+        
+        return R_prime
+
+    
+
+    
+    def scale(self, c):
+        raise Exception("Not implemented")
+
+    # def matmul(self, x1, x2, R, wn = True, **kwargs):
+
+    #     R_prime = tensor_mult(self.Sigma, X1, X2, R, **kwargs)
+
+    #     for i in range(len(self.K_list)):
+    #         R_prime += tensor_mult(self.K_list[i], X1, X2, R, **kwargs)
+        
+    #     return R_prime
 
 class Block2x2Kernel(CovType):
     def __init__(self, kf_A, kf_B = None, kf_D_CAB = None, kf_D = None, A_full = True, D_full = True,
@@ -253,6 +353,7 @@ class Block2x2Kernel(CovType):
         
         return self, {"logdet":self.logdet}
         
+    
     def matrix_inv_sqrt(self, R, transpose=0):
 
         if self.dim_split == 0:

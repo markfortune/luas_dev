@@ -168,7 +168,9 @@ class DoubleMultiLowRankKernel(CovType):
         C_A_inv_B = LowRankProduct(self.B_rows.T, K_A_inv_B.T).to_qsm()
 
         if not self.use_quasi:
-            C_A_inv_B = C_A_inv_B.to_dense().reshape((self.N_beta, self.N_l - self.N_alpha, self.N_beta, self.N_l - self.N_alpha), order = "F").reshape((self.N_beta * (self.N_l - self.N_alpha), self.N_beta * (self.N_l - self.N_alpha)), order = "C")
+            shape_F_style = (self.N_beta, self.N_l - self.N_alpha, self.N_beta, self.N_l - self.N_alpha)
+            shape_C_style = (self.N_beta * (self.N_l - self.N_alpha), self.N_beta * (self.N_l - self.N_alpha))
+            C_A_inv_B = C_A_inv_B.to_dense().reshape(shape_F_style, order = "F").reshape(shape_C_style, order = "C")
 
         
         kf_D_corr = MixingMatTerm(kf_B.mixing_mat, kf_B.kernel_list, 

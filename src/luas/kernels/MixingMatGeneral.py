@@ -8,6 +8,7 @@ from luas.luas_types import Kernel, PyTree, JAXArray, Scalar, is_scalar
 from typing import Callable, Tuple, Union, Any, Optional
 from tinygp.solvers.quasisep.core import DiagQSM, StrictLowerTriQSM, StrictUpperTriQSM, SymmQSM, SquareQSM
 
+
 class MixingMatGeneral(CovType):
     def __init__(self, mixing_mat, kernel_list, noise_model = None,
                  diag = 0., wn_diag = 0., params = None, fast_dim = 1, use_block = True, **kwargs):

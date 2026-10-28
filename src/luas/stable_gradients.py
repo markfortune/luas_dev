@@ -15,49 +15,32 @@ __all__ = [
     "logdetK_calc_hessianable",
 ]
 
-# def stable_eigh(K):
-#     return jnp.linalg.eigh(K)
-
-# @jax.custom_jvp
-# def stable_eigh(K):
-#     result = jnp.linalg.eigh(K)
-#     return result.eigenvalues, result.eigenvectors
-
-# @stable_eigh.defjvp
-# def stable_eigh_jvp(primals, tangents):
-#     (K,) = primals
-#     (dK,) = tangents
-#     vals, vecs = stable_eigh(K)
-
-#     diffs = vals[:, None] - vals[None, :]
-#     F = diffs / (diffs**2 + 1e-6)
-
-#     VtdKV = vecs.T @ dK @ vecs
-#     d_vals = jnp.diag(VtdKV)
-#     d_vecs = vecs @ (F * VtdKV)
-
-#     return (vals, vecs), (d_vals, d_vecs)
-
 @jax.custom_vjp
 def stable_eigh(K):
-    w, v = jnp.linalg.eigh(K)
-    return w, v  # plain tuple
+    lam, Q = jnp.linalg.eigh(K)
+    return lam, Q
 
 def stable_eigh_fwd(K):
-    w, v = jnp.linalg.eigh(K)
-    return (w, v), (w, v)
+    lam, Q = jnp.linalg.eigh(K)
+    return (lam, Q), (lam, Q)
 
 def stable_eigh_bwd(res, g):
-    w, v = res
-    g_w, g_v = g
+    lam, Q = res
+    g_lam, g_Q = g
 
-    # F[i,j] = 1 / (w_j - w_i) off-diagonal, 0 on the diagonal.
-    # Sign matters: w_j - w_i, NOT w_i - w_j.
-    diffs = w[None, :] - w[:, None]          # w_j - w_i
-    eps = 1e-12                              # only for genuine degeneracy
-    F = diffs / (diffs**2 + eps)             # -> 1/diffs as eps->0; F_ii = 0
+    # Use trick from Liao et al. (2019) "Differentiable Programming Tensor Networks"
+    # F[i,j] = 1 / (lam_j - lam_i) off-diagonal, 0 on the diagonal.
+    diffs = lam[None, :] - lam[:, None]          # (lam_j - lam_i) matrix
 
-    g_K = v @ (jnp.diag(g_w) + F * (v.T @ g_v)) @ v.T
+    # avoids numerical stability when lam_j - lam_i is very small
+    # -> 1/eps when diffs -> 0; otherwise approximately 1/diffs with 
+    eps = 1e-16
+    F = diffs / (diffs**2 + eps)
+
+    g_K = Q @ (jnp.diag(g_lam) + F * (Q.T @ g_Q)) @ Q.T
+
+    # symmetrisation necessary, note F.T = -F which adds the necessary (-g_Q @ Q) term from Liao et al. (2019)
+    # Without adding an extra O(N^3) matrix mult
     return ((g_K + g_K.T) / 2,)
 
 stable_eigh.defvjp(stable_eigh_fwd, stable_eigh_bwd)

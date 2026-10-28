@@ -184,7 +184,7 @@ class LuasPlusMultiLowRankKernel(CovType):
             kf_A, kf_A_stored_values = kf_A.decompose((X[self.fast_dim][:-self.N_alpha], X[1-self.fast_dim]),
                                                             full = False, idx = (jnp.arange(self.N_fast - self.N_alpha), jnp.arange(self.N_slow))
             )
-            # Use for LuasPlusMultiTermBothDimKernel
+            # Use for ExtendedLuasKernel
             self.lam_fast_A, self.Q_fast_A = kf_A_stored_values["lam_0"], kf_A_stored_values["Q_0"]
         else:
             kf_A = BlockKernel(*K_A_kernel, non_block_dim_size = self.N_slow, block_dim=0, use_pmap = self.use_pmap)

@@ -11,7 +11,7 @@ from luas.kernels.householder import HouseholderProduct, orthonormal_nullspace_g
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar
 from luas.kronecker_fns import tensor_mult
 from luas.kernels.tinygp_ext import ScaledKernel
-from luas.kernels.BlockKernel import Block2x2Kernel
+from luas.kernels.BlockKernel import Block2x2Kernel, DifferentBlocksKernel
 from luas.kernels.MixingMatQuasisep import MixingMatQuasisep
 from luas.kernels.MixingMatGeneral import MixingMatGeneral
 
@@ -25,16 +25,17 @@ class MultiLowRankKernel(CovType):
         Sigma,
         *K_list,
         fast_dim = None,
-        never_reduce_dim = False,
-        use_stored_values: Optional[bool] = True,
+        QR_transform = True,
+        use_stored_values: Optional[bool] = False,
         use_quasi = True,
+        orthogonalise = False,
         **kwargs,
     ):
         assert fast_dim is not None # Must specify the fast dimension
         self.Sigma = Sigma[0], Sigma[1]
         self.K_list = K_list
         self.fast_dim = fast_dim
-        self.never_reduce_dim = never_reduce_dim
+        self.QR_transform = QR_transform
         self.N_alpha = len(K_list)
         self.use_quasi = use_quasi
 
@@ -44,6 +45,10 @@ class MultiLowRankKernel(CovType):
         else:
             self.opt_name = "MultiLowRankKernel"
 
+        self.orthogonalise = orthogonalise
+
+        if not QR_transform and orthogonalise:
+            raise Exception("Orthogonalisation requires a QR transformation! Either set QR_transform = False or orthogonalise = False")
         self.logL_hessianable = self.logL
         self.decompose = self.decomp_no_stored_values
 
@@ -119,12 +124,20 @@ class MultiLowRankKernel(CovType):
                     # Could accept a list of kernels in K_i[self.fast_dim]
                     cel_kernel_order.append(K_i[self.fast_dim])
                     col_i += 1
+        if stored_values["A"].shape[1] > stored_values["A"].shape[0] and self.orthogonalise:
+            raise Exception(f"Too many components to orthogonalise! Rank of low-rank dimension = {stored_values["A"].shape[1]},"\
+                            f"which is greater than the length of the low-rank dimension {non_cel_vec.shape[-1]}")
         
         # Transform vectors 
         stored_values["J"] = self.Sigma_transf.matrix_inv_sqrt(stored_values["A"], transpose = 0)
 
         # If the total rank is less than the length of that dimension, we can reduce the dimension by exploiting sparsity
-        self.reduce_dim = stored_values["non_cel_rank"] < non_cel_vec.shape[-1] and not self.never_reduce_dim
+        reduce_dim1 = stored_values["non_cel_rank"] < non_cel_vec.shape[-1] and self.QR_transform
+
+        # Even if the total rank is equal to the length of the dimension, orthogonalising the vectors still gives a speed boost
+        reduce_dim2 = stored_values["non_cel_rank"] <= non_cel_vec.shape[-1] and self.orthogonalise
+
+        self.reduce_dim = reduce_dim1 or reduce_dim2
 
         if self.reduce_dim:
             stored_values["J"], U, self.householder_transform = orthonormal_nullspace_gen(stored_values["J"])
@@ -152,8 +165,19 @@ class MultiLowRankKernel(CovType):
             total_cel_diag = jnp.kron(cel_diag, jnp.ones(stored_values["non_cel_rank"]))
         else:
             total_cel_diag = jnp.kron(cel_diag, jnp.ones(non_cel_vec.shape[-1]))
+
+        # print(stored_values["J"], jnp.diag(jnp.diag(stored_values["J"])))
         
-        if self.use_quasi:
+        if self.orthogonalise:
+            if self.fast_dim:
+                D_mat = total_cel_diag.reshape((stored_values["non_cel_rank"], -1), order = "C")
+            else:
+                D_mat = total_cel_diag.reshape((stored_values["non_cel_rank"], -1), order = "F")
+            # print(D_mat, jnp.diag(stored_values["J"]), cel_kernel_order)
+            kf_quasi2D = DifferentBlocksKernel(D_mat, jnp.diag(stored_values["J"])**2, cel_kernel_order, block_dim = self.fast_dim)
+        elif self.use_quasi:
+            # kf_quasi2D = MixingMatQuasisep(mixing_mat = jnp.diag(jnp.diag(stored_values["J"])), kernel_list = cel_kernel_order,
+            #                                 diag = total_cel_diag, fast_dim = self.fast_dim)
             kf_quasi2D = MixingMatQuasisep(mixing_mat = stored_values["J"], kernel_list = cel_kernel_order,
                                             diag = total_cel_diag, fast_dim = self.fast_dim)
         else:

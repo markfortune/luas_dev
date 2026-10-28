@@ -365,7 +365,7 @@ class SquaredExpApprox(Quasisep):
         self.use_block = use_block
 
         assert order % 2 == 0, "Only even orders supported for squared exponential approximation"
-        assert order <= 18, "Modal decompositions only precomputed up to order 18"
+        assert order <= 14, "Modal decompositions only supported up to order 14"
 
         modal_decomp = _get_sq_exp_decomp_arrays(order)
         self.T = modal_decomp["T_modal"]

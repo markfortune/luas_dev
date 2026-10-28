@@ -47,7 +47,6 @@ class CovType():
             K = self.evaluate(x, x, wn = wn, full = True, **kwargs)
         return stable_eigh(K)
     
-    
     def inverse(self, R):
         R_prime = self.matrix_inv_sqrt(R, transpose=0)
         K_inv_R = self.matrix_inv_sqrt(R_prime, transpose=1)

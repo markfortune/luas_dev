@@ -22,7 +22,7 @@ def modal_decomp_SDE(h_coeffs):
 
     order = len(h_coeffs)
 
-    # Calculate transfer function matrix and stationary covariance ofreference SDE with length scale of 1
+    # Calculate transfer function matrix and stationary covariance of reference SDE with length scale of 1
     F_ref, P_inf_ref = state_space_matrices_from_coeffs(h_coeffs)
     
     # Use eigendecomposition to get modal decomposition of SDE

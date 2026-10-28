@@ -191,8 +191,11 @@ def powered_exp_calc(x: JAXArray, y: JAXArray, L: Scalar, k: Scalar) -> JAXArray
     """Function used by powered_exp to evaluate the powered exponential kernel function. 
     """
 
-    tau_sq = jnp.power(distanceL1(x, y, L), k)
-    return jnp.exp(-tau_sq.sum())
+    d = distanceL1(x, y, L)
+    zero_dist = d == 0.0
+    d_safe = jnp.where(zero_dist, 1.0, d) # avoid numerically unstable gradients at 0^k
+    val = jnp.exp(-d_safe ** k)
+    return jnp.where(zero_dist, 1.0, val) 
 
 
 def Linear(alpha: JAXArray, sigma: Scalar = 1.) -> JAXArray:
