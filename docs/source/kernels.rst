@@ -8,8 +8,8 @@ kernels package
 Kernel functions build the covariance matrix along one dimension of the data
 (e.g. wavelength or time) and are the main way of building a model in luas.
 Each function returns a covariance object (see :doc:`covtype`). These objects
-can be added and multiplied together, and are then passed to one of the 2D
-kernel classes (e.g. :class:`luas.LuasKernel`).
+can be added and multiplied together, and can be passed to one of the 2D
+kernel classes (e.g. :class:`luas.LuasKernel`) for building Kronecker kernels.
 
 The kernels in this package build dense covariance matrices. Versions that
 exploit quasiseparable or low-rank structure are in the

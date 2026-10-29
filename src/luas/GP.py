@@ -151,13 +151,24 @@ class GP(object):
             self.logP_hessianable = jax.jit(self.logP_hessianable)
 
 
-    def sample(self, p, add_mf = True, **kwargs):
+    def sample(self, p, add_mf = True):
+        """Sample from the GP prior distribution. Useful for visualising a GP model and generating synthetic data.
+        
+        Args:
+            p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
+                in addition to any mean function parameters which may be needed to calculate the mean function.
+            add_mf (bool, optional): Whether to add the mean function to the GP draw, default is True.
+        
+        Returns:
+            JAXArray: A random draw from the GP prior distribution.
+            
+        """
 
         self.kf_eval = self.build_kf(p, self.x)
         self.kf_eval, stored_values = self.kf_eval.decompose(self.x, stored_values = {})
 
         z = np.random.normal(size = self.data_shape)
-        R = self.kf_eval.matrix_sqrt(z, **kwargs)
+        R = self.kf_eval.matrix_sqrt(z)
 
         if add_mf:
             R += self.mf(p, self.x)
@@ -590,6 +601,48 @@ class GP(object):
                 fast_dim = None, return_predicted_loc = True,
                 sample = False, return_K_pred_inv = False):
     
+        r"""Performs GP regression and computes the GP predictive mean and the GP predictive
+        uncertainty as the standard devation at each location or else can return the full
+        covariance matrix. Requires the input kernel function(s) to have a ``wn`` keyword
+        argument that defines the kernel when white noise is included (``wn = True``) and
+        when white noise isn't included (``wn = False``).
+        
+        Currently assumes the same input hyperparameters for both the observed and predicted
+        locations. The predicted locations ``x_l_pred`` and ``x_t_pred`` may deviate from
+        the observed locations ``x_l`` and ``x_t`` however.
+        
+        The GP predictive mean is defined as:
+        
+        .. math::
+        
+            \mathbb{E}[\vec{y}_*] = \vec{\mu}_* + \mathbf{K}_*^T \mathbf{K}^{-1} \vec{r}
+        
+        And the GP predictive covariance is given by:
+        
+        .. math::
+        
+            Var[\vec{y}_*] = \mathbf{K}_{**} - \mathbf{K}_*^T \mathbf{K}^{-1} \mathbf{K}_*
+        
+        Args:
+            p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
+                in addition to any mean function parameters which may be needed to calculate the mean function.
+            Y (JAXArray): Observed data to fit, must be of shape ``(N_l, N_t)``.
+            x_l_pred (JAXArray, optional): Prediction locations along the row dimension,
+                defaults to observed input locations.
+            x_t_pred (JAXArray, optional): Prediction locations along the column dimension,
+                defaults to observed input locations.
+            return_std_dev (bool, optional): If ``True`` will return the standard deviation ofuncertainty
+                at the predicted locations. Otherwise will return the full predictive covariance matrix.
+                Defaults to ``True``.
+        
+        Returns:
+            (JAXArray, JAXArray, JAXArray): Returns a tuple of three elements, where the first element is
+            the GP predictive mean at the prediction locations, the second element is either the
+            standard deviation of the predictions if ``return_std_dev = True``, otherwise it will be
+            the full covariance matrix of the predicted values. The third element will be the mean function
+            evalulated at the prediction locations.
+        
+        """
         p_obs = deepcopy(p)
         
         if p_pred is None:
@@ -731,140 +784,6 @@ class GP(object):
         K_pred_draw -= Ks_Kinv_Ks_term
     
         return K_pred_draw
-        
-        
-    def predict_old(
-        self,
-        p: PyTree,
-        Y: JAXArray,
-        x_pred: Optional[JAXArray] = None,
-        return_std_dev: Optional[bool] = True,
-        **kwargs,
-    ) -> Tuple[JAXArray, JAXArray, JAXArray]:
-        r"""Performs GP regression and computes the GP predictive mean and the GP predictive
-        uncertainty as the standard devation at each location or else can return the full
-        covariance matrix. Requires the input kernel function(s) to have a ``wn`` keyword
-        argument that defines the kernel when white noise is included (``wn = True``) and
-        when white noise isn't included (``wn = False``).
-        
-        Currently assumes the same input hyperparameters for both the observed and predicted
-        locations. The predicted locations ``x_l_pred`` and ``x_t_pred`` may deviate from
-        the observed locations ``x_l`` and ``x_t`` however.
-        
-        The GP predictive mean is defined as:
-        
-        .. math::
-        
-            \mathbb{E}[\vec{y}_*] = \vec{\mu}_* + \mathbf{K}_*^T \mathbf{K}^{-1} \vec{r}
-        
-        And the GP predictive covariance is given by:
-        
-        .. math::
-        
-            Var[\vec{y}_*] = \mathbf{K}_{**} - \mathbf{K}_*^T \mathbf{K}^{-1} \mathbf{K}_*
-        
-        Args:
-            p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
-                in addition to any mean function parameters which may be needed to calculate the mean function.
-            Y (JAXArray): Observed data to fit, must be of shape ``(N_l, N_t)``.
-            x_l_pred (JAXArray, optional): Prediction locations along the row dimension,
-                defaults to observed input locations.
-            x_t_pred (JAXArray, optional): Prediction locations along the column dimension,
-                defaults to observed input locations.
-            return_std_dev (bool, optional): If ``True`` will return the standard deviation ofuncertainty
-                at the predicted locations. Otherwise will return the full predictive covariance matrix.
-                Defaults to ``True``.
-        
-        Returns:
-            (JAXArray, JAXArray, JAXArray): Returns a tuple of three elements, where the first element is
-            the GP predictive mean at the prediction locations, the second element is either the
-            standard deviation of the predictions if ``return_std_dev = True``, otherwise it will be
-            the full covariance matrix of the predicted values. The third element will be the mean function
-            evalulated at the prediction locations.
-        
-        """
-        
-        # If no prediction locations specified, predict at observed locations
-        
-        if x_l_pred is None:
-            x_l_pred = self.x_l
-        if x_t_pred is None:
-            x_t_pred = self.x_t
-
-        # Generate mean function and compute residuals
-        R = Y - self.mf(p, self.x_l, self.x_t)
-        M_pred = self.mf(p, x_l_pred, x_t_pred)
-        
-        # Kernel object computes GP regression as the most efficient method depends on the form of
-        # the kernel function
-        self.kf_eval = self.build_kf(p, self.x)
-        gp_mean, pred_err = self.kf_eval.predict(p, self.x_l, x_l_pred, self.x_t, x_t_pred, R, M_pred,
-                                            return_std_dev = return_std_dev, **kwargs)
-        
-        return gp_mean, pred_err, M_pred
-
-    
-    def sigma_clip(
-        self,
-        p: PyTree,
-        Y:JAXArray,
-        sigma: Scalar,
-        plot: Optional[bool] = True,
-        use_gp_mean: Optional[bool] = True,
-    ) -> JAXArray:
-        """Performs GP regression and replaces any outliers above a given number of standard deviations
-        with the GP predictive mean evaluated at those locations. If ``use_gp_mean = False`` then will instead
-        replace outliers with the mean function evaluated at each location.
-        
-        Args:
-            p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
-                in addition to any mean function parameters which may be needed to calculate the mean function.
-            Y (JAXArray): Observed data to fit, must be of shape ``(N_l, N_t)``.
-            sigma (Scalar): Significance value in standard deviations above which outliers will be clipped.
-            plot (bool, optional): Whether to produce plots which visualise the outliers in the data.
-            use_gp_mean (bool, optional): Will replace outliers with values from the GP predictive mean if ``True``,
-                otherwise will replace with values from the mean function.
-        
-        Returns:
-            JAXArray: The observed data with outliers cleaned.
-            
-        """
-        
-        # First perform the GP regression with the predicted locations defaulting to the observed locations
-        gp_mean, sigma_diag, M = self.predict(p, Y)
-        
-        # Residuals after subtraction of the GP mean are normalised based on their predicted uncertainties
-        res = Y - gp_mean
-        Z = jnp.abs(res/sigma_diag)
-        
-        # Identify outliers above given significance level
-        outliers = Z > sigma
-        
-        # Create a copy of the observed data with outliers replaced with the GP predictive mean values
-        Y_clean = jnp.array(Y.copy())
-        
-        if use_gp_mean:
-            Y_clean = Y_clean.at[outliers].set(gp_mean[outliers])
-        else:
-            Y_clean = Y_clean.at[outliers].set(M[outliers])
-        
-        print("Number of outliers clipped = ", (outliers).sum())
-        
-        # Some convenient plots to visualise the locations of the outliers
-        if plot:
-            plt.title("Std. Dev. of Residuals")
-            plt.imshow(Z, aspect = 'auto')
-            plt.colorbar()
-            plt.show()
-            
-            if outliers.sum() > 0:
-                plt.title("Locations of Outliers Removed")
-                plt.imshow(Y, aspect = 'auto')
-                y, x = jnp.where(outliers)
-                plt.scatter(x, y, color='red', marker='x')
-                plt.show()
-
-        return Y_clean
     
     
     def autocorrelate(
@@ -1260,14 +1179,19 @@ class GP(object):
         for par in p_transf.keys():
             # Select just the bounded parameters
             if par in param_bounds.keys():
+
+                # Reshape to ensure hessian wrt 2D arrays can be dealt with by flattening
+                n = np.size(p_transf[par])
+                hessian_mat[par][par] = jnp.reshape(hessian_mat[par][par], (n, n))
+
                 # Add to the diagonal of the hessian an additional term
                 # which is equal to the hessian of the jacobian of the transformation
                 # performed by PyMC and NumPyro
                 # This term is added to ensure the transformation these inference libraries perform
                 # does not impact the choice of priors made
                 exp_minus_p = jnp.exp(-p_transf[par])
-                hessian_of_transform_jacobian = jnp.diag(-2*exp_minus_p/(1+exp_minus_p)**2)
-                hessian_mat[par][par] += hessian_of_transform_jacobian
+                hessian_mat[par][par] += jnp.diag(jnp.ravel(-2*exp_minus_p/(1+exp_minus_p)**2))
+
 
         # Convert hessian from a nested PyTree to a 2D JAXArray for GP.laplace_approx to be able
         # to invert to calculate the covariance matrix
@@ -1291,64 +1215,63 @@ class GP(object):
         r"""Visualise the covariance matrix/matrices generated by the input hyperparameters.
         
         Note:
-            Default behaviour is to separately visualise each of the 4 component covariance matrices
-            ``Kl``, ``Kt``, ``Sl``, ``St`` which are used to calculate the full covariance matrix ``K``.
-            If ``full = True`` then will instead build the full covariance matrix ``K`` but this is very
-            memory intensive as it requires creating a JAXArray with ``(N_l*N_t, N_l*N_t)`` entries.
+            Default behaviour is to separately visualise each of the component covariance matrices in each dimension.
+            For example, ``Sl``, ``St``, ``Kl`` and ``Kt`` for the 2D `LuasKernel` or `LuasLasrachKernel`.
+            If ``full = True`` then it will instead build the full covariance matrix ``K``, but this is very
+            memory intensive as it requires creating a JAXArray with ``(N_l*N_t, N_l*N_t)`` entries 
+            (and is not currently implemented)! For 1D GPs this will simply generate the full covariance matrix.
         
         Args:
             hp (Pytree): Hyperparameters needed to build the covariance matrices
                 ``Kl``, ``Kt``, ``Sl``, ``St``. Will be unaffected if additional mean function
                 parameters are also included.
-            x_l (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
-                for the observed locations. May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l``
-                different wavelength/vertical regression variables.
-            x_t (JAXArray): Array containing time/horizontal dimension regression variable(s) for the
-                observed locations. May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different
-                time/horizontal regression variables.
             corr (bool, optional): If ``True`` will plot the correlation between points instead of the
                 covariance. Defaults to ``False``.
             wn (bool, optional): Whether to include white noise in the calculation of covariance.
                 Defaults to ``True``.
-            x_l_plot (JAXArray, optional): The values on the y-axis used by ``plt.pcolormesh`` for the plot.
-                If not included will default to ``x_l`` if ``x_l`` is of shape ``(N_l,)`` or to ``x_l[0, :]``
-                if ``x_l`` is of shape ``(d_l, N_l)``.
-            x_t_plot (JAXArray, optional): The values on the x-axis used by ``plt.pcolormesh`` for the plot.
-                If not included will default to ``x_t`` if ``x_t`` is of shape ``(N_t,)`` or to ``x_t[0, :]``
-                if ``x_t`` is of shape ``(d_t, N_t)``.
+            x_plot (JAXArray | tuple, optional): The values on the axes used by ``plt.pcolormesh`` for the plot.
+                If not included, will default to the input vector(s) in ``X`` during GP object intialisation.
+                If these input vectors consist of multiple regression vectors i.e. of shape ``(d, N)``, 
+                then the first vector will be used.
             full (bool, optional): If ``True`` will build and visualise the full constructed covariance matrix
         
         Returns:
-            plt.Figure: A figure displaying the covariance of each point in the observed data with the
-            selected point located at ``(i, j)`` in the observed data ``Y``.
+            plt.Figure: A figure displaying each of the component covariance matrices in the Kronecker product model.
         
         """
-        
-        self.kf_eval = self.build_kf(p, self.x)
-        N_kron_terms = 1 + len(self.kf_eval.K_list)
     
         # If no x and y axes for the plots specified, defaults to x_l, x_t
         # If x_l or x_t contain multiple rows then pick the first row
         if x_plot is None:
-            x_plot = list(self.x)
-            for d in range(self.dim):
-                if x_plot[d].ndim != 1:
-                    x_plot[d] = x_plot[d][0]
+            x_plot = ()
+            if self.dim == 1:
+                x_plot = (self.x,)
+            else:
+                for d in range(self.dim):
+                    if self.x[d].ndim > 1:
+                        x_plot += (self.x[d][0],)
+                    else:
+                        x_plot += (self.x[d],)
 
         if axes_labels is None:
             axes_labels = [rf"$x_{d+1}$" for d in range(self.dim)]
         
-        fig, ax = plt.subplots(N_kron_terms, self.dim, figsize = (5*self.dim, 5*N_kron_terms), squeeze=False)
+        self.kf_eval = self.build_kf(p, self.x)
+        N_kron_terms = 1 + len(self.kf_eval.K_list)
 
         if self.dim == 1:
-            self.kf_eval.Sigma = (self.kf_eval,)
-        K_list = []
-        for d in range(self.dim):
-            K_list.append([self.kf_eval.Sigma[d].evaluate(self.x[d], self.x[d], wn = wn, full = True)])
-            
-            # Build each component matrix
-            for i in range(N_kron_terms-1):
-                K_list[-1].append(self.kf_eval.K_list[i][d].evaluate(self.x[d], self.x[d], wn = wn, full = True))
+            K_list = [[self.kf_eval.evaluate(self.x, self.x, wn = wn, full = True)]]
+        else:
+            K_list = []
+            for d in range(self.dim):
+                K_list.append([self.kf_eval.Sigma[d].evaluate(self.x[d], self.x[d], wn = wn, full = True)])
+                
+                # Build each component matrix
+                for i in range(N_kron_terms-1):
+                    K_list[-1].append(self.kf_eval.K_list[i][d].evaluate(self.x[d], self.x[d], wn = wn, full = True))
+
+
+        fig, ax = plt.subplots(N_kron_terms, self.dim, figsize = (5*self.dim, 5*N_kron_terms), squeeze=False)
 
         if full:
             raise Exception("Plotting full covariance matrix not implemented")
@@ -1407,7 +1330,7 @@ class GP(object):
         return_fig = False,
         return_fit = False,
         axes_labels = [r"$x_1$", r"$x_2$"],
-        sharey = True,
+        sharey = None,
         **fig_kwargs,
     ) -> plt.Figure:
         """Visualises the fit to the data. Displays the observed data as well as the mean function,
@@ -1446,6 +1369,13 @@ class GP(object):
                         x_plot += (x.copy(),)
                     else:
                         x_plot += (x[0, :],)
+
+        if sharey is None:
+            # default to sharey = False for 1D fits, but True for 2D fits
+            if self.dim == 1:
+                sharey = False
+            else:
+                sharey = True
     
         # Perform GP regression at the observed data locations
         gp_mean, M = self.gp_mean_calc(p, Y, return_mf = True)
@@ -1729,3 +1659,136 @@ def stack_obs_and_pred_points(x, x_pred, sort = None):
 
     return x_total, x_pred, obs_points, pred_points, sort_fn
     
+ 
+    # def predict_old(
+    #     self,
+    #     p: PyTree,
+    #     Y: JAXArray,
+    #     x_pred: Optional[JAXArray] = None,
+    #     return_std_dev: Optional[bool] = True,
+    #     **kwargs,
+    # ) -> Tuple[JAXArray, JAXArray, JAXArray]:
+    #     r"""Performs GP regression and computes the GP predictive mean and the GP predictive
+    #         uncertainty as the standard devation at each location or else can return the full
+    #         covariance matrix. Requires the input kernel function(s) to have a ``wn`` keyword
+    #         argument that defines the kernel when white noise is included (``wn = True``) and
+    #         when white noise isn't included (``wn = False``).
+            
+    #         Currently assumes the same input hyperparameters for both the observed and predicted
+    #         locations. The predicted locations ``x_l_pred`` and ``x_t_pred`` may deviate from
+    #         the observed locations ``x_l`` and ``x_t`` however.
+            
+    #         The GP predictive mean is defined as:
+            
+    #         .. math::
+            
+    #             \mathbb{E}[\vec{y}_*] = \vec{\mu}_* + \mathbf{K}_*^T \mathbf{K}^{-1} \vec{r}
+            
+    #         And the GP predictive covariance is given by:
+            
+    #         .. math::
+            
+    #             Var[\vec{y}_*] = \mathbf{K}_{**} - \mathbf{K}_*^T \mathbf{K}^{-1} \mathbf{K}_*
+            
+    #         Args:
+    #             p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
+    #                 in addition to any mean function parameters which may be needed to calculate the mean function.
+    #             Y (JAXArray): Observed data to fit, must be of shape ``(N_l, N_t)``.
+    #             x_l_pred (JAXArray, optional): Prediction locations along the row dimension,
+    #                 defaults to observed input locations.
+    #             x_t_pred (JAXArray, optional): Prediction locations along the column dimension,
+    #                 defaults to observed input locations.
+    #             return_std_dev (bool, optional): If ``True`` will return the standard deviation ofuncertainty
+    #                 at the predicted locations. Otherwise will return the full predictive covariance matrix.
+    #                 Defaults to ``True``.
+            
+    #         Returns:
+    #             (JAXArray, JAXArray, JAXArray): Returns a tuple of three elements, where the first element is
+    #             the GP predictive mean at the prediction locations, the second element is either the
+    #             standard deviation of the predictions if ``return_std_dev = True``, otherwise it will be
+    #             the full covariance matrix of the predicted values. The third element will be the mean function
+    #             evalulated at the prediction locations.
+            
+    #         """
+        
+    #     # If no prediction locations specified, predict at observed locations
+        
+    #     if x_l_pred is None:
+    #         x_l_pred = self.x_l
+    #     if x_t_pred is None:
+    #         x_t_pred = self.x_t
+
+    #     # Generate mean function and compute residuals
+    #     R = Y - self.mf(p, self.x_l, self.x_t)
+    #     M_pred = self.mf(p, x_l_pred, x_t_pred)
+        
+    #     # Kernel object computes GP regression as the most efficient method depends on the form of
+    #     # the kernel function
+    #     self.kf_eval = self.build_kf(p, self.x)
+    #     gp_mean, pred_err = self.kf_eval.predict(p, self.x_l, x_l_pred, self.x_t, x_t_pred, R, M_pred,
+    #                                         return_std_dev = return_std_dev, **kwargs)
+        
+    #     return gp_mean, pred_err, M_pred
+
+    
+    # def sigma_clip(
+    #     self,
+    #     p: PyTree,
+    #     Y:JAXArray,
+    #     sigma: Scalar,
+    #     plot: Optional[bool] = True,
+    #     use_gp_mean: Optional[bool] = True,
+    # ) -> JAXArray:
+    #     """Performs GP regression and replaces any outliers above a given number of standard deviations
+    #     with the GP predictive mean evaluated at those locations. If ``use_gp_mean = False`` then will instead
+    #     replace outliers with the mean function evaluated at each location.
+        
+    #     Args:
+    #         p (PyTree): Pytree of hyperparameters used to calculate the covariance matrix
+    #             in addition to any mean function parameters which may be needed to calculate the mean function.
+    #         Y (JAXArray): Observed data to fit, must be of shape ``(N_l, N_t)``.
+    #         sigma (Scalar): Significance value in standard deviations above which outliers will be clipped.
+    #         plot (bool, optional): Whether to produce plots which visualise the outliers in the data.
+    #         use_gp_mean (bool, optional): Will replace outliers with values from the GP predictive mean if ``True``,
+    #             otherwise will replace with values from the mean function.
+        
+    #     Returns:
+    #         JAXArray: The observed data with outliers cleaned.
+            
+    #     """
+        
+    #     # First perform the GP regression with the predicted locations defaulting to the observed locations
+    #     gp_mean, sigma_diag, M = self.predict(p, Y)
+        
+    #     # Residuals after subtraction of the GP mean are normalised based on their predicted uncertainties
+    #     res = Y - gp_mean
+    #     Z = jnp.abs(res/sigma_diag)
+        
+    #     # Identify outliers above given significance level
+    #     outliers = Z > sigma
+        
+    #     # Create a copy of the observed data with outliers replaced with the GP predictive mean values
+    #     Y_clean = jnp.array(Y.copy())
+        
+    #     if use_gp_mean:
+    #         Y_clean = Y_clean.at[outliers].set(gp_mean[outliers])
+    #     else:
+    #         Y_clean = Y_clean.at[outliers].set(M[outliers])
+        
+    #     print("Number of outliers clipped = ", (outliers).sum())
+        
+    #     # Some convenient plots to visualise the locations of the outliers
+    #     if plot:
+    #         plt.title("Std. Dev. of Residuals")
+    #         plt.imshow(Z, aspect = 'auto')
+    #         plt.colorbar()
+    #         plt.show()
+            
+    #         if outliers.sum() > 0:
+    #             plt.title("Locations of Outliers Removed")
+    #             plt.imshow(Y, aspect = 'auto')
+    #             y, x = jnp.where(outliers)
+    #             plt.scatter(x, y, color='red', marker='x')
+    #             plt.show()
+
+    #     return Y_clean

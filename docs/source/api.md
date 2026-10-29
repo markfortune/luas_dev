@@ -4,14 +4,14 @@
 
 We have detailed documentation for luas included in this section. For getting started we recommend the [tutorials](tutorials_index) section however as it may not be obvious from the documentation where to start. If you spot any bugs or think the documentation is unclear, feel free to raise an issue on GitHub [`here`](<https://github.com/markfortune/luas/issues>).
 
-## Primary Interface
+## Primary interface
 ```{toctree}
 :maxdepth: 1
 
 GP
 ```
 
-## Kronecker Kernels
+## Kronecker kernels
 
 ```{toctree}
 :maxdepth: 1
@@ -19,7 +19,7 @@ GP
 kronecker_kernels
 ```
 
-## Kernel Functions
+## Kernel functions
 
 ```{toctree}
 :maxdepth: 1

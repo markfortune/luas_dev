@@ -11,6 +11,7 @@ If you would like to see a sample analysis using `luas` then there is an example
 ```{toctree}
 :maxdepth: 1
 
-tutorials/2D_GP_intro
+tutorials/Simple_1D_example
 tutorials/PyMC Example
+tutorials/2D_GP_intro
 ```

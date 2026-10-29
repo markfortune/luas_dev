@@ -5,7 +5,7 @@ from jax.flatten_util import ravel_pytree
 from tqdm import tqdm
 from copy import deepcopy
 from typing import Callable, Optional, Tuple, Union
-from .luas_types import PyTree, JAXArray
+from .luas_types import PyTree, JAXArray, is_scalar
 import warnings
 
 __all__ = [
@@ -53,25 +53,30 @@ def check_params_in_bounds(p, param_bounds, bound_tol = 1e-9):
     # Check if values are all within bounds
     for par in p.keys():
         if par in param_bounds.keys():
-            ind_below = p[par] <= param_bounds[par][0]
-            ind_above = p[par] >= param_bounds[par][1]
+            # Allow bounds to be floats/scalars as well as arrays, broadcasting them to the shape of the parameter
+            lower = np.broadcast_to(np.asarray(param_bounds[par][0]), np.shape(p[par]))
+            upper = np.broadcast_to(np.asarray(param_bounds[par][1]), np.shape(p[par]))
+            param_bounds_par = [lower, upper]
+
+            ind_below = p[par] <= lower
+            ind_above = p[par] >= upper
 
             # Check params are above lower bounds
             if jnp.any(ind_below):
-                if jnp.all((p[par][ind_below] + bound_tol) > param_bounds[par][0][ind_below]):
+                if jnp.all((p[par][ind_below] + bound_tol) > lower[ind_below]):
                     # Do small adjustment to correct numerical jitter errors
-                    warnings.warn(f"Input parameter {par} at indices {np.arange(p[par].size)[ind_below]} at lower prior bound and shifted inside by +{bound_tol}", UserWarning)
+                    warnings.warn(f"Input parameter {par} at indices {np.nonzero(ind_below.ravel())} at lower prior bound and shifted inside by +{bound_tol}", UserWarning)
                     p_new[par][ind_below] += bound_tol
                 else:
-                    raise ValueError(f"Parameter {par} is below param_bounds at indices {np.arange(p[par].size)[ind_below]}. Value: {p[par]}, Bounds: {param_bounds[par]}")
+                    raise ValueError(f"Parameter {par} is below param_bounds at indices {np.nonzero(ind_below.ravel())[0]}. Value: {p[par]}, Bounds: {param_bounds_par}")
             
             # Check params are below upper bounds
             if jnp.any(ind_above):
-                if jnp.all((p[par][ind_above] - bound_tol) < param_bounds[par][1][ind_above]):
+                if jnp.all((p[par][ind_above] - bound_tol) < upper[ind_above]):
                     warnings.warn(f"Input parameter {par} at indices {np.arange(p[par].size)[ind_above]} at upper prior bound and shifted inside by -{bound_tol}", UserWarning)
                     p_new[par][ind_above] -= bound_tol
                 else:
-                    raise ValueError(f"Parameter {par} is out of param_bounds at indices {np.arange(p[par].size)[ind_above]}. Value: {p[par]}, Bounds: {param_bounds[par]}")
+                    raise ValueError(f"Parameter {par} is out of param_bounds at indices {np.nonzero(ind_above.ravel())[0]}. Value: {p[par]}, Bounds: {param_bounds_par}")
     return p_new
 
 
@@ -148,7 +153,8 @@ def array_to_pytree_2D(p: PyTree, arr_2D: JAXArray) -> PyTree:
     # Use this function to sort the numbers from 0 to N for N parameters
     # This will be used to sort the array into a nested PyTree in the right order
     coord_dict = make_p_dict(jnp.arange(p_arr.size))
-    
+
+    coord_dict = {k: jnp.ravel(v) for k, v in coord_dict.items()}
      
     pytree_2D = {}
     # Loop through the parameters lying along each row
@@ -157,7 +163,6 @@ def array_to_pytree_2D(p: PyTree, arr_2D: JAXArray) -> PyTree:
         
         # Loop through the parameters lying along each column
         for k2 in p.keys():
-            
             # Select the array elements corresponding to the row and column parameters
             pytree_2D[k1][k2] = arr_2D[jnp.ix_(coord_dict[k1], coord_dict[k2])]
     
@@ -190,7 +195,9 @@ def pytree_to_array_2D(
         param_order = order_list(list(p.keys()))
         p_arr, make_p_dict = ravel_pytree(p)
         coord_dict = make_p_dict(jnp.arange(p_arr.size))
-        
+
+        coord_dict = {k: jnp.ravel(v) for k, v in coord_dict.items()}
+
         # Get the total number of parameters
         N_par = p_arr.size
     else:
@@ -199,14 +206,16 @@ def pytree_to_array_2D(
         coord_dict = {}
         N_par = 0
         for par in param_order:
-            coord_dict[par] = jnp.arange(N_par, N_par + p[par].size)
-            N_par += p[par].size
+            coord_dict[par] = jnp.arange(N_par, N_par + np.size(p[par]))
+            N_par += np.size(p[par])
             
     # Loop through each element in the nested PyTree and use the array locations already found
     arr_2D = jnp.zeros((N_par, N_par))
     for k1 in param_order:
         for k2 in param_order:
-            arr_2D = arr_2D.at[jnp.ix_(coord_dict[k1], coord_dict[k2])].set(pytree_2D[k1][k2])
+            # Reshape as e.g. jax.hessian returns shape (N,) for a vector-scalar pair but (N, 1) is needed here
+            block = jnp.reshape(pytree_2D[k1][k2], (coord_dict[k1].size, coord_dict[k2].size))
+            arr_2D = arr_2D.at[jnp.ix_(coord_dict[k1], coord_dict[k2])].set(block)
     
     return arr_2D
 
