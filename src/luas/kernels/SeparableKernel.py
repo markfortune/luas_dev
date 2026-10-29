@@ -17,7 +17,109 @@ __all__ = [
 ]
 
 class SeparableKernel(CovType):
-    
+    r"""GP optimisation for a covariance matrix that is a single Kronecker product,
+    i.e. a kernel which is fully separable in every dimension.
+
+    For 2D data this handles kernel functions of the form
+
+    .. math::
+
+        k(\lambda, \lambda', t, t') = s_\lambda(\lambda, \lambda')\, s_t(t, t'),
+
+    which on a rectangular grid gives the covariance matrix
+
+    .. math::
+
+        \mathbf{K} = \mathbf{\Sigma}_\lambda \otimes \mathbf{\Sigma}_t.
+
+    Here and throughout the ``luas`` Kronecker kernels, dimension 0 is written as
+    wavelength :math:`\lambda` and dimension 1 as time :math:`t` to match the
+    exoplanet use case, but any rectangular grid can be used. Unlike most of the
+    other Kronecker kernels, this optimisation works for any number of dimensions,
+    i.e. :math:`\mathbf{K} = \mathbf{\Sigma}_1 \otimes \mathbf{\Sigma}_2 \otimes
+    \dots \otimes \mathbf{\Sigma}_d`.
+
+    A typical use is modelling white noise plus measurement covariance, e.g.
+    wavelength-correlated readout noise which is drawn independently for each
+    integration.
+
+    **Method.** Uses the approach of Saatchi (2011), generalised to any matrix
+    square root (Fortune, Gibson & Pope, in prep.). Each
+    :math:`\mathbf{\Sigma}_d` is decomposed separately using its own ``decompose``
+    method (general Cholesky, quasiseparable/``tinygp`` Cholesky, or a trivial
+    diagonal decomposition). The residuals are then whitened by applying each
+    matrix inverse square root along its own axis, after which the log-likelihood
+    reduces to a least-squares term on the whitened residuals plus
+
+    .. math::
+
+        \log|\mathbf{K}| = \sum_d \frac{N}{N_d} \log|\mathbf{\Sigma}_d|,
+
+    where :math:`N = \prod_d N_d` is the total number of data points.
+
+    **Runtime scaling (2D).**
+
+    - Diagonal :math:`\mathbf{\Sigma}_\lambda` and :math:`\mathbf{\Sigma}_t`:
+      :math:`\mathcal{O}(N_\lambda N_t)`.
+    - Quasiseparable :math:`\mathbf{\Sigma}_\lambda`, :math:`\mathbf{\Sigma}_t`
+      (from ``luas.kernels.quasisep``):
+      :math:`\mathcal{O}(N_\lambda J_{\Sigma_\lambda}^2 + N_t J_{\Sigma_t}^2
+      + N_\lambda N_t (J_{\Sigma_\lambda} + J_{\Sigma_t}))`, i.e. linear in both
+      dimensions.
+    - Arbitrary :math:`\mathbf{\Sigma}_\lambda` with diagonal
+      :math:`\mathbf{\Sigma}_t`: :math:`\mathcal{O}(N_\lambda^3 + N_\lambda^2 N_t)`.
+
+    **Selection.** :class:`luas.GP` selects this optimisation automatically when the
+    kernel function ``kf`` returns a single tuple with one kernel per dimension
+    (rather than a tuple of tuples).
+
+    Warning:
+        Every :math:`\mathbf{\Sigma}_d` must be positive definite and reasonably
+        well-conditioned, since each is inverted. Including non-zero white noise
+        (``Noise``) or a ``KroneckerDelta`` term in each dimension guarantees this.
+
+    Example:
+        White noise varying in wavelength plus exponential readout noise in
+        wavelength, independent in time (from the ``luas`` tutorial):
+
+        .. code-block:: python
+
+            import jax.numpy as jnp
+            import luas
+
+            def kf(p, X):
+                s_l = luas.kernels.quasisep.Noise(jnp.exp(p["log_sigma"]))
+                s_l += jnp.exp(2*p["log_h_readout"][0]) * luas.kernels.quasisep.Exp(jnp.exp(p["log_l_readout"][0]))
+                s_t = luas.kernels.quasisep.KroneckerDelta()
+
+                # A single tuple, one kernel per dimension, in the same order as X
+                return (s_l, s_t)
+
+            gp = luas.GP(p, (x_l, x_t), kf = kf)  # Uses SeparableKernel
+
+    Args:
+        *Sigma (CovType): One covariance object per dimension, in the same order as
+            the regression variables ``X`` and the axes of the data array. Normally
+            built from ``luas.kernels``, ``luas.kernels.quasisep`` or
+            ``luas.kernels.diagonal`` kernels. Each must be positive definite.
+        use_stored_values (bool, optional): Reusing stored decompositions is not
+            currently implemented for this kernel, leave as ``False``.
+        data_shape (tuple, optional): Currently unused.
+        inv_dims (bool, optional): If ``True``, computes :math:`\vec{r}^T
+            \mathbf{K}^{-1} \vec{r}` using a fallback which applies the full inverse
+            :math:`\mathbf{\Sigma}_d^{-1}` along any dimension whose covariance
+            object does not provide a matrix inverse square root. Defaults to
+            ``False``.
+        **kwargs: Ignored, accepted so that all Kronecker kernels share a common
+            constructor interface.
+
+    See Also:
+        :class:`luas.LuasKernel`, :class:`luas.LuasLasrachKernel` for adding a
+        second, full-rank Kronecker product term.
+        :class:`luas.MultiLowRankKernel` for adding low-rank terms.
+        :class:`luas.GeneralKernel` for an unoptimised reference implementation.
+    """
+
     def __init__(
         self,
         *Sigma,

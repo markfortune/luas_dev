@@ -105,49 +105,116 @@ def decomp_K_tilde(
 
 
 class LuasKernel(Kernel):
-    r"""Kernel class which solves for the log likelihood for any covariance matrix which
-    is the sum of two kronecker products of the covariance matrix in each of two dimensions
-    i.e. the full covariance matrix K is given by:
-    
-    .. math::
-        K = K_l \otimes K_t + S_l \otimes S_t
-    
-    although we can avoid calculating ``K`` for many calculations implemented here.
-        
-    The ``Kl`` and ``Sl`` functions should both return ``(N_l, N_l)`` matrices which will be the covariance
-    matrices in the wavelength/vertical direction.
-    
-    The ``Kt`` and ``St`` functions should both return ``(N_t, N_t)`` matrices which will by the covariance
-    matrices in the time/horizontal direction.
-    
-    .. code-block:: python
+    r"""GP optimisation for a covariance matrix that is the sum of two Kronecker
+    products, using simultaneous diagonalisation in both dimensions.
 
-        >>> from luas import LuasKernel, kernels
-        >>> def Kl_fn(hp, x_l1, x_l2, wn = True):
-        >>> ... return hp["h"]**2*kernels.squared_exp(x_l1, x_l2, hp["l_l"])
-        >>> def Kt_fn(hp, x_t1, x_t2, wn = True):
-        >>> ... return kernels.squared_exp(x_t1, x_t2, hp["l_t"])
-        >>> # ... And similarly for Sl_fn, St_fn
-        >>> kernel = LuasKernel(Kl = Kl_fn, Kt = Kt_fn, Sl = Sl_fn, St = St_fn)
-        ... )
-    
-    See https://luas.readthedocs.io/en/latest/tutorials.html for more detailed tutorials on how to use.
-        
+    Handles kernel functions of the form
+
+    .. math::
+
+        k(\lambda, \lambda', t, t') = s_\lambda(\lambda, \lambda')\, s_t(t, t')
+        + k_\lambda(\lambda, \lambda')\, k_t(t, t'),
+
+    which on a rectangular grid gives the covariance matrix
+
+    .. math::
+
+        \mathbf{K} = \mathbf{\Sigma}_\lambda \otimes \mathbf{\Sigma}_t
+        + \mathbf{K}_\lambda \otimes \mathbf{K}_t.
+
+    Dimension 0 is written as wavelength :math:`\lambda` and dimension 1 as time
+    :math:`t`, but any 2D rectangular grid can be used. The first term typically
+    models white noise and measurement covariance, and the second term a 2D
+    correlated noise term (e.g. systematics correlated in both wavelength and time).
+    Any valid kernels can be used for all four matrices.
+
+    **Method.** From Rakitsch et al. (2013). In each dimension the pair of matrices
+    is simultaneously diagonalised: :math:`\mathbf{K}_\lambda` is transformed by the
+    inverse square root of :math:`\mathbf{\Sigma}_\lambda` and the result
+    eigendecomposed (and similarly in time), which factorises :math:`\mathbf{K}` as
+
+    .. math::
+
+        \mathbf{K}^{-1} = [\mathbf{W}_\lambda \otimes \mathbf{W}_t]\,
+        [\mathbf{I} + \mathbf{\Lambda}_{\tilde{K}_\lambda} \otimes
+        \mathbf{\Lambda}_{\tilde{K}_t}]^{-1}\,
+        [\mathbf{W}_\lambda^T \otimes \mathbf{W}_t^T],
+
+    so the log-likelihood only needs a diagonal solve after transforming the
+    residuals. This implementation computes the inverse square roots of
+    :math:`\mathbf{\Sigma}_\lambda` and :math:`\mathbf{\Sigma}_t` by
+    eigendecomposition, so four eigendecompositions are performed in total
+    (Fortune, Gibson & Pope, in prep. describe using cheaper Cholesky
+    decompositions for this step instead).
+
+    **Runtime scaling.** :math:`\mathcal{O}(N_\lambda^3 + N_t^3 + N_\lambda N_t
+    (N_\lambda + N_t))` runtime and :math:`\mathcal{O}(N_\lambda^2 + N_t^2 +
+    N_\lambda N_t)` memory. The two eigendecompositions dominate, which in practice
+    limits this kernel to roughly 1000-4000 points in either dimension. Using
+    quasiseparable kernels (``luas.kernels.quasisep``) does not reduce this cost.
+
+    **Selection.** :class:`luas.GP` selects this optimisation automatically when the
+    kernel function returns two Kronecker terms, ``(s_l, s_t), (k_l, k_t)``, with no
+    low-rank terms, and the kernels along the longer dimension are not all
+    quasiseparable/diagonal (so :class:`luas.LuasLasrachKernel` would not scale
+    linearly along it). The one exception is when *neither* dimension is
+    quasiseparable/diagonal and the shorter dimension has fewer than
+    ``max_gen_cholesky_blocks`` points (default 10, set through
+    ``kernel_select_kwargs``), in which case :class:`luas.LuasLasrachKernel` is used
+    instead. Force it with ``luas.GP(..., use_kernel = luas.LuasKernel)``.
+
+    Warning:
+        :math:`\mathbf{\Sigma}_\lambda` and :math:`\mathbf{\Sigma}_t` must be positive
+        definite and well-conditioned, and must be the **first** tuple returned by
+        the kernel function. :math:`\mathbf{K}_\lambda` and :math:`\mathbf{K}_t` may
+        be positive semi-definite.
+
+    Note:
+        This class still uses the older ``luas`` kernel interface (it subclasses
+        ``luas.luas_types.Kernel`` rather than ``CovType``), and is restricted to
+        exactly two dimensions and a single :math:`\mathbf{K}` term. See
+        :class:`luas.LuasKernelND` for more than two dimensions, and
+        :class:`luas.LuasPlusMultiLowRankKernel` or :class:`luas.ExtendedLuasKernel`
+        for adding further low-rank terms.
+
+    Example:
+        Measurement covariance plus a 2D Matern kernel term (from the ``luas``
+        tutorial):
+
+        .. code-block:: python
+
+            def kf(p, X):
+                s_l = luas.kernels.Noise(jnp.exp(p["log_sigma"]))
+                s_l += jnp.exp(2*p["log_h_readout"][0]) * luas.kernels.Exp(jnp.exp(p["log_l_readout"][0]))
+                s_t = luas.kernels.KroneckerDelta()
+
+                k_l = jnp.exp(2*p["log_h"][0]) * luas.kernels.Matern52(jnp.exp(p["log_l_l"][0]))
+                k_t = luas.kernels.Matern32(jnp.exp(p["log_l_t"][0]))
+
+                # The positive definite (s_l, s_t) term must come first
+                return (s_l, s_t), (k_l, k_t)
+
+            gp = luas.GP(p, (x_l, x_t), kf = kf, use_kernel = luas.LuasKernel)
+
     Args:
-        Kl (Callable): Function which returns the covariance matrix Kl, should be of the form
-            ``Kl(hp, x_l1, x_l2, wn = True)``.
-        Kt (Callable): Function which returns the covariance matrix Kt, should be of the form
-            ``Kt(hp, x_t1, x_t2, wn = True)``.
-        Sl (Callable): Function which returns the covariance matrix Sl, should be of the form
-            ``Sl(hp, x_l1, x_l2, wn = True)``.
-        St (Callable): Function which returns the covariance matrix St, should be of the form
-            ``St(hp, x_t1, x_t2, wn = True)``.
-        use_stored_values (bool, optional): Whether to perform checks if any of the component
-            covariance matrices have changed and to make use of previously stored values for
-            the decomposition of those matrices if they're the same. If ``False`` then will
-            not perform these checks and will compute the eigendecomposition of all matrices
-            for every calculation.
-    
+        Sigma (tuple[CovType, CovType]): The covariance objects
+            :math:`(\mathbf{\Sigma}_\lambda, \mathbf{\Sigma}_t)` for dimensions 0 and
+            1. Both must be positive definite.
+        K (tuple[CovType, CovType]): The covariance objects
+            :math:`(\mathbf{K}_\lambda, \mathbf{K}_t)` for dimensions 0 and 1.
+        use_stored_values (bool, optional): If ``True`` (the default), each call to
+            ``decompose`` checks whether any of the four component matrices are
+            unchanged (within ``rtol``/``atol``) from the ``stored_values`` passed in
+            and reuses their stored eigendecompositions. This can save time when some
+            hyperparameters are held fixed, e.g. blocked Gibbs sampling. If ``False``,
+            all four matrices are decomposed on every call.
+        **kwargs: Ignored, accepted so that all Kronecker kernels share a common
+            constructor interface.
+
+    See Also:
+        :class:`luas.LuasLasrachKernel` for the same kernel structure with linear
+        scaling in one dimension.
+        :class:`luas.SeparableKernel` if only the first Kronecker term is needed.
     """
     
     def __init__(

@@ -18,6 +18,71 @@ from luas.jax_convenience_fns import array_to_pytree_2D
 __all__ = ["GeneralKernel"]
 
 class GeneralKernel(CovType):
+    r"""Unoptimised reference implementation which builds the full covariance matrix
+    and decomposes it with a general Cholesky decomposition.
+
+    Accepts the same kernel structure as the optimised Kronecker kernels, i.e. a
+    sum of Kronecker products of covariance matrices in each dimension:
+
+    .. math::
+
+        \mathbf{K} = \mathbf{\Sigma}_\lambda \otimes \mathbf{\Sigma}_t
+        + \sum_i \mathbf{K}_{\lambda; i} \otimes \mathbf{K}_{t; i}
+        \; \left[+ \, \mathbf{K}_\mathrm{dense}\right],
+
+    optionally plus an arbitrary dense matrix :math:`\mathbf{K}_\mathrm{dense}`.
+    Any terms accepted by the optimised kernels (including low-rank terms from
+    ``luas.kernels.lowrank``) can be used, for data with two or more dimensions.
+
+    No structure is exploited, so it is useful mainly for testing: validating the
+    log-likelihood of an optimised kernel, benchmarking, or kernels with no
+    available optimisation. Force it with ``luas.GP(..., use_kernel =
+    luas.GeneralKernel)``; :class:`luas.GP` never selects it automatically.
+
+    **Runtime scaling.** :math:`\mathcal{O}(N^3)` runtime and
+    :math:`\mathcal{O}(N^2)` memory for :math:`N = N_\lambda N_t` total data
+    points.
+
+    Warning:
+        The full :math:`(N, N)` covariance matrix is built in memory, which becomes
+        impractical beyond roughly :math:`N \sim 10^4` data points (a
+        :math:`(10^3, 10^3)` dataset would need ~8 TB at double precision).
+
+    Example:
+        .. code-block:: python
+
+            def kf(p, X):
+                s_l = luas.kernels.Noise(jnp.exp(p["log_sigma"]))
+                s_t = luas.kernels.KroneckerDelta()
+                k_l = luas.kernels.Constant(jnp.exp(p["log_h"][0]))
+                k_t = luas.kernels.Matern32(jnp.exp(p["log_l_t"][0]))
+                return (s_l, s_t), (k_l, k_t)
+
+            gp_fast = luas.GP(p, X, kf = kf)
+            gp_ref = luas.GP(p, X, kf = kf, use_kernel = luas.GeneralKernel)
+
+            # Should agree to numerical precision
+            gp_fast.logL(p, Y), gp_ref.logL(p, Y)
+
+    Args:
+        Sigma (tuple[CovType] or CovType): Either a tuple containing one covariance
+            object per dimension for the first Kronecker product term, or (when the
+            kernel function returns a single tuple) the first dimension's covariance
+            object, with the remaining dimensions given in ``*K_list``.
+        *K_list (tuple[CovType]): Any further Kronecker product terms, each a tuple
+            with one covariance object per dimension. If ``Sigma`` is a single
+            covariance object, these are instead the covariance objects for the
+            remaining dimensions of a single Kronecker product.
+        dense_mat (JAXArray, optional): An optional :math:`(N, N)` matrix added to
+            the covariance matrix after the Kronecker terms are built. Rows and
+            columns follow the row-major (``"C"``) flattening of the data array.
+        use_stored_values (bool, optional): Currently unused.
+
+    See Also:
+        :class:`luas.SeparableKernel`, :class:`luas.LuasKernel`,
+        :class:`luas.ExtendedLuasKernel` and the other Kronecker kernels for exact
+        optimised alternatives.
+    """
     def __init__(
         self,
         Sigma,

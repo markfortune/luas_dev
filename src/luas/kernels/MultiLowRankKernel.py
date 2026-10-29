@@ -20,6 +20,149 @@ __all__ = [
 ]
 
 class MultiLowRankKernel(CovType):
+    r"""GP optimisation for a separable noise term plus a sum of low-rank kernel
+    terms, with all low-rank vectors along the same dimension.
+
+    With the low-rank vectors along wavelength (``fast_dim = 1``), this handles
+    kernel functions of the form
+
+    .. math::
+
+        k(\lambda, \lambda', t, t') = s_\lambda(\lambda, \lambda')\, s_t(t, t')
+        + \sum_{i=1}^{N_\alpha} \alpha_i(\lambda)\alpha_i(\lambda')\, k_{t; i}(t, t'),
+
+    which on a rectangular grid gives the covariance matrix
+
+    .. math::
+
+        \mathbf{K} = \mathbf{\Sigma}_\lambda \otimes \mathbf{\Sigma}_t
+        + \sum_{i=1}^{N_\alpha} \boldsymbol{\alpha}_{\lambda; i}
+        \boldsymbol{\alpha}_{\lambda; i}^T \otimes \mathbf{K}_{t; i}.
+
+    The dimensions can be flipped (``fast_dim = 0``) to instead model terms
+    :math:`\mathbf{K}_{\lambda; j} \otimes \boldsymbol{\beta}_{t; j}
+    \boldsymbol{\beta}_{t; j}^T`, e.g. to analytically marginalise over a
+    wavelength-dependent amplitude of a fixed time-dependent ramp or baseline
+    model. ``fast_dim`` is always the dimension holding the full kernels
+    :math:`k_{t; i}`, and the low-rank vectors lie along the other dimension.
+
+    Each low-rank term models a systematic with a fixed shape along one dimension
+    (e.g. common-mode systematics or stellar granulation with a wavelength-dependent
+    amplitude). The model is closely related to PCA/SysRem with a GP prior on each
+    component, and to the linear model of coregionalisation.
+
+    **Method.** The noise term is whitened by
+    :math:`\mathbf{\Sigma}_\lambda^{-\frac{1}{2}}`, and the whitened vectors
+    :math:`\boldsymbol{\alpha}'_{\lambda; i} = \mathbf{\Sigma}_\lambda^{-\frac{1}{2}}
+    \boldsymbol{\alpha}_{\lambda; i}` are QR decomposed using :math:`N_\alpha`
+    Householder transformations. This reduces the problem to a dense
+    :math:`(N_\alpha N_t, N_\alpha N_t)` block, decomposed with the quasiseparable
+    method of Gordon et al. (2020) when the time kernels are quasiseparable, plus a
+    diagonal block. For :math:`N_\alpha = 1` this is identical to
+    :class:`luas.LuasLasrachKernel`.
+
+    **Runtime scaling** (low-rank vectors along :math:`\lambda`, quasiseparable
+    :math:`k_{t; i}` with mean rank :math:`\bar{J}_{K_t}`, diagonal
+    :math:`\mathbf{\Sigma}_t`):
+
+    - Diagonal :math:`\mathbf{\Sigma}_\lambda`:
+      :math:`\mathcal{O}(N_\alpha^3 N_t \bar{J}_{K_t}^2 + N_\alpha N_\lambda N_t)`.
+    - Plus :math:`\mathcal{O}(N_\lambda J_{\Sigma_\lambda}^2 + N_\lambda N_t
+      J_{\Sigma_\lambda})` for quasiseparable :math:`\mathbf{\Sigma}_\lambda`, or
+      :math:`\mathcal{O}(N_\lambda^3 + N_\lambda^2 N_t)` for arbitrary
+      :math:`\mathbf{\Sigma}_\lambda`.
+    - With ``orthogonalise = True``:
+      :math:`\mathcal{O}(N_\alpha N_t \bar{J}_{K_t}^2 + N_\alpha N_\lambda N_t)`
+      plus the same :math:`\mathbf{\Sigma}_\lambda` costs.
+    - Non-quasiseparable :math:`k_{t; i}` (``use_quasi = False``):
+      :math:`\mathcal{O}(N_\alpha^3 N_t^3 + N_\alpha N_\lambda N_t)`.
+
+    **Selection.** :class:`luas.GP` selects this optimisation automatically when the
+    kernel function returns the noise term followed only by low-rank terms, all with
+    their low-rank vectors along the same dimension. Rank-1 terms are recognised
+    from kernels returning an outer product, i.e. ``luas.kernels.lowrank.Constant``,
+    ``luas.kernels.lowrank.Amplitude``, ``luas.kernels.Constant`` and
+    ``luas.kernels.Linear``. ``fast_dim`` is set automatically, and ``use_quasi``
+    is set to whether all kernels along ``fast_dim`` are quasiseparable or diagonal.
+
+    Warning:
+        :math:`\mathbf{\Sigma}_\lambda` must be positive definite and the noise term
+        must be the **first** tuple returned by the kernel function.
+        :math:`\mathbf{\Sigma}_t` is normally diagonal (e.g. ``KroneckerDelta``). A
+        non-diagonal :math:`\mathbf{\Sigma}_t` is also accepted, but is handled as
+        additional components, increasing the runtime.
+
+    Example:
+        Common-mode systematics plus extra systematics in a single light curve, with
+        readout noise (from the ``luas`` tutorial):
+
+        .. code-block:: python
+
+            def kf(p, X):
+                s_l = luas.kernels.quasisep.Noise(jnp.exp(p["log_sigma"]))
+                s_l += jnp.exp(2*p["log_h_readout"][0]) * luas.kernels.quasisep.Exp(jnp.exp(p["log_l_readout"][0]))
+                s_t = luas.kernels.quasisep.KroneckerDelta()
+
+                # Common-mode systematics: same shape and amplitude at every wavelength
+                alpha_l1 = luas.kernels.lowrank.Constant(jnp.exp(p["log_h_const"][0]))
+                k_t1 = luas.kernels.quasisep.Matern32(jnp.exp(p["log_l_t1"][0]))
+
+                # Extra systematics only in the 10th light curve
+                e_10 = jnp.zeros(X[0].shape[-1]).at[9].set(jnp.exp(p["log_h10"][0]))
+                alpha_l2 = luas.kernels.lowrank.Amplitude(e_10)
+                k_t2 = luas.kernels.quasisep.SquaredExpApprox(jnp.exp(p["log_l_t2"][0]))
+
+                return (s_l, s_t), (alpha_l1, k_t1), (alpha_l2, k_t2)
+
+            gp = luas.GP(p, (x_l, x_t), kf = kf)  # Uses MultiLowRankKernel with fast_dim = 1
+
+    Args:
+        Sigma (tuple[CovType, CovType]): The covariance objects
+            :math:`(\mathbf{\Sigma}_\lambda, \mathbf{\Sigma}_t)` for the noise term.
+        *K_list (tuple[CovType, CovType]): Each low-rank term, given as a tuple with
+            one covariance object per dimension. The entry along the low-rank
+            dimension (``1 - fast_dim``) should be a rank-1 outer product (see above).
+            Other low-rank covariance objects which define ``rank`` (e.g.
+            ``luas.kernels.lowrank.SquaredExp(..., rank = R)``) are also accepted when
+            this kernel is forced with ``use_kernel``; they are eigendecomposed and
+            split into ``R`` rank-1 components sharing the same kernel along
+            ``fast_dim``.
+        fast_dim (int): **Required.** The dimension holding the full kernels
+            :math:`k_{t; i}` (``1`` if the low-rank vectors are along dimension 0,
+            ``0`` if they are along dimension 1). Must be passed as a keyword
+            argument to :class:`luas.GP` when using ``use_kernel =
+            luas.MultiLowRankKernel``.
+        QR_transform (bool, optional): Whether to use the Householder QR
+            transformation to reduce the dense part of the problem to an
+            :math:`(N_\alpha N_t, N_\alpha N_t)` block. Only has an effect when the
+            total rank is less than the length of the low-rank dimension. Defaults to
+            ``True``; setting ``False`` is mainly useful for testing, and currently
+            fails if :math:`\mathbf{\Sigma}_t` is not diagonal.
+        use_stored_values (bool, optional): Currently unused.
+        use_quasi (bool, optional): If ``True``, decompose the dense block using
+            quasiseparable methods, which requires every kernel along ``fast_dim`` to
+            be quasiseparable or diagonal. If ``False``, use a general Cholesky
+            decomposition. Defaults to ``True``.
+        orthogonalise (bool, optional): If ``True``, assume the whitened vectors
+            :math:`\boldsymbol{\alpha}'_{\lambda; i}` are mutually orthogonal, so the
+            problem splits into :math:`N_\alpha` independent 1D GPs (scaling linearly
+            in :math:`N_\alpha`). Requires ``QR_transform = True`` and a total rank no
+            larger than the length of the low-rank dimension. Defaults to ``False``.
+        **kwargs: Ignored, accepted so that all Kronecker kernels share a common
+            constructor interface.
+
+    Warning:
+        ``orthogonalise = True`` discards the off-diagonal terms of the QR
+        decomposition, so the log-likelihood is only correct if the whitened
+        vectors really are orthogonal. This is not checked.
+
+    See Also:
+        :class:`luas.LuasLasrachKernel`, the :math:`N_\alpha = 1` special case.
+        :class:`luas.DoubleMultiLowRankKernel` for low-rank terms along both
+        dimensions.
+        :class:`luas.LuasPlusMultiLowRankKernel` for also including a full-rank 2D
+        kernel term.
+    """
     def __init__(
         self,
         Sigma,

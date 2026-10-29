@@ -22,7 +22,142 @@ __all__ = [
 ]
 
 class LuasLasrachKernel(CovType):
-    
+    r"""GP optimisation for a covariance matrix that is the sum of two Kronecker
+    products, which decouples a 2D GP into independent 1D GPs along one "fast"
+    dimension.
+
+    Handles the same kernel structure as :class:`luas.LuasKernel`,
+
+    .. math::
+
+        k(\lambda, \lambda', t, t') = s_\lambda(\lambda, \lambda')\, s_t(t, t')
+        + k_\lambda(\lambda, \lambda')\, k_t(t, t'),
+        \qquad
+        \mathbf{K} = \mathbf{\Sigma}_\lambda \otimes \mathbf{\Sigma}_t
+        + \mathbf{K}_\lambda \otimes \mathbf{K}_t,
+
+    but only performs simultaneous diagonalisation in the dimension(s) other than
+    ``fast_dim``. Writing the fast dimension as time :math:`t`,
+
+    .. math::
+
+        \mathbf{K} = [\mathbf{\Sigma}_\lambda^{\frac{1}{2}} \mathbf{Q}_{K'_\lambda}
+        \otimes \mathbf{I}_{N_t}]\,
+        [\mathbf{I}_{N_\lambda} \otimes \mathbf{\Sigma}_t
+        + \mathbf{\Lambda}_{K'_\lambda} \otimes \mathbf{K}_t]\,
+        [\mathbf{\Sigma}_\lambda^{\frac{1}{2}} \mathbf{Q}_{K'_\lambda}
+        \otimes \mathbf{I}_{N_t}]^T,
+
+    where :math:`\mathbf{K}'_\lambda = \mathbf{\Sigma}_\lambda^{-\frac{1}{2}}
+    \mathbf{K}_\lambda \mathbf{\Sigma}_\lambda^{-\frac{T}{2}}`. The middle matrix is
+    block-diagonal, so the log-likelihood becomes a sum of independent 1D GP
+    log-likelihoods, one per eigenvalue :math:`\lambda_{K'_\lambda; i}`, each with
+    covariance :math:`\mathbf{\Sigma}_t + \lambda_{K'_\lambda; i} \mathbf{K}_t`. These
+    blocks are never eigendecomposed, so any fast 1D method valid for that sum can
+    be used, e.g. quasiseparable (``tinygp``/celerite) Cholesky decompositions in
+    linear time. The blocks are decomposed in parallel with ``jax.vmap`` (or
+    ``jax.pmap``).
+
+    If :math:`\mathbf{K}_\lambda` is low-rank with rank :math:`R_\lambda` (e.g. a
+    ``luas.kernels.lowrank`` kernel), only :math:`R_\lambda` blocks contain
+    :math:`\mathbf{K}_t` and the remaining blocks reduce to :math:`\mathbf{\Sigma}_t`,
+    which is exploited automatically.
+
+    This optimisation also works for more than two dimensions: every dimension
+    other than ``fast_dim`` is simultaneously diagonalised.
+
+    **Runtime scaling (2D, fast dimension** :math:`t` **).** With quasiseparable
+    :math:`\mathbf{\Sigma}_t` and :math:`\mathbf{K}_t` of rank :math:`J_{K_t}`:
+
+    - Arbitrary :math:`\mathbf{\Sigma}_\lambda`, :math:`\mathbf{K}_\lambda`:
+      :math:`\mathcal{O}(N_\lambda^3 + N_\lambda^2 N_t + R_\lambda N_t J_{K_t}^2)`.
+    - Quasiseparable :math:`\mathbf{\Sigma}_\lambda` (rank :math:`J_{\Sigma_\lambda}`):
+      the decomposition and transformation by :math:`\mathbf{\Sigma}_\lambda`
+      drop to :math:`\mathcal{O}(N_\lambda J_{\Sigma_\lambda}^2 + N_\lambda N_t
+      J_{\Sigma_\lambda})`, but the eigendecomposition of
+      :math:`\mathbf{K}'_\lambda` (:math:`\mathcal{O}(N_\lambda^3)`) and applying
+      its dense eigenvector matrix to the residuals
+      (:math:`\mathcal{O}(N_\lambda^2 N_t)`) remain. Both are avoided only for a
+      rank-1 ``lowrank.Constant``/``lowrank.Amplitude`` term, which uses a
+      Householder transformation instead, giving
+      :math:`\mathcal{O}(N_\lambda J_{\Sigma_\lambda}^2 + N_\lambda N_t
+      J_{\Sigma_\lambda} + N_t J_{K_t}^2)`.
+
+    If the fast-dimension kernels are not quasiseparable, each block costs a general
+    :math:`\mathcal{O}(N_t^3)` Cholesky decomposition, which can still beat the
+    :math:`\mathcal{O}(N_t^3)` eigendecomposition in :class:`luas.LuasKernel` when
+    :math:`R_\lambda` is small or many parallel workers (e.g. a GPU) are available.
+
+    **Selection.** :class:`luas.GP` selects this optimisation automatically for two
+    Kronecker terms with no low-rank terms when all kernels along the longer
+    dimension are quasiseparable or diagonal (setting ``fast_dim`` to that
+    dimension). It is also selected when *neither* dimension is
+    quasiseparable/diagonal but the shorter dimension has fewer than
+    ``max_gen_cholesky_blocks`` points (default 10). A single low-rank term
+    (e.g. ``luas.kernels.lowrank.Constant``) is instead routed to
+    :class:`luas.MultiLowRankKernel`, which reduces to the same optimisation.
+
+    Warning:
+        :math:`\mathbf{\Sigma}_\lambda` and :math:`\mathbf{\Sigma}_t` must be positive
+        definite and must be the **first** tuple returned by the kernel function.
+        Along ``fast_dim``, :math:`\mathbf{\Sigma}_t` and :math:`\mathbf{K}_t` are
+        scaled and added together, so they must be compatible covariance types
+        (e.g. both from ``luas.kernels.quasisep``/``luas.kernels.diagonal`` to get a
+        linear-time decomposition, or both general).
+
+    Example:
+        Measurement covariance plus a 2D kernel term, quasiseparable in time (from
+        the ``luas`` tutorial):
+
+        .. code-block:: python
+
+            def kf(p, X):
+                s_l = luas.kernels.quasisep.Noise(jnp.exp(p["log_sigma"]))
+                s_l += jnp.exp(2*p["log_h_readout"][0]) * luas.kernels.quasisep.Exp(jnp.exp(p["log_l_readout"][0]))
+                s_t = luas.kernels.quasisep.KroneckerDelta()
+
+                # Eigendecomposed, so quasisep gives no speed-up here
+                k_l = jnp.exp(2*p["log_h"][0]) * luas.kernels.Matern52(jnp.exp(p["log_l_l"][0]))
+
+                # Keep quasiseparable for linear scaling in time
+                k_t = luas.kernels.quasisep.Matern32(jnp.exp(p["log_l_t"][0]))
+
+                return (s_l, s_t), (k_l, k_t)
+
+            # Uses LuasLasrachKernel with fast_dim = 1 (assuming N_t >= N_l)
+            gp = luas.GP(p, (x_l, x_t), kf = kf)
+
+            # Or explicitly:
+            gp = luas.GP(p, (x_l, x_t), kf = kf, use_kernel = luas.LuasLasrachKernel, fast_dim = 1)
+
+    Args:
+        Sigma (tuple[CovType, ...]): One positive definite covariance object per
+            dimension for the first Kronecker product term.
+        K (tuple[CovType, ...]): One covariance object per dimension for the second
+            Kronecker product term. May be positive semi-definite or low-rank.
+        fast_dim (int): **Required.** The dimension which is decomposed as
+            independent 1D GPs and is never eigendecomposed. Choose the dimension
+            where :math:`\mathbf{\Sigma}` and :math:`\mathbf{K}` have fast
+            decompositions (e.g. quasiseparable kernels), typically the longer one.
+            Must be passed as a keyword argument to :class:`luas.GP` when using
+            ``use_kernel = luas.LuasLasrachKernel``.
+        use_stored_values (bool, optional): Reusing stored decompositions is not yet
+            implemented; must be ``False`` (the default) or an exception is raised.
+        use_pmap (bool, optional): Experimental, and not currently working. Intended
+            to decompose the independent blocks across multiple devices with
+            ``jax.pmap`` rather than ``jax.vmap`` (requiring at least as many devices
+            as blocks). Defaults to ``False``.
+        **kwargs: Ignored, accepted so that all Kronecker kernels share a common
+            constructor interface.
+
+    See Also:
+        :class:`luas.LuasKernel` for the same kernel structure using
+        eigendecomposition in both dimensions.
+        :class:`luas.MultiLowRankKernel`, which reduces to this optimisation for a
+        single low-rank term and generalises it to several.
+        :class:`luas.LuasPlusMultiLowRankKernel` for adding low-rank terms.
+    """
+
     def __init__(
         self,
         Sigma,

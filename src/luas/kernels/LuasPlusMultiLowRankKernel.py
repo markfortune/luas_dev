@@ -16,7 +16,138 @@ __all__ = [
 ]
 
 class LuasPlusMultiLowRankKernel(CovType):
-    
+    r"""GP optimisation for measurement covariance plus a full-rank 2D kernel term
+    plus low-rank kernel terms along one dimension.
+
+    With the low-rank vectors along time (``fast_dim = 1``), this handles kernel
+    functions of the form
+
+    .. math::
+
+        k(\lambda, \lambda', t, t') = s_\lambda(\lambda, \lambda')\, s_t(t, t')
+        + k_{\lambda; \mathrm{2D}}(\lambda, \lambda')\, k_{t; \mathrm{2D}}(t, t')
+        + \sum_{j=1}^{N_\beta} k_{\lambda; j}(\lambda, \lambda')\, \beta_j(t)\beta_j(t'),
+
+    which on a rectangular grid gives the covariance matrix
+
+    .. math::
+
+        \mathbf{K} = \mathbf{\Sigma}_\lambda \otimes \mathbf{\Sigma}_t
+        + \mathbf{K}_{\lambda; \mathrm{2D}} \otimes \mathbf{K}_{t; \mathrm{2D}}
+        + \sum_{j=1}^{N_\beta} \mathbf{K}_{\lambda; j} \otimes
+        \boldsymbol{\beta}_{t; j} \boldsymbol{\beta}_{t; j}^T.
+
+    With ``fast_dim = 0`` the low-rank vectors are instead along wavelength, i.e.
+    terms :math:`\boldsymbol{\alpha}_{\lambda; i}\boldsymbol{\alpha}_{\lambda; i}^T
+    \otimes \mathbf{K}_{t; i}`. Unlike :class:`luas.MultiLowRankKernel`, here
+    ``fast_dim`` is the dimension **holding the low-rank vectors**. This is also
+    the dimension where quasiseparable kernels can be exploited, giving linear
+    scaling along it if :math:`\mathbf{\Sigma}` and :math:`\mathbf{K}_\mathrm{2D}` are
+    quasiseparable or diagonal in that dimension.
+
+    For example, a 2D correlated noise term plus a detector settling ramp with a
+    fixed shape in time and a wavelength-correlated amplitude.
+
+    **Method.** In the other (slow) dimension, :math:`\mathbf{\Sigma}` and
+    :math:`\mathbf{K}_\mathrm{2D}` are simultaneously diagonalised as in
+    :class:`luas.LuasKernel`. In ``fast_dim``, the low-rank vectors are
+    transformed with a Householder QL decomposition, which keeps quasiseparable
+    kernels quasiseparable (each transformation raises the rank by 2). The
+    transformed matrix is decomposed as a 2x2 block matrix. The large A block is
+    handled either as independent 1D GPs like :class:`luas.LuasLasrachKernel`
+    (``eigen_both = False``) or with eigendecomposition in both dimensions like
+    :class:`luas.LuasKernel` (``eigen_both = True``). The
+    :math:`(N_\beta N_\lambda, N_\beta N_\lambda)` block
+    :math:`\mathbf{D} - \mathbf{C}\mathbf{A}^{-1}\mathbf{B}` is decomposed with a
+    general Cholesky decomposition, which is usually the bottleneck.
+
+    **Runtime scaling** (low-rank vectors along :math:`t`, quasiseparable
+    :math:`k_{t; \mathrm{2D}}` of rank :math:`J_{K_t}`, diagonal :math:`s_t`,
+    ``eigen_both = False``):
+
+    .. math::
+
+        \mathcal{O}\left((1 + N_\beta^3) N_\lambda^3 + N_\lambda^2 N_t
+        + N_\lambda N_t (J_{K_t} + 2N_\beta)^2\right),
+
+    i.e. linear in :math:`N_t`. With ``eigen_both = True`` no quasiseparable kernels
+    are needed but the scaling is cubic in both dimensions,
+    :math:`\mathcal{O}((1 + N_\beta^3) N_\lambda^3 + N_t^3 + N_\lambda N_t
+    (N_\lambda + N_t + N_\beta^2))`.
+
+    **Selection.** :class:`luas.GP` selects this optimisation automatically when the
+    kernel function returns the noise term, exactly one full-rank 2D term, and
+    low-rank terms along only one dimension. ``fast_dim`` is set to the dimension
+    of the low-rank vectors, and ``eigen_both = True`` is used unless all kernels
+    along the longer dimension are quasiseparable or diagonal.
+
+    Warning:
+        The noise term must be positive definite and be the **first** tuple returned
+        by the kernel function. Exactly one full-rank 2D term is required, all
+        low-rank terms must have their vectors along ``fast_dim``, and the number of
+        low-rank terms must be less than the length of ``fast_dim``.
+
+    Example:
+        Measurement covariance, a 2D kernel term and a wavelength-correlated
+        settling ramp (from the ``luas`` tutorial):
+
+        .. code-block:: python
+
+            def kf(p, X):
+                s_l = luas.kernels.quasisep.Noise(jnp.exp(p["log_sigma"]))
+                s_l += jnp.exp(2*p["log_h_readout"][0]) * luas.kernels.quasisep.Exp(jnp.exp(p["log_l_readout"][0]))
+                s_t = luas.kernels.quasisep.KroneckerDelta()
+
+                # Full-rank 2D term, keep the time kernel quasiseparable for linear scaling in time
+                k_l = jnp.exp(2*p["log_h"][0]) * luas.kernels.Matern52(jnp.exp(p["log_l_l"][0]))
+                k_t = luas.kernels.quasisep.Matern32(jnp.exp(p["log_l_t"][0]))
+
+                # beta term: fixed ramp shape along time, wavelength-correlated amplitude
+                k_l1 = jnp.exp(2*p["log_h_ramp"][0]) * luas.kernels.quasisep.Matern32(jnp.exp(p["log_l_l_ramp"][0]))
+                settle_vec = jnp.exp(-(X[1] - X[1][0])/jnp.exp(p["log_l_t_ramp"][0]))
+                beta_t1 = luas.kernels.lowrank.Amplitude(settle_vec)
+
+                return (s_l, s_t), (k_l, k_t), (k_l1, beta_t1)
+
+            gp = luas.GP(p, (x_l, x_t), kf = kf)  # Uses LuasPlusMultiLowRankKernel with fast_dim = 1
+
+    Args:
+        Sigma (tuple[CovType, CovType]): The covariance objects
+            :math:`(\mathbf{\Sigma}_\lambda, \mathbf{\Sigma}_t)` for the noise term.
+        *K_list (tuple[CovType, CovType]): Exactly one full-rank 2D term plus one or
+            more low-rank terms, each as a tuple with one covariance object per
+            dimension. Low-rank terms must have a rank-1 outer product (e.g.
+            ``luas.kernels.lowrank.Amplitude``) along ``fast_dim``.
+        fast_dim (int, optional): The dimension holding the low-rank vectors, which
+            is also the dimension that can exploit quasiseparable kernels. Defaults
+            to ``1``.
+        never_reduce_dim (bool, optional): Currently unused.
+        use_stored_values (bool, optional): Currently unused.
+        transform (bool, optional): Internal. If ``False``, the inputs are assumed
+            to be already transformed (as done when this class is used inside
+            :class:`luas.ExtendedLuasKernel`), and ``transform_fn`` and
+            ``inv_transform_fn`` must be given. Defaults to ``True``.
+        transform_fn (Callable, optional): Internal. Replaces the default transform
+            applied to the residuals by ``matrix_sqrt``.
+        inv_transform_fn (Callable, optional): Internal. Replaces the default
+            inverse transform applied to the residuals by ``matrix_inv_sqrt``.
+        eigen_both (bool, optional): If ``True``, decompose the A block using
+            eigendecomposition in both dimensions (no restrictions on kernels, cubic
+            scaling in both dimensions). If ``False``, decompose it as independent 1D
+            GPs along ``fast_dim`` (linear in that dimension when its kernels are
+            quasiseparable). Defaults to ``False``.
+        use_pmap (bool, optional): Experimental, and not currently working. Intended
+            (when ``eigen_both = False``) to decompose the independent blocks across
+            devices with ``jax.pmap`` instead of ``jax.vmap``. Defaults to ``False``.
+        **kwargs: Ignored, accepted so that all Kronecker kernels share a common
+            constructor interface.
+
+    See Also:
+        :class:`luas.LuasKernel`, :class:`luas.LuasLasrachKernel` for the same model
+        without low-rank terms.
+        :class:`luas.ExtendedLuasKernel` for low-rank terms along both dimensions.
+    """
+
     def __init__(
         self,
         Sigma,

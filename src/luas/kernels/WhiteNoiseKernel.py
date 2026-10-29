@@ -18,7 +18,60 @@ __all__ = ["WhiteNoiseKernel"]
 
 
 class WhiteNoiseKernel(CovType):
-    
+    r"""Diagonal covariance matrix with an independent variance for every data point.
+
+    Models uncorrelated noise whose amplitude does not need to be separable in each
+    dimension, i.e.
+
+    .. math::
+
+        k(\lambda, \lambda', t, t') = \sigma^2(\lambda, t)\,\delta_{\lambda\lambda'}\delta_{tt'},
+        \qquad \mathbf{K} = \mathrm{diag}\left(\mathrm{vec}(\mathbf{D})\right),
+
+    where :math:`\mathbf{D}` has the same shape as the data. If the variance can be
+    written as :math:`\sigma^2(\lambda)\sigma^2(t)`, the same model can instead be
+    built with :class:`luas.SeparableKernel` using ``Noise``/``KroneckerDelta``
+    kernels, which can then be combined with correlated kernel terms.
+
+    The variance is split into two parts, :math:`\mathbf{D} = \texttt{diag} +
+    \texttt{wn\_diag}`. Both contribute to the log-likelihood, but ``wn_diag`` is
+    treated as white noise and is dropped when ``wn = False`` (e.g. when
+    :class:`luas.GP` computes a GP predictive mean), while ``diag`` is treated as
+    part of the signal being fit.
+
+    **Runtime scaling.** :math:`\mathcal{O}(N)` for :math:`N` total data points.
+
+    **Selection.** :class:`luas.GP` uses ``WhiteNoiseKernel(wn_diag = 1.)`` by
+    default when no kernel function is given, which gives an ordinary
+    (unit-variance) least-squares log-likelihood. For parameter-dependent
+    variances, have the kernel function return a ``WhiteNoiseKernel`` directly.
+
+    Warning:
+        ``diag`` and ``wn_diag`` should have the same shape as the data. Scalars or
+        arrays which only broadcast against the data (e.g. shape ``(N_l, 1)``) are
+        accepted by some methods but give an incorrect log determinant.
+
+    Example:
+        .. code-block:: python
+
+            def kf(p, X):
+                # Separate white noise amplitude for every data point
+                return luas.WhiteNoiseKernel(wn_diag = jnp.exp(2*p["log_sigma_2D"]))
+
+            gp = luas.GP(p, (x_l, x_t), kf = kf)
+
+    Args:
+        diag (JAXArray, optional): Variance at each data point which is retained
+            when ``wn = False``. Defaults to ``0.``.
+        wn_diag (JAXArray, optional): White noise variance at each data point,
+            excluded when ``wn = False``. Defaults to ``0.``.
+        **kwargs: Ignored.
+
+    See Also:
+        :class:`luas.SeparableKernel` for separable white noise and measurement
+        covariance.
+    """
+
     def __init__(
         self,
         diag: Optional[JAXArray] = 0.,

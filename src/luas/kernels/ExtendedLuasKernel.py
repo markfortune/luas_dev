@@ -19,7 +19,110 @@ __all__ = [
 ]
 
 class ExtendedLuasKernel(CovType):
-    
+    r"""The most general Kronecker kernel optimisation: measurement covariance, a
+    full-rank 2D kernel term, and low-rank kernel terms along both dimensions.
+
+    Handles kernel functions of the form
+
+    .. math::
+
+        k(\lambda, \lambda', t, t') &= s_\lambda(\lambda, \lambda')\, s_t(t, t')
+        + k_{\lambda; \mathrm{2D}}(\lambda, \lambda')\, k_{t; \mathrm{2D}}(t, t') \\
+        &+ \sum_{i=1}^{N_\alpha} \alpha_i(\lambda)\alpha_i(\lambda')\, k_{t; i}(t, t')
+        + \sum_{j=1}^{N_\beta} k_{\lambda; j}(\lambda, \lambda')\, \beta_j(t)\beta_j(t'),
+
+    which on a rectangular grid gives the covariance matrix
+
+    .. math::
+
+        \mathbf{K} = \mathbf{\Sigma}_\lambda \otimes \mathbf{\Sigma}_t
+        + \mathbf{K}_{\lambda; \mathrm{2D}} \otimes \mathbf{K}_{t; \mathrm{2D}}
+        + \sum_{i=1}^{N_\alpha} \boldsymbol{\alpha}_{\lambda; i}
+        \boldsymbol{\alpha}_{\lambda; i}^T \otimes \mathbf{K}_{t; i}
+        + \sum_{j=1}^{N_\beta} \mathbf{K}_{\lambda; j} \otimes
+        \boldsymbol{\beta}_{t; j} \boldsymbol{\beta}_{t; j}^T.
+
+    All the other 2D Kronecker kernel optimisations in ``luas`` are special cases of
+    this kernel structure. Any valid kernels can be used, but no quasiseparable
+    structure is exploited, so it is best suited to modest dataset sizes or GPUs.
+
+    **Method.** Whitens with :math:`\mathbf{\Sigma}_\lambda` and
+    :math:`\mathbf{\Sigma}_t`, then applies a Householder QL decomposition to the
+    low-rank vectors along both dimensions. The transformed matrix is decomposed as
+    a 2x2 block matrix. The A block is handled by
+    :class:`luas.LuasPlusMultiLowRankKernel`, and the
+    :math:`\mathbf{C}\mathbf{A}^{-1}\mathbf{B}` term exploits sparsity in the
+    blocks. :math:`\mathbf{D} - \mathbf{C}\mathbf{A}^{-1}\mathbf{B}` is decomposed as
+    a general :math:`(N_\alpha N_t, N_\alpha N_t)` matrix.
+
+    **Runtime scaling.**
+
+    .. math::
+
+        \mathcal{O}\left((1 + N_\alpha^3) N_t^3 + (1 + N_\beta^3) N_\lambda^3
+        + N_\lambda N_t (N_\lambda + N_t + N_\alpha^2 + N_\beta^2)\right)
+
+    runtime and :math:`\mathcal{O}(N_\alpha^2 N_t^2 + N_\beta^2 N_\lambda^2 +
+    N_\alpha N_\beta N_\lambda N_t)` memory. For small :math:`N_\alpha`,
+    :math:`N_\beta` this is similar to :class:`luas.LuasKernel`. It can be
+    substantially faster on a GPU.
+
+    **Selection.** :class:`luas.GP` selects this optimisation automatically when the
+    kernel function returns the noise term, one full-rank 2D term, and low-rank
+    terms along both dimensions.
+
+    Warning:
+        Requires exactly one full-rank 2D term, at least one low-rank term along
+        each dimension, :math:`0 < N_\alpha < N_\lambda` and
+        :math:`0 < N_\beta < N_t`. The noise term must be positive definite and be
+        the **first** tuple returned by the kernel function. Low-rank terms are only
+        recognised as rank-1 outer products (e.g. ``luas.kernels.lowrank.Constant``
+        or ``luas.kernels.lowrank.Amplitude``).
+
+    Example:
+        Combining every type of term from the ``luas`` tutorial:
+
+        .. code-block:: python
+
+            def kf(p, X):
+                s_l = luas.kernels.Noise(jnp.exp(p["log_sigma"]))
+                s_l += jnp.exp(2*p["log_h_readout"][0]) * luas.kernels.Exp(jnp.exp(p["log_l_readout"][0]))
+                s_t = luas.kernels.KroneckerDelta()
+
+                # Full-rank 2D term with a wavelength-dependent amplitude
+                k_l = luas.kernels.lowrank.Amplitude(jnp.exp(p["log_h_l_vec"])) * luas.kernels.Matern52(jnp.exp(p["log_l_l"][0]))
+                k_t = luas.kernels.Matern32(jnp.exp(p["log_l_t"][0]))
+
+                # alpha term: fixed vector along wavelength, kernel in time (common-mode systematics)
+                alpha_l1 = luas.kernels.lowrank.Constant(jnp.exp(p["log_h_const"][0]))
+                k_t1 = luas.kernels.Matern32(jnp.exp(p["log_l_t1"][0]))
+
+                # beta term: fixed vector along time, kernel in wavelength (settling ramp)
+                k_l1 = jnp.exp(2*p["log_h_ramp"][0]) * luas.kernels.Matern32(jnp.exp(p["log_l_l_ramp"][0]))
+                settle_vec = jnp.exp(-(X[1] - X[1][0])/jnp.exp(p["log_l_t_ramp"][0]))
+                beta_t1 = luas.kernels.lowrank.Amplitude(settle_vec)
+
+                return (s_l, s_t), (k_l, k_t), (alpha_l1, k_t1), (k_l1, beta_t1)
+
+            gp = luas.GP(p, (x_l, x_t), kf = kf)  # Uses ExtendedLuasKernel
+
+    Args:
+        Sigma (tuple[CovType, CovType]): The covariance objects
+            :math:`(\mathbf{\Sigma}_\lambda, \mathbf{\Sigma}_t)` for the noise term.
+            Both must be positive definite.
+        *K_list (tuple[CovType, CovType]): Exactly one full-rank 2D term plus the
+            low-rank terms, each as a tuple with one covariance object per dimension.
+        use_stored_values (bool, optional): Currently unused.
+        **kwargs: Ignored, accepted so that all Kronecker kernels share a common
+            constructor interface.
+
+    See Also:
+        :class:`luas.LuasPlusMultiLowRankKernel` for low-rank terms along only one
+        dimension, which can exploit quasiseparable kernels.
+        :class:`luas.DoubleMultiLowRankKernel` for low-rank terms along both
+        dimensions without a full-rank 2D term.
+    """
+
     def __init__(
         self,
         Sigma,
