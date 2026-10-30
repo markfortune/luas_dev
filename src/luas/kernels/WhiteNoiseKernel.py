@@ -83,9 +83,6 @@ class WhiteNoiseKernel(CovType):
         self.wn_diag = wn_diag
         self.opt_name = "WhiteNoiseKernel"
         
-        # alias to maintain consistency with LuasKernel which has a separate fn for calculating the hessian
-        self.logL_hessianable = self.logL
-        
 
     def evaluate(
         self,

@@ -12,7 +12,7 @@ from tinygp.solvers.quasisep.core import SymmQSM, StrictLowerTriQSM, DiagQSM
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar, is_scalar
 import luas.kernels.tinygp_ext
 from luas.kernels.tinygp_ext import ScaledKernel, HandleIdx
-from luas.kernels.householder import HouseholderTransform
+from luas.kernels.householder import HouseholderTransform, HouseholderandDiagonalTransform
 from luas.stable_gradients import stable_eigh
 
 
@@ -71,17 +71,6 @@ class CovType():
     
     def logL_hessianable(self, R, **kwargs):
         return - 0.5 * self.dot_solve(R) - 0.5 * self.logdet - 0.5 * R.size * jnp.log(2*jnp.pi)
-    
-    def logL_numerically_stable(self, R, **kwargs):
-        # More numerically stable version of the log-likelihood
-        # Answer is off by a constant from true log-likelihood but this is unimportant for MCMC
-        # Keeping the log-likelihood value small improves precision in difference between two log likelihoods
-        # Data and covariance matrix need to be scaled so that log determinant is close to zero
-        L_inv_R = self.matrix_inv_sqrt(R, transpose = 0)
-        squared_res = jnp.square(L_inv_R)
-        dot_solve_val = (squared_res - 1.).sum()
-    
-        return - 0.5 * dot_solve_val - 0.5 * self.logdet_calc()
 
     def inv_sqrt_transform(self, K, x, **K_kwargs):
         
@@ -1183,6 +1172,7 @@ class Outer(CovType):
 
 
 class OuterPlusScaledIdentity(CovType):
+    # TO DO: Surely better to do a Sherman-Morrison CovType instead...
     def __init__(self, alpha, diag = 0., wn_diag = 0., params = None):
         self.alpha_init = alpha
         self.diag = diag
@@ -1231,35 +1221,28 @@ class OuterPlusScaledIdentity(CovType):
 
         # Shift eigenvalues by constant added to diagonal
         self.lam = self.H.lam + (self.diag + wn * self.wn_diag)
+
+        self.factor = HouseholderandDiagonalTransform(self.alpha, jnp.sqrt(self.lam), i = i, transpose = 0)
         
         self.logdet = jnp.log(self.lam).sum()
         return self, {"logdet":self.logdet}
 
     def matrix_inv_sqrt(self, R, transpose=0, **kwargs):
 
-        lam_inv_sqrt = 1/jnp.sqrt(self.lam)
-
         if transpose:
-            R_prime = jnp.einsum('i,i...->i...', lam_inv_sqrt, R)
-            R_prime = self.H @ R_prime
+            R_prime = self.factor.T.solve(R)
         else:
-            R_prime = self.H @ R
-            R_prime = jnp.einsum('i,i...->i...', lam_inv_sqrt, R_prime)
+            R_prime = self.factor.solve(R)
     
         return R_prime
 
     
     def matrix_sqrt(self, R, transpose=0, **kwargs):
 
-        lam_sqrt = jnp.sqrt(self.lam)
-
         if transpose:
-            R_prime = self.H @ R
-            R_prime = jnp.einsum('i,i...->i...', lam_sqrt, R_prime)
-    
+            R_prime = self.factor.T @ R
         else:
-            R_prime = jnp.einsum('i,i...->i...', lam_sqrt, R)
-            R_prime = self.H @ R_prime
+            R_prime = self.factor @ R
 
         return R_prime
 

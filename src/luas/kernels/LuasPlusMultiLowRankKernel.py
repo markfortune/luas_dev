@@ -154,7 +154,7 @@ class LuasPlusMultiLowRankKernel(CovType):
         *K_list,
         fast_dim = 1,
         never_reduce_dim = False,
-        use_stored_values: Optional[bool] = True,
+        use_stored_values: Optional[bool] = False,
         transform = True,
         transform_fn = None,
         inv_transform_fn = None,
@@ -180,9 +180,13 @@ class LuasPlusMultiLowRankKernel(CovType):
             self.inv_transform_fn = inv_transform_fn
         else:
             self.inv_transform_fn = self.default_inv_transform_fn
-
-        self.logL_hessianable = self.logL
-        self.decompose = self.decomp_no_stored_values
+        
+        # Have different decomposition functions depending on whether previous stored values
+        # are to be used to avoid recalculating eigendecompositions
+        if use_stored_values:
+            raise NotImplementedError("Use of pre-calculated stored values not yet implemented.")
+        else:
+            self.decompose = self.decompose_no_stored_values
 
 
     def _rotate_to_fast_dim_wrapper(self, fn, fast_dim):
@@ -228,7 +232,7 @@ class LuasPlusMultiLowRankKernel(CovType):
         return C_A_inv_B_dense
     
 
-    def decomp_no_stored_values(
+    def decompose_no_stored_values(
         self,
         X: Tuple[JAXArray],
         stored_values: Optional[PyTree] = {},

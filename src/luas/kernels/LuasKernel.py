@@ -10,7 +10,7 @@ from functools import partial
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar
 from luas.kronecker_fns import kron_prod
 from luas.stable_gradients import logdetK_calc, r_K_inv_r, K_inv_vec, logdetK_calc_hessianable
-from luas.kernels.covtype import Identity, ScaledIdentity, Diagonal
+from luas.kernels.covtype import Identity, ScaledIdentity, Diagonal, CovType
 
 __all__ = [
     "diag_eigendecomp",
@@ -104,7 +104,7 @@ def decomp_K_tilde(
     return lam_K_tilde, W
 
 
-class LuasKernel(Kernel):
+class LuasKernel(CovType):
     r"""GP optimisation for a covariance matrix that is the sum of two Kronecker
     products, using simultaneous diagonalisation in both dimensions.
 
@@ -237,10 +237,10 @@ class LuasKernel(Kernel):
         for i in range(2):
             S_i = [self.Sl, self.St][i]
             K_i = [self.Kl, self.Kt][i]
-            if isinstance(S_i, (Identity, ScaledIdentity, Diagonal)):
+            if isinstance(Sigma[i], (Identity, ScaledIdentity, Diagonal)):
                 S_i.decomp = diag_eigendecomp
 
-                if isinstance(K_i, (Identity, ScaledIdentity, Diagonal)):
+                if isinstance(K[i], (Identity, ScaledIdentity, Diagonal)):
                     K_i.decomp = diag_eigendecomp
                 else:
                     K_i.decomp = jnp.linalg.eigh
@@ -251,9 +251,9 @@ class LuasKernel(Kernel):
         # Have different decomposition functions depending on whether previous stored values
         # are to be used to avoid recalculating eigendecompositions
         if use_stored_values:
-            self.decompose = self.eigendecomp_use_stored_values
+            self.decompose = self.decompose_use_stored_values
         else:
-            self.decompose = self.eigendecomp_no_stored_values
+            self.decompose = self.decompose_no_stored_values
 
         # Specify how each of the 4 matrices will be decomposed
         self.Sl_decomp_fn = lambda Sl: decomp_S(Sl, eigen_fn = self.Sl.decomp)
@@ -262,7 +262,7 @@ class LuasKernel(Kernel):
         self.Kt_tilde_decomp_fn = lambda Kt, St_inv_sqrt: decomp_K_tilde(Kt, St_inv_sqrt, eigen_fn = self.Kt.decomp)
 
     
-    def eigendecomp_no_stored_values(
+    def decompose_no_stored_values(
         self,
         X: tuple,
         stored_values: Optional[PyTree] = {},
@@ -340,7 +340,7 @@ class LuasKernel(Kernel):
         return self, stored_values
 
     
-    def eigendecomp_use_stored_values(
+    def decompose_use_stored_values(
         self,
         X: tuple,
         stored_values: Optional[PyTree] = {},
@@ -700,10 +700,10 @@ class LuasKernel(Kernel):
         x_l2, x_t2 = X2[0], X2[1]
 
         # Build 4 component matrices
-        Kl = self.Kl({}, x_l1, x_l2, **kwargs)
-        Kt = self.Kt({}, x_t1, x_t2, **kwargs)
-        Sl = self.Sl({}, x_l1, x_l2, **kwargs)
-        St = self.St({}, x_t1, x_t2, **kwargs)
+        Kl = self.Kl(x_l1, x_l2, **kwargs)
+        Kt = self.Kt(x_t1, x_t2, **kwargs)
+        Sl = self.Sl(x_l1, x_l2, **kwargs)
+        St = self.St(x_t1, x_t2, **kwargs)
         
         K = jnp.kron(Kl, Kt) + jnp.kron(Sl, St)
         
@@ -778,125 +778,125 @@ class LuasKernel(Kernel):
         return kron_prod(Kl, Kt, R) + kron_prod(Sl, St, R)
 
 
-    def predict(
-        self,
-        hp: PyTree,
-        x_l: JAXArray,
-        x_l_pred: JAXArray,
-        x_t: JAXArray,
-        x_t_pred: JAXArray,
-        R: JAXArray,
-        M_s: JAXArray,
-        wn = True,
-        return_std_dev = True,
-    ) -> Tuple[JAXArray, JAXArray]:
-        r"""Performs GP regression and computes the GP predictive mean and the GP predictive
-        uncertainty as the standard devation at each location or else can return the full
-        covariance matrix. Requires the input kernel function ``K`` to have a ``wn`` keyword
-        argument that defines the kernel when white noise is included (``wn = True``) and
-        when white noise isn't included (``wn = False``).
+    # def predict(
+    #     self,
+    #     hp: PyTree,
+    #     x_l: JAXArray,
+    #     x_l_pred: JAXArray,
+    #     x_t: JAXArray,
+    #     x_t_pred: JAXArray,
+    #     R: JAXArray,
+    #     M_s: JAXArray,
+    #     wn = True,
+    #     return_std_dev = True,
+    # ) -> Tuple[JAXArray, JAXArray]:
+    #     r"""Performs GP regression and computes the GP predictive mean and the GP predictive
+    #     uncertainty as the standard devation at each location or else can return the full
+    #     covariance matrix. Requires the input kernel function ``K`` to have a ``wn`` keyword
+    #     argument that defines the kernel when white noise is included (``wn = True``) and
+    #     when white noise isn't included (``wn = False``).
         
-        Currently assumes the same input hyperparameters for both the observed and predicted
-        locations. The predicted locations ``x_l_pred`` and ``x_t_pred`` may deviate from
-        the observed locations ``x_l`` and ``x_t`` however.
+    #     Currently assumes the same input hyperparameters for both the observed and predicted
+    #     locations. The predicted locations ``x_l_pred`` and ``x_t_pred`` may deviate from
+    #     the observed locations ``x_l`` and ``x_t`` however.
         
-        The GP predictive mean is defined as:
+    #     The GP predictive mean is defined as:
         
-        .. math::
+    #     .. math::
 
-            \mathbb{E}[\vec{y}_*] = \vec{\mu}_* + \mathbf{K}_*^T \mathbf{K}^{-1} \vec{r}
+    #         \mathbb{E}[\vec{y}_*] = \vec{\mu}_* + \mathbf{K}_*^T \mathbf{K}^{-1} \vec{r}
             
-        And the GP predictive covariance is given by:
+    #     And the GP predictive covariance is given by:
         
-        .. math::
-            Var[\vec{y}_*] = \mathbf{K}_{**} - \mathbf{K}_*^T \mathbf{K}^{-1} \mathbf{K}_*
+    #     .. math::
+    #         Var[\vec{y}_*] = \mathbf{K}_{**} - \mathbf{K}_*^T \mathbf{K}^{-1} \mathbf{K}_*
         
-        Note:
-            The calculation of the full predictive covariance matrix when ``return_std_dev = False``
-            is still experimental and may come with numerically stability issues. It is also very
-            memory intensive and may cause code to crash. Future updates to luas may improve this.
+    #     Note:
+    #         The calculation of the full predictive covariance matrix when ``return_std_dev = False``
+    #         is still experimental and may come with numerically stability issues. It is also very
+    #         memory intensive and may cause code to crash. Future updates to luas may improve this.
         
-        Args:
-            hp (Pytree): Hyperparameters needed to build the covariance matrices
-                ``Kl``, ``Kt``, ``Sl``, ``St``. Will be unaffected if additional mean function
-                parameters are also included.
-            x_l (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
-                for the observed locations. May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l``
-                different wavelength/vertical regression variables.
-            x_l_pred (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
-                for the prediction locations (which may be the same as the observed locations).
-                May be of shape ``(N_l_pred,)`` or ``(d_l,N_l_pred)`` for ``d_l`` different
-                wavelength/vertical regression variables.
-            x_t (JAXArray): Array containing time/horizontal dimension regression variable(s) for the
-                observed locations. May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different
-                time/horizontal regression variables.
-            x_t_pred (JAXArray): Array containing time/horizontal dimension regression variable(s) for
-                the prediction locations (which may be the same as the observed locations). May be of
-                shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different time/horizontal regression variables.
-            R (JAXArray): Residuals to be fit, equal to the observed data minus the deterministic
-                mean function. Must have the same shape as the observed data ``(N_l, N_t)``.
-            M_s (JAXArray): Mean function evaluated at the locations of the predictions ``x_l_pred``, ``x_t_pred``.
-                Must have shape ``(N_l_pred, N_t_pred)`` where ``N_l_pred`` is the number of wavelength/vertical
-                dimension predictions and ``N_t_pred`` the number of time/horizontal dimension predictions.
-            wn (bool, optional): Whether to include white noise in the uncertainty at the predicted locations.
-                Defaults to True.
-            return_std_dev (bool, optional): If ``True`` will return the standard deviation of uncertainty at the predicted
-                locations. Otherwise will return the full predictive covariance matrix. Defaults to True.
+    #     Args:
+    #         hp (Pytree): Hyperparameters needed to build the covariance matrices
+    #             ``Kl``, ``Kt``, ``Sl``, ``St``. Will be unaffected if additional mean function
+    #             parameters are also included.
+    #         x_l (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
+    #             for the observed locations. May be of shape ``(N_l,)`` or ``(d_l,N_l)`` for ``d_l``
+    #             different wavelength/vertical regression variables.
+    #         x_l_pred (JAXArray): Array containing wavelength/vertical dimension regression variable(s)
+    #             for the prediction locations (which may be the same as the observed locations).
+    #             May be of shape ``(N_l_pred,)`` or ``(d_l,N_l_pred)`` for ``d_l`` different
+    #             wavelength/vertical regression variables.
+    #         x_t (JAXArray): Array containing time/horizontal dimension regression variable(s) for the
+    #             observed locations. May be of shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different
+    #             time/horizontal regression variables.
+    #         x_t_pred (JAXArray): Array containing time/horizontal dimension regression variable(s) for
+    #             the prediction locations (which may be the same as the observed locations). May be of
+    #             shape ``(N_t,)`` or ``(d_t,N_t)`` for ``d_t`` different time/horizontal regression variables.
+    #         R (JAXArray): Residuals to be fit, equal to the observed data minus the deterministic
+    #             mean function. Must have the same shape as the observed data ``(N_l, N_t)``.
+    #         M_s (JAXArray): Mean function evaluated at the locations of the predictions ``x_l_pred``, ``x_t_pred``.
+    #             Must have shape ``(N_l_pred, N_t_pred)`` where ``N_l_pred`` is the number of wavelength/vertical
+    #             dimension predictions and ``N_t_pred`` the number of time/horizontal dimension predictions.
+    #         wn (bool, optional): Whether to include white noise in the uncertainty at the predicted locations.
+    #             Defaults to True.
+    #         return_std_dev (bool, optional): If ``True`` will return the standard deviation of uncertainty at the predicted
+    #             locations. Otherwise will return the full predictive covariance matrix. Defaults to True.
         
-        Returns:
-            (JAXArray, JAXArray): Returns a tuple of two elements, where the first element is
-            the GP predictive mean at the prediction locations, the second element is either the
-            standard deviation of the predictions if ``return_std_dev = True``, otherwise it will be
-            the full covariance matrix of the predicted values.
+    #     Returns:
+    #         (JAXArray, JAXArray): Returns a tuple of two elements, where the first element is
+    #         the GP predictive mean at the prediction locations, the second element is either the
+    #         standard deviation of the predictions if ``return_std_dev = True``, otherwise it will be
+    #         the full covariance matrix of the predicted values.
         
-        """
-        # Calculate the decomposition of K
-        stored_values = self.decomp_fn(hp, x_l, x_t)
+    #     """
+    #     # Calculate the decomposition of K
+    #     stored_values = self.decomp_fn(hp, x_l, x_t)
         
-        # Calculate the covariance between the observed and predicted points
-        Kl_s = self.Kl(hp, x_l, x_l_pred, wn = False)
-        Kt_s = self.Kt(hp, x_t, x_t_pred, wn = False)
-        Sl_s = self.Sl(hp, x_l, x_l_pred, wn = False)
-        St_s = self.St(hp, x_t, x_t_pred, wn = False)
+    #     # Calculate the covariance between the observed and predicted points
+    #     Kl_s = self.Kl(hp, x_l, x_l_pred, wn = False)
+    #     Kt_s = self.Kt(hp, x_t, x_t_pred, wn = False)
+    #     Sl_s = self.Sl(hp, x_l, x_l_pred, wn = False)
+    #     St_s = self.St(hp, x_t, x_t_pred, wn = False)
         
-        # Calculate the covariance between predicted points with other predicted points
-        Kl_ss = self.Kl(hp, x_l_pred, x_l_pred, wn = wn)
-        Kt_ss = self.Kt(hp, x_t_pred, x_t_pred, wn = wn)
-        Sl_ss = self.Sl(hp, x_l_pred, x_l_pred, wn = wn)
-        St_ss = self.St(hp, x_t_pred, x_t_pred, wn = wn)
+    #     # Calculate the covariance between predicted points with other predicted points
+    #     Kl_ss = self.Kl(hp, x_l_pred, x_l_pred, wn = wn)
+    #     Kt_ss = self.Kt(hp, x_t_pred, x_t_pred, wn = wn)
+    #     Sl_ss = self.Sl(hp, x_l_pred, x_l_pred, wn = wn)
+    #     St_ss = self.St(hp, x_t_pred, x_t_pred, wn = wn)
 
-        # Calculate K^-1 R
-        K_inv_R = K_inv_vec(R, stored_values)
+    #     # Calculate K^-1 R
+    #     K_inv_R = K_inv_vec(R, stored_values)
 
-        # Calculates the GP mean including the deterministic mean function at the prediction locations
-        gp_mean = M_s + kron_prod(Kl_s.T, Kt_s.T, K_inv_R) + kron_prod(Sl_s.T, St_s.T, K_inv_R)
+    #     # Calculates the GP mean including the deterministic mean function at the prediction locations
+    #     gp_mean = M_s + kron_prod(Kl_s.T, Kt_s.T, K_inv_R) + kron_prod(Sl_s.T, St_s.T, K_inv_R)
 
-        # Prepare matrices for calculating the predictive covariance
-        KW_l = Kl_s.T @ stored_values["W_l"]
-        KW_t = Kt_s.T @ stored_values["W_t"]
-        SW_l = Sl_s.T @ stored_values["W_l"]
-        SW_t = St_s.T @ stored_values["W_t"]
+    #     # Prepare matrices for calculating the predictive covariance
+    #     KW_l = Kl_s.T @ stored_values["W_l"]
+    #     KW_t = Kt_s.T @ stored_values["W_t"]
+    #     SW_l = Sl_s.T @ stored_values["W_l"]
+    #     SW_t = St_s.T @ stored_values["W_t"]
 
-        if return_std_dev:
-            # Efficiently solves for the diagonal of the predictive covariance
-            pred_err = jnp.outer(jnp.diag(Kl_ss), jnp.diag(Kt_ss))
-            pred_err += jnp.outer(jnp.diag(Sl_ss), jnp.diag(St_ss))
+    #     if return_std_dev:
+    #         # Efficiently solves for the diagonal of the predictive covariance
+    #         pred_err = jnp.outer(jnp.diag(Kl_ss), jnp.diag(Kt_ss))
+    #         pred_err += jnp.outer(jnp.diag(Sl_ss), jnp.diag(St_ss))
 
-            # K_s.T K^-1 K_s term can be broken into these three terms
-            pred_err -= kron_prod(KW_l**2, KW_t**2, stored_values["D_inv"])
-            pred_err -= kron_prod(SW_l**2, SW_t**2, stored_values["D_inv"])
-            pred_err -= 2*kron_prod(KW_l * SW_l, KW_t * SW_t, stored_values["D_inv"])
+    #         # K_s.T K^-1 K_s term can be broken into these three terms
+    #         pred_err -= kron_prod(KW_l**2, KW_t**2, stored_values["D_inv"])
+    #         pred_err -= kron_prod(SW_l**2, SW_t**2, stored_values["D_inv"])
+    #         pred_err -= 2*kron_prod(KW_l * SW_l, KW_t * SW_t, stored_values["D_inv"])
             
-            # Take the sqrt of the diagonal to get the std dev
-            pred_err = jnp.sqrt(pred_err)
+    #         # Take the sqrt of the diagonal to get the std dev
+    #         pred_err = jnp.sqrt(pred_err)
             
-        else:
-            # Note very memory intensive!
-            K_W = jnp.kron(KW_l, KW_t) + jnp.kron(SW_l, SW_t)
-            pred_err = -K_W @ jnp.diag(stored_values["D_inv"].ravel()) @ K_W.T
+    #     else:
+    #         # Note very memory intensive!
+    #         K_W = jnp.kron(KW_l, KW_t) + jnp.kron(SW_l, SW_t)
+    #         pred_err = -K_W @ jnp.diag(stored_values["D_inv"].ravel()) @ K_W.T
             
-            # Add the K_ss term
-            pred_err += jnp.kron(Kl_ss, Kt_ss) + jnp.kron(Sl_ss, St_ss)
+    #         # Add the K_ss term
+    #         pred_err += jnp.kron(Kl_ss, Kt_ss) + jnp.kron(Sl_ss, St_ss)
         
-        return gp_mean, pred_err
+    #     return gp_mean, pred_err
     

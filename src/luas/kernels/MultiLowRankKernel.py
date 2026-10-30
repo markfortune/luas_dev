@@ -190,10 +190,16 @@ class MultiLowRankKernel(CovType):
 
         self.orthogonalise = orthogonalise
 
+        if orthogonalise:
+            print("Will orthogonalise components, not this will ignore any non-orthogonal component of the whitened alpha vectors!")
+
         if not QR_transform and orthogonalise:
             raise Exception("Orthogonalisation requires a QR transformation! Either set QR_transform = False or orthogonalise = False")
-        self.logL_hessianable = self.logL
-        self.decompose = self.decomp_no_stored_values
+
+        if use_stored_values:
+            raise NotImplementedError("Use of pre-calculated stored values not yet implemented.")
+        else:
+            self.decompose = self.decompose_no_stored_values
 
 
     def _rotate_to_fast_dim_wrapper(self, fn, fast_dim):
@@ -214,7 +220,7 @@ class MultiLowRankKernel(CovType):
         return wrapped_fn
     
 
-    def decomp_no_stored_values(
+    def decompose_no_stored_values(
         self,
         X: Tuple[JAXArray],
         stored_values: Optional[PyTree] = None,

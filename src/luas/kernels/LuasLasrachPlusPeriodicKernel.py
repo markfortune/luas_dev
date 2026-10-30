@@ -41,12 +41,14 @@ class LuasLasrachPlusPeriodicKernel(CovType):
         # Have different decomposition functions depending on whether previous stored values
         # are to be used to avoid recalculating eigendecompositions
         if use_stored_values:
-            raise Exception("Use of precalculated stored values not yet implemented")
+            raise NotImplementedError("Use of pre-calculated stored values not yet implemented.")
+        else:
+            self.decompose = self.decompose_no_stored_values
         
         assert period is not None
     
 
-    def decompose(
+    def decompose_no_stored_values(
         self,
         X: Tuple,
         stored_values: Optional[PyTree] = None,

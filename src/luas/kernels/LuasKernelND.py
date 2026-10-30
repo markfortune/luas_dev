@@ -55,10 +55,10 @@ class LuasKernelND(CovType):
            
         # Have different decomposition functions depending on whether previous stored values
         # are to be used to avoid recalculating eigendecompositions
-        if use_stored_values == True:
-            raise Exception("Use of stored_values not yet implemented in this version of luas")
+        if use_stored_values:
+            raise NotImplementedError("Use of pre-calculated stored values not yet implemented.")
         else:
-            self.decompose = self.eigendecomp_no_stored_values
+            self.decompose = self.decompose_no_stored_values
     
     def evaluate(self, X, **kwargs):
 
@@ -76,7 +76,7 @@ class LuasKernelND(CovType):
         
         return Sigma
     
-    def eigendecomp_no_stored_values(
+    def decompose_no_stored_values(
         self,
         X: Tuple,
         stored_values: Optional[PyTree] = {},

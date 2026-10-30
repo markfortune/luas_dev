@@ -23,11 +23,12 @@ class BlockKernel(CovType):
         self.opt_name = "Block diagonal covariance matrix"
         
         if use_pmap:
-            print("pmap size", self.non_block_dim_size)
-            self.parallel_kwargs = {"devices":jax.devices()[:self.non_block_dim_size], "static_broadcasted_argnums":(2,)}
+            self.parallel_kwargs = {"devices":jax.devices()[:self.non_block_dim_size], "static_broadcasted_argnums":(3,)}
+            self.parallel_decompose_kwargs = {"devices":jax.devices()[:self.non_block_dim_size]}
             self.parallel_method = jax.pmap
         else:
             self.parallel_kwargs = {}
+            self.parallel_decompose_kwargs = {}
             self.parallel_method = jax.vmap
 
 
@@ -75,63 +76,47 @@ class BlockKernel(CovType):
             diag_term_i = self.K_list[i][1-self.block_dim].diag + self.K_list[i][1-self.block_dim].wn_diag
             self.lam_arr = self.lam_arr.at[:, i+1].set(diag_term_i)
 
-        def matrix_inv_sqrt_calc(r, lam_arr, transpose):
-
+        def build_block(lam_arr):
             kf_block = lam_arr[0] * self.block_kernels[0]
             for i in range(1, len(self.block_kernels)):
                 kf_block += lam_arr[i] * self.block_kernels[i]
+            return kf_block
 
+        def block_decompose(lam_arr):
+            kf_block = build_block(lam_arr)
             kf_block, stored_values = kf_block.decompose(X[self.block_dim], idx = idx[self.block_dim])
-            return kf_block.matrix_inv_sqrt(r, transpose = transpose), stored_values["logdet"]
+            return kf_block.factor, stored_values["logdet"]
+
+        block_decompose_vmap = self.parallel_method(block_decompose, in_axes = 0, out_axes = (0, 0), **self.parallel_decompose_kwargs)
+        self.factor, logdet_arr = block_decompose_vmap(self.lam_arr)
+        self.logdet = logdet_arr.sum()
+
+        def matrix_inv_sqrt_calc(r, lam_arr, factor, transpose):
+            kf_block = build_block(lam_arr)
+            kf_block.factor = factor
+            return kf_block.matrix_inv_sqrt(r, transpose = transpose)
+
+        def matrix_sqrt_calc(r, lam_arr, factor, transpose):
+            kf_block = build_block(lam_arr)
+            kf_block.factor = factor
+            return kf_block.matrix_sqrt(r, transpose = transpose)
+
+        self.matrix_inv_sqrt_calc_vmap = self.parallel_method(matrix_inv_sqrt_calc, in_axes = (1-self.block_dim, 0, 0, None),
+                                                          out_axes = 1-self.block_dim, **self.parallel_kwargs)
+        self.matrix_sqrt_calc_vmap = self.parallel_method(matrix_sqrt_calc, in_axes = (1-self.block_dim, 0, 0, None),
+                                                out_axes = 1-self.block_dim, **self.parallel_kwargs)
         
-        def matrix_sqrt_calc(r, lam_arr, transpose):
-
-            kf_block = lam_arr[0] * self.block_kernels[0]
-            for i in range(1, len(self.block_kernels)):
-                kf_block += lam_arr[i] * self.block_kernels[i]
-
-            kf_block, stored_values = kf_block.decompose(X[self.block_dim], idx = idx[self.block_dim])
-            return kf_block.matrix_sqrt(r, transpose = transpose), stored_values["logdet"]
-        
-        def logL_calc(r, lam_arr):
-            kf_block = lam_arr[0] * self.block_kernels[0]
-            for i in range(1, len(self.block_kernels)):
-                kf_block += lam_arr[i] * self.block_kernels[i]
-
-            kf_block, _ = kf_block.decompose(X[self.block_dim], idx = idx[self.block_dim])
-            return kf_block.logL(r)
-        
-        def logdet_calc(lam_arr):
-            kf_block =  lam_arr[0] * self.block_kernels[0]
-            for i in range(1, len(self.block_kernels)):
-                kf_block += lam_arr[i] * self.block_kernels[i]
-
-            kf_block, stored_values = kf_block.decompose(X[self.block_dim], idx = idx[self.block_dim])
-            return stored_values["logdet"]
-
-
-        self.matrix_inv_sqrt_calc_vmap = self.parallel_method(matrix_inv_sqrt_calc, in_axes = (1-self.block_dim, 0, None),
-                                                  out_axes = (1-self.block_dim, 0), **self.parallel_kwargs)
-        self.matrix_sqrt_calc_vmap = self.parallel_method(matrix_sqrt_calc, in_axes = (1-self.block_dim, 0, None),
-                                              out_axes = (1-self.block_dim, 0), **self.parallel_kwargs)
-
-        self.logL_vmap = self.parallel_method(logL_calc, in_axes = (1-self.block_dim, 0), **self.parallel_kwargs)
-
-        self.logL_vmap = self.parallel_method(logdet_calc, in_axes = (0), **self.parallel_kwargs)
-        
-        self.logdet = self.logL_vmap(self.lam_arr).sum()
 
         return self, {"logdet":self.logdet}
 
     def matrix_sqrt(self, R, transpose = 0):
-        R_prime, logdet_arr = self.matrix_sqrt_calc_vmap(R, self.lam_arr, transpose)
+        R_prime = self.matrix_sqrt_calc_vmap(R, self.lam_arr, self.factor, transpose)
 
         return R_prime
     
     def matrix_inv_sqrt(self, R, transpose = 0):
-        R_prime, logdet_arr = self.matrix_inv_sqrt_calc_vmap(R, self.lam_arr, transpose)
+        R_prime = self.matrix_inv_sqrt_calc_vmap(R, self.lam_arr, self.factor, transpose)
 
-        # self.logdet = logdet_arr.sum()
         return R_prime
     
     def scale(self, c):
@@ -232,8 +217,6 @@ class DifferentBlocksKernel(CovType):
         return R_prime
 
     
-
-    
     def scale(self, c):
         raise Exception("Not implemented")
 
@@ -245,6 +228,7 @@ class DifferentBlocksKernel(CovType):
     #         R_prime += tensor_mult(self.K_list[i], X1, X2, R, **kwargs)
         
     #     return R_prime
+
 
 class Block2x2Kernel(CovType):
     def __init__(self, kf_A, kf_B = None, kf_D_CAB = None, kf_D = None, A_full = True, D_full = True,

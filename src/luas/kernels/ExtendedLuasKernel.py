@@ -127,20 +127,24 @@ class ExtendedLuasKernel(CovType):
         self,
         Sigma,
         *K_list,
-        use_stored_values: Optional[bool] = True,
+        use_stored_values: Optional[bool] = False,
         **kwargs,
     ):
         
         self.Sigma = Sigma[0], Sigma[1]
         self.K_list = K_list
         self.opt_name = "ExtendedLuasKernel"
-
-        self.logL_hessianable = self.logL
-        self.decompose = self.decomp_no_stored_values
+        
+        # Have different decomposition functions depending on whether previous stored values
+        # are to be used to avoid recalculating eigendecompositions
+        if use_stored_values:
+            raise NotImplementedError("Use of pre-calculated stored values not yet implemented.")
+        else:
+            self.decompose = self.decompose_no_stored_values
     
     
 
-    def decomp_no_stored_values(
+    def decompose_no_stored_values(
         self,
         X: Tuple[JAXArray],
         stored_values: Optional[PyTree] = {},

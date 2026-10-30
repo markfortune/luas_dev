@@ -71,6 +71,88 @@ class HouseholderProduct:
         return cls(*children)
 
 
+@tree_util.register_pytree_node_class
+class HouseholderandDiagonalTransform:
+    """Represents H @ D where H = I - 2 * vec @ vec^T is a Householder matrix     
+    """
+    def __init__(self, vec, diag, i = -1, transpose = 0):
+        self.vec = vec
+        self.diag = diag
+        self.T = self
+        self.transpose = transpose
+        basis_vec = jnp.zeros_like(vec)
+        basis_vec = basis_vec.at[i].set(1)
+
+        norm_alpha = jnp.linalg.norm(self.vec)
+
+        alpha_normalised = self.vec/norm_alpha
+        u = alpha_normalised - basis_vec
+        self.u_hat = u/jnp.linalg.norm(u)
+        self.lam = norm_alpha**2 * basis_vec
+
+
+    def __matmul__(self, other):
+        if other.ndim == 1:
+            if self.transpose:
+                other_prime = other - 2 * jnp.kron(self.u_hat, self.u_hat @ other)
+                other_prime = self.diag * other_prime
+            else:
+                other_prime = self.diag * other
+                other_prime -= 2 * jnp.kron(self.u_hat, self.u_hat @ other_prime)
+        elif other.ndim == 2:
+            if self.transpose:
+                other_prime = other - 2 * jnp.outer(self.u_hat, self.u_hat @ other)
+                other_prime = jnp.einsum('i,i...->i...', self.diag, other)
+            else:
+                other_prime = jnp.einsum('i,i...->i...', self.diag, other)
+                other_prime -= 2 * jnp.outer(self.u_hat, self.u_hat @ other_prime)
+        elif other.ndim > 2:
+            return vmap_for_tensors(self.__matmul__)(other)
+        else:
+            raise Exception("Not implemented")
+        
+        return other_prime
+
+    def __rmatmul__(self, other):
+        if other.ndim == 1:
+            return other - 2 * jnp.kron(other @ self.u_hat, self.u_hat)
+        elif other.ndim == 2:
+            return other - 2 * jnp.outer(other @ self.u_hat, self.u_hat @ other)
+        else:
+            raise Exception("Not implemented")
+
+    def __repr__(self):
+        dense_mat = self.to_dense()
+        return f"HouseholderandDiagonalTransform({dense_mat})"
+
+    def solve(self, R):
+        inv_mat = HouseholderandDiagonalTransform(vec = self.vec, diag = 1/self.diag, transpose = 1-self.transpose)
+        return inv_mat @ R
+    
+    @property
+    def T(self):
+        return HouseholderandDiagonalTransform(vec = self.vec, diag = self.diag, transpose = 1-self.transpose)
+
+    def to_dense(self):
+        H_mat = jnp.eye(self.u_hat.size) - 2 * jnp.outer(self.u_hat, self.u_hat)
+        D = jnp.diag(self.diag)
+
+        if self.transpose:
+            self.dense = D @ H_mat
+        else:
+            self.dense = H_mat @ D
+
+        return self.dense
+        
+    # Required for JAX
+    def tree_flatten(self):
+        return (self.__repr__(),), None
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(*children)
+
+
 
 @tree_util.register_pytree_node_class
 class HouseholderTransform:

@@ -12,6 +12,7 @@ If you would like to see a sample analysis using `luas` then there is an example
 :maxdepth: 1
 
 tutorials/Simple_1D_example
-tutorials/PyMC Example
+tutorials/joint_transit_spec_example_pymc
+tutorials/Walking_through_luas_optimisations
 tutorials/2D_GP_intro
 ```
