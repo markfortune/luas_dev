@@ -24,16 +24,10 @@ class MixingMatGeneral(CovType):
         self.opt_name = "MixingMatGeneral"
     
     def _flatten_R(self, R):
-        if False: #self.fast_dim == 0:
-            return R.ravel("C")
-        else:
-            return R.ravel("F")
+        return R.ravel("F")
 
     def _reshape_R(self, r, R_shape):
-        if False: #self.fast_dim == 0:
-            return r.reshape(R_shape, order='C')
-        else:
-            return r.reshape(R_shape, order='F')
+        return r.reshape(R_shape, order='F')
 
     def evaluate(self, X1, X2, row_idx = None, col_idx = None, full = False, wn = True, flip_kron = True, calc_diag = True):
 
@@ -96,7 +90,6 @@ class MixingMatGeneral(CovType):
                     K_eval += self.noise_model.to_dense()
                 else:
                     K_eval += self.noise_model
-                # raise Exception("Not Implemented!")
 
             for i in range(self.rank):
                 K_i_eval = self.kernel_list[i](X1[self.fast_dim], X2[self.fast_dim], full = False,

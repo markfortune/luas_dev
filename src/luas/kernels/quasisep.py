@@ -16,18 +16,18 @@ __all__ = [
     "Exp",
     "Matern32",
     "Matern52",
-    "Matern",
-    "Outer",
+    "MaternHalfInt",
     "Constant",
     "SHO",
     "Cosine",
     "KroneckerDelta",
     "Noise",
+    "SquaredExpApprox",
+    "ExpSineSquaredApprox",
+    "QuasiperiodicApprox",
 ]
 
 from luas.kernels.diagonal import KroneckerDelta, Noise
-
-
 
 def CustomTinygp(kf_tinygp: Callable, params = None) -> JAXArray:
     r"""Wrap a tinygp-compatible kernel in a quasisep covariance object.
@@ -78,7 +78,7 @@ def Linear(alpha: JAXArray, sigma: Scalar = 1., use_block: bool = True, const: N
         tinygp_kf = luas.kernels.tinygp_ext.Linear(alpha = sigma * alpha, const = const)
         return covtype.GeneralQuasisepPlusNoise(tinygp_kf, use_block = use_block)
     else:
-        return covtype.Outer(alpha)
+        return covtype.Outer(alpha * sigma)
 
 
 def Banded(diag: JAXArray, off_diags: JAXArray, use_block: bool = True) -> covtype.CovType:
@@ -210,7 +210,6 @@ def Cosine(scale: Scalar, sigma: Scalar = 1.) -> JAXArray:
     """
 
     return covtype.PeriodicQuasisep(HandleIdx(tinygp.kernels.quasisep.Cosine(scale = scale, sigma = sigma)))
-
 
 
 def ExpSineSquaredApprox(

@@ -159,7 +159,9 @@ class ExtendedLuasKernel(CovType):
         self.N_beta = beta_mat.shape[1]
 
         # Required for this optimisation to work
-        assert 0 < self.N_alpha < self.N_l and 0 < self.N_beta < self.N_t 
+        kernel_valid = 0 < self.N_alpha < self.N_l and 0 < self.N_beta < self.N_t
+        if not kernel_valid:
+            raise Exception("ExtendedLuasKernel requires 0 < N_alpha < N_l and 0 < N_beta < N_t for a dataset of shape (N_l, N_t).")
 
         ######### Do transforms in both dims #########
         # Decompose slow Sigma mat and add its contribution to the log determinant
@@ -411,16 +413,6 @@ class ExtendedLuasKernel(CovType):
 
         return C_A_inv_B + C_A_inv_B2
     
-
-    def _calc_C_A_inv_B_unopt(self, kf_A, X):
-        B_mat_dense = self.kf_B_eval(X, X)
-        L_A_inv_B = jnp.zeros_like(B_mat_dense)
-        for i in range(B_mat_dense.shape[1]):
-            B_vec = B_mat_dense[:, i].reshape((self.N_l - self.N_alpha, self.N_t))
-            L_A_inv_B = L_A_inv_B.at[:, i].set(kf_A.matrix_inv_sqrt(B_vec).ravel())
-        C_A_inv_B = L_A_inv_B.T @ L_A_inv_B
-
-        return C_A_inv_B
     
     def kf_B_eval(self, X1, X2):
         K_B = jnp.kron(self.K_transf0_B, self.K_transf[1].evaluate(X1[1], X2[1])) 

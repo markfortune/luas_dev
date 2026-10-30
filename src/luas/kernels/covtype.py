@@ -1066,7 +1066,7 @@ class Outer(CovType):
 
     def matrix_inv_sqrt(self, R, **kwargs):
 
-        return Exception("Outer product matrix is not invertible!")
+        raise Exception("Outer product matrix is not invertible!")
     
     def inv_sqrt_transform(self, K, x, **kwargs):
 
@@ -1157,7 +1157,7 @@ class Outer(CovType):
                                             use_block = K.use_block, noise_model = new_noise_model)
         
         elif isinstance(K, (Identity, ScaledIdentity, Diagonal)):
-            K_mul = type(K)(diag = K.diag * self.alpha_init**2, wn_diag = K.wn_diag * self.alpha_init**2)
+            K_mul = Diagonal(diag = K.diag * self.alpha_init**2, wn_diag = K.wn_diag * self.alpha_init**2)
         
         elif isinstance(K, Outer):
             K_mul = Outer(alpha = self.alpha_init * K.alpha_init)

@@ -194,31 +194,13 @@ class MultiLowRankKernel(CovType):
             print("Will orthogonalise components, not this will ignore any non-orthogonal component of the whitened alpha vectors!")
 
         if not QR_transform and orthogonalise:
-            raise Exception("Orthogonalisation requires a QR transformation! Either set QR_transform = False or orthogonalise = False")
+            raise Exception("Orthogonalisation requires a QR transformation! Either set QR_transform = True or orthogonalise = False")
 
         if use_stored_values:
             raise NotImplementedError("Use of pre-calculated stored values not yet implemented.")
         else:
             self.decompose = self.decompose_no_stored_values
 
-
-    def _rotate_to_fast_dim_wrapper(self, fn, fast_dim):
-
-        def wrapped_fn(R, **kwargs):
-            if fast_dim == 0:
-                R_prime = R.T
-            else:
-                R_prime = R.copy()
-
-            R_prime = fn(R_prime, **kwargs)
-
-            if self.fast_dim == 0:
-                R_prime = R_prime.T
-                
-            return R_prime
-
-        return wrapped_fn
-    
 
     def decompose_no_stored_values(
         self,
@@ -236,11 +218,12 @@ class MultiLowRankKernel(CovType):
         non_cel_vec = X[1-self.fast_dim]
         cel_vec = X[self.fast_dim]
 
-        # Generate transformations
+        # Generate transformations to handle whitening for measurement covariance/noise
         self.Sigma_transf, stored_values_Sigma_transf = self.Sigma[1-self.fast_dim].decompose(non_cel_vec, full = True)
 
-        # Computes the log determinant of K
+        # Adds the log determinant of K_transf term in the transformed log-likelihood
         stored_values["logdet"] = cel_vec.shape[-1]*stored_values_Sigma_transf["logdet"]
+
         
         stored_values["non_cel_rank"] = 0
         for K_i in self.K_list:
@@ -291,50 +274,58 @@ class MultiLowRankKernel(CovType):
         if self.reduce_dim:
             stored_values["J"], U, self.householder_transform = orthonormal_nullspace_gen(stored_values["J"])
         
-        # Handle Sigma mat in the fast_dim, likely just diagonal
         if not isinstance(self.Sigma[self.fast_dim], (Identity, ScaledIdentity, Diagonal)):
-            add_basis = jnp.eye(stored_values["non_cel_rank"])
+            # If Sigma is a dense matrix append to A block as e_i e_i^t \otimes Sigma_t terms
+            add_basis = jnp.eye(stored_values["J"].shape[0])
             stored_values["J"] = jnp.concatenate([stored_values["J"], add_basis], axis = 1)
 
-            for j in range(stored_values["non_cel_rank"]):
+            for j in range(stored_values["J"].shape[0]):
                 cel_kernel_order.append(self.Sigma[self.fast_dim])
 
-            if hasattr(self.Sigma[self.fast_dim], "noise_model") and self.Sigma[self.fast_dim].noise_model is not None:
-                assert self.use_quasi == False # Not implemented otherwise
-            
             if self.use_quasi:
                 cel_diag = (self.Sigma[self.fast_dim].diag + self.Sigma[self.fast_dim].wn_diag)*jnp.ones(cel_vec.shape[-1])
             else:
-                cel_diag = 0.*jnp.ones(cel_vec.shape[-1])
-            
+                cel_diag = jnp.zeros(cel_vec.shape[-1])
         else:
+            # If Sigma_t is diagonal then we just add an overall diagonal to the A block
             cel_diag = (self.Sigma[self.fast_dim].diag + self.Sigma[self.fast_dim].wn_diag)*jnp.ones(cel_vec.shape[-1])
 
+        
         if self.reduce_dim:
+            # Create the full diagonal for the A block
             total_cel_diag = jnp.kron(cel_diag, jnp.ones(stored_values["non_cel_rank"]))
         else:
+            # Create the full diagonal of the full kf_tilde
             total_cel_diag = jnp.kron(cel_diag, jnp.ones(non_cel_vec.shape[-1]))
 
-        # print(stored_values["J"], jnp.diag(jnp.diag(stored_values["J"])))
         
         if self.orthogonalise:
             if self.fast_dim:
                 D_mat = total_cel_diag.reshape((stored_values["non_cel_rank"], -1), order = "C")
             else:
                 D_mat = total_cel_diag.reshape((stored_values["non_cel_rank"], -1), order = "F")
-            # print(D_mat, jnp.diag(stored_values["J"]), cel_kernel_order)
-            kf_quasi2D = DifferentBlocksKernel(D_mat, jnp.diag(stored_values["J"])**2, cel_kernel_order, block_dim = self.fast_dim)
+
+            # Different blocks kernel handles a block diagonal covariance matrix where kernel objects can have different types
+            kf_mixingmat = DifferentBlocksKernel(D_mat, jnp.diag(stored_values["J"])**2, cel_kernel_order, block_dim = self.fast_dim)
+
         elif self.use_quasi:
-            # kf_quasi2D = MixingMatQuasisep(mixing_mat = jnp.diag(jnp.diag(stored_values["J"])), kernel_list = cel_kernel_order,
-            #                                 diag = total_cel_diag, fast_dim = self.fast_dim)
-            kf_quasi2D = MixingMatQuasisep(mixing_mat = stored_values["J"], kernel_list = cel_kernel_order,
+            # MixingMatQuasisep basically just implements the Gordon et al. (2020) method in tinygp
+            # But we may have reduced the dimensionality if self.reduce_dim is true
+            kf_mixingmat = MixingMatQuasisep(mixing_mat = stored_values["J"], kernel_list = cel_kernel_order,
                                             diag = total_cel_diag, fast_dim = self.fast_dim)
         else:
-            kf_quasi2D = MixingMatGeneral(mixing_mat = stored_values["J"], kernel_list = cel_kernel_order,
+            # Just decompose the full covariance using general Cholesky decomposition
+            # Useful if having reduced dimensionality with Householder QR when kernel is not quasiseparable
+            kf_mixingmat = MixingMatGeneral(mixing_mat = stored_values["J"], kernel_list = cel_kernel_order,
                                             diag = total_cel_diag, fast_dim = self.fast_dim)
 
         if self.reduce_dim:
+            # Create a 2x2 block matrix where our kf_mixingmat is just the A block
+            # B and C blocks are zero
+
+            # Must create the D block
             if isinstance(self.Sigma[self.fast_dim], (Identity, ScaledIdentity, Diagonal)):
+                # Case where D block is fully diagonal
                 null_space_rank = non_cel_vec.shape[-1] - stored_values["non_cel_rank"]
                 if self.fast_dim == 0:
                     rest_cel_diag = jnp.outer(cel_diag, jnp.ones(null_space_rank))
@@ -343,16 +334,18 @@ class MultiLowRankKernel(CovType):
                     
                 kf_D = WhiteNoiseKernel(diag = rest_cel_diag)
             else:
+                # Case where D block is a single Kronecker product handled by the SeparableKernel
                 if self.fast_dim == 0:
                     kf_D = SeparableKernel(self.Sigma[self.fast_dim], Identity())
                 else:
                     kf_D = SeparableKernel(Identity(), self.Sigma[self.fast_dim])
 
-            self.kf_tilde = Block2x2Kernel(kf_A = kf_quasi2D, kf_D_CAB = kf_D,
+            self.kf_tilde = Block2x2Kernel(kf_A = kf_mixingmat, kf_D_CAB = kf_D,
                                            dim_split = 1-self.fast_dim, A_full = True, D_full = True,
                                            split_loc = stored_values["non_cel_rank"])
         else:
-            self.kf_tilde = kf_quasi2D
+            # No need for 2x2 block matrix if we aren't reducing the dimension with Householder QR
+            self.kf_tilde = kf_mixingmat
         
         self.kf_tilde, stored_values["kf_tilde_stored"] = self.kf_tilde.decompose(X, full = True)
         stored_values["logdet"] += stored_values["kf_tilde_stored"]["logdet"]

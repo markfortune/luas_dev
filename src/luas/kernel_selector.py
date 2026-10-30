@@ -55,7 +55,7 @@ def kernel_selector(
             else:
                 build_kf = lambda p, X: use_kernel(kf(p, X), **kernel_kwargs)
 
-        elif isinstance(use_kernel, GeneralKernel) and dim == 1:
+        elif use_kernel == GeneralKernel and dim == 1:
             def general_kf(hp, X, **kwargs):
                 cov_form = kf(hp, X)
                 return covtype.General(lambda p, X, **kwargs: cov_form.evaluate(X, **kwargs), **kernel_kwargs)
@@ -184,13 +184,10 @@ def fastest_opt_2D(dense_kron, N_alpha, N_beta, data_shape,
     else:
         longest_dim = 1
 
-    print_str = ""
-
     kernel_kwargs = {}
     if dense_kron:
         if N_alpha > 0 and N_beta > 0:
             use_kernel = ExtendedLuasKernel
-            print_str += "One Kronecker term detected, using method from Saatchi (2011)\n"
         
         elif N_alpha == 0 and N_beta == 0:
             if longest_fast_dim is None:

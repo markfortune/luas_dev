@@ -13,26 +13,8 @@ from multiprocessing import shared_memory
 
 from luas.kernels.diagonal import KroneckerDelta, Noise
 
-def _eigsh_worker(shm_name, shape, dtype, k):
-    from scipy.sparse.linalg import eigsh
-    import numpy as np
-    from multiprocessing import shared_memory
-    
-    # Attach to shared memory — no copy
-    shm = shared_memory.SharedMemory(name=shm_name)
-    A_np = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
-    
-    vals, vecs = eigsh(A_np, k=k)
-    result = (vals.astype(dtype), vecs.astype(dtype))
-    shm.close()
-    return result
 
-
-_pool = ProcessPoolExecutor(max_workers=1)
-class LowRank(CovType):
-    # This function has the most cursed behaviour I've seen, but it seems to run fast up to around N ~ 1000 - 1500
-    # But somewhere above 1500 it only seems to be able to run once and then hangs afterwards
-    # Probably something to do with multithreading from scipy playing badly with JIT-compilation I have no idea
+class LowRank(General):
     def __init__(self, kf, hp = {}, V = None, rank = None, params = None, use_shared_memory = True):
         self.kf = kf
         self.hp = hp
@@ -41,9 +23,11 @@ class LowRank(CovType):
         self.use_shared_memory = use_shared_memory
         self.V = V
 
-        assert rank is not None
+        if rank is None:
+            raise Exception("Must specify rank of LowRank term")
 
-    def eigendecomp(self, x, wn = True, full = True, **kwargs):
+
+    def eigendecomp(self, x, wn = True, full = True, idx = None, **kwargs):
         if self.V is not None:
             lam = jnp.concatenate([jnp.zeros(x.shape[-1] - self.fixed_rank), (self.V**2).sum(0)])
 
@@ -57,47 +41,10 @@ class LowRank(CovType):
                                 row_idx = idx, col_idx = idx, **kwargs)
             else:
                 K = self.evaluate(x, x, wn = wn, full = True, **kwargs)
+
+            # ideally there should be a faster way to do this than calculating a full eigen
             return stable_eigh(K)
     
-    def eigendecomp_scipy(self, x, wn = True, **kwargs):
-
-        K = self.evaluate(x, x, full = True, wn = True)
-
-        result_shape = (jax.ShapeDtypeStruct((self.fixed_rank,), K.dtype), jax.ShapeDtypeStruct((K.shape[0], self.fixed_rank), K.dtype))
-
-        if self.use_shared_memory:
-            lam_sparse, Q_sparse = jax.pure_callback(self.sparse_eigh_shared_mem, result_shape, K, self.fixed_rank)
-        else:
-            lam_sparse, Q_sparse = jax.pure_callback(self.sparse_eigh, result_shape, K, self.fixed_rank)
-
-        Q = HouseholderProduct(Q_sparse)
-        lam = jnp.concatenate([jnp.zeros(x.shape[-1] - self.fixed_rank), lam_sparse])
-        
-        return lam, Q
-    
-    def sparse_eigh(self, K, rank):
-        K_np = np.asarray(K)
-        lam, Q = _pool.submit(scipy.sparse.linalg.eigsh, K_np, k=rank).result()
-        return lam, Q
-
-
-    def sparse_eigh_shared_mem(self, K, rank):
-        K_np = np.asarray(K)
-    
-        # Write matrix into shared memory
-        shm = shared_memory.SharedMemory(create=True, size=K_np.nbytes)
-        shared_A = np.ndarray(K_np.shape, dtype=K_np.dtype, buffer=shm.buf)
-        shared_A[:] = K_np
-        
-        try:
-            lam, Q = _pool.submit(
-                _eigsh_worker, shm.name, K_np.shape, K_np.dtype, rank
-            ).result()
-        finally:
-            shm.close()
-            shm.unlink()
-        
-        return lam, Q
 
     def rank(self, x):
         return self.fixed_rank
@@ -138,31 +85,6 @@ class LowRank(CovType):
     
     def matmul(self, x1, x2, R, **kwargs):
         return self.evaluate(x1, x2, **kwargs) @ R
-
-    # def decompose(self, x, full = True, **kwargs):
-    #     # By default returns the lower triangular Cholesky factor
-    #     # i.e. K = L @ L.T
-    #     # Matches with tinygp default but not scipy or jax.scipy default
-        
-    #     K = self.evaluate(x, x, full = full, **kwargs)
-        
-    #     self.factor = JLA.cholesky(K, lower=True)
-    #     self.logdet = 2*jnp.log(jnp.diag(self.factor)).sum()
-        
-    #     return self, {"logdet":self.logdet, "factor":self.factor, "hp":self.hp}
-
-    # def matrix_inv_sqrt(self, R, transpose=0, **kwargs):
-
-    #     R_prime = jax.scipy.linalg.solve_triangular(self.factor, R, trans=transpose, lower=True)
-
-    #     return R_prime
-    
-    # def matrix_sqrt(self, R, transpose=0, **kwargs):
-
-    #     if transpose:
-    #         return self.factor.transpose() @ R
-    #     else:
-    #         return self.factor @ R
 
 
     def __mul__(self, other) -> Kernel:

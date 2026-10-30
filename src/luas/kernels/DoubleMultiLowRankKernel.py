@@ -9,7 +9,7 @@ from luas import WhiteNoiseKernel
 from luas.kernels.covtype import Outer, Exp, GeneralQuasisep, CovType, Identity, ScaledIdentity, Diagonal
 from luas.luas_types import Kernel, PyTree, JAXArray, Scalar, is_scalar
 from luas.kronecker_fns import kron_prod, tensor_mult
-from luas.kernels.tinygp_ext import ScaledKernel, LowRankProduct
+from luas.kernels.tinygp_ext import LowRankProduct
 from luas.kernels.BlockKernel import Block2x2Kernel
 from luas.kernels.MixingMatQuasisep import MixingMatQuasisep
 from luas.kernels.MixingMatGeneral import MixingMatGeneral
@@ -145,8 +145,6 @@ class DoubleMultiLowRankKernel(CovType):
         self,
         Sigma,
         *K_list,
-        fast_dim = 1,
-        never_reduce_dim = False,
         use_stored_values: Optional[bool] = False,
         use_quasi = True,
         **kwargs,
@@ -154,8 +152,6 @@ class DoubleMultiLowRankKernel(CovType):
         
         self.Sigma = Sigma[0], Sigma[1]
         self.K_list = K_list
-        self.fast_dim = fast_dim
-        self.never_reduce_dim = never_reduce_dim
         self.N_alpha = len(K_list)
         self.use_quasi = use_quasi
         self.opt_name = "DoubleMultiLowRankKernel"
@@ -215,7 +211,8 @@ class DoubleMultiLowRankKernel(CovType):
             elif not isinstance(K0, Outer) and isinstance(K1, Outer):
                 self.N_beta += 1
             else:
-                raise Exception("Not implemented!")
+                raise Exception("Require only terms that are low-rank in exactly one of the two dimensions, \
+                                in addition to diagonal noise for the first Kronecker term.")
                 
         stored_values["A"] = jnp.zeros((X[0].shape[-1], self.N_alpha))
         stored_values["B"] = jnp.zeros((X[1].shape[-1], self.N_beta))
@@ -241,7 +238,8 @@ class DoubleMultiLowRankKernel(CovType):
         
 
         reduce_dim = self.N_alpha < X[0].shape[-1] and self.N_beta < X[1].shape[-1]
-        assert reduce_dim
+        if not reduce_dim:
+            raise Exception(r"Requires fewer low-rank terms than the dimension size, i.e. N_\alpha < N_\lambda and N_\beta < N_t")
 
         stored_values["J_A"], stored_values["U_A"], self.householder_transform_A = orthonormal_nullspace_gen(stored_values["A"])
         stored_values["J_B"], stored_values["U_B"], self.householder_transform_B = orthonormal_nullspace_gen(stored_values["B"])
@@ -257,7 +255,7 @@ class DoubleMultiLowRankKernel(CovType):
 
         # Calculate component of K_l \otimes \beta \beta^T which falls within block A (concentrated in top left corner of matrix)
         top_corner_ind = (jnp.arange(self.N_alpha), jnp.arange(self.N_beta))
-        X_top_corner = (X[0][:self.N_alpha], X[1][:self.N_alpha])
+        X_top_corner = (X[0][:self.N_alpha], X[1][:self.N_beta])
 
         top_corner_eval = kf_B.evaluate(X_top_corner, X_top_corner,
                                         row_idx = top_corner_ind, col_idx = top_corner_ind,
@@ -269,7 +267,7 @@ class DoubleMultiLowRankKernel(CovType):
                                  fast_dim = 1, noise_model = banded_term, diag = 1.)
 
         non_zero_B_ind = (jnp.arange(self.N_alpha, X[0].shape[-1]), jnp.arange(self.N_beta))
-        X_at_non_zero_B = (X[0][non_zero_B_ind[0]], X[1][non_zero_B_ind[1]])
+        X_at_non_zero_B = (jnp.asarray(X[0])[non_zero_B_ind[0]], jnp.asarray(X[1])[non_zero_B_ind[1]])
         self.B_rows = kf_B.evaluate(X_top_corner, X_at_non_zero_B, full = False,
                                     row_idx = top_corner_ind, col_idx = non_zero_B_ind,
                                     flip_kron = False, calc_diag = False)

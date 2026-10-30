@@ -153,7 +153,6 @@ class LuasPlusMultiLowRankKernel(CovType):
         Sigma,
         *K_list,
         fast_dim = 1,
-        never_reduce_dim = False,
         use_stored_values: Optional[bool] = False,
         transform = True,
         transform_fn = None,
@@ -242,14 +241,14 @@ class LuasPlusMultiLowRankKernel(CovType):
 
         self.N_slow = X[1-self.fast_dim].shape[-1]
         self.N_fast = X[self.fast_dim].shape[-1]
-        self.N_alpha = len(self.K_list) - 1
 
         dense_kron, *low_rank_terms = read_K_list_2D(self.K_list, X)
         alpha_mat, kernel_list = low_rank_terms[self.fast_dim]
+        self.N_alpha = len(self.K_list) - 1
 
         # Required for this optimisation to work
-        reduce_dim = self.N_alpha < X[self.fast_dim].shape[-1]
-        assert reduce_dim
+        if self.N_alpha >= X[self.fast_dim].shape[-1]:
+            raise Exception(r"Must have fewer low-rank terms than size of dimension these terms are fixed vectors in.")
 
         # Check low rank terms have correct number of terms and dimensions
         assert alpha_mat.shape[-1] == len(kernel_list) == self.N_alpha

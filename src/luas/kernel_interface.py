@@ -31,12 +31,12 @@ def read_K_list_2D(K_list, X):
             beta_list.append(K_1.alpha)
             low_rank_kernels_dim0.append(K_0)
 
-        elif isinstance(K_0, CovType) and isinstance(K_1, CovType) and dense_kron is None:
-            dense_kron = [K_0, K_1]
+        elif isinstance(K_0, CovType) and isinstance(K_1, CovType):
+            if dense_kron is None:
+                dense_kron = [K_0, K_1]
+            else:
+                raise Exception("Can only have one dense Kronecker term!")
 
-        elif isinstance(dense_kron, tuple):
-            raise Exception("Can only have one dense kronecker term")
-        
         else:
             raise Exception("All kernel terms must be valid CovType objects")
         
